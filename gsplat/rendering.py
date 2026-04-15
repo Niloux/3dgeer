@@ -29,7 +29,7 @@ from .distributed import (
     all_to_all_int32,
     all_to_all_tensor_list,
 )
-from .geer.camera import omni_tan
+from .geer.camera import get_camera_tanfov
 import numpy as np
 from.debug import *
 from datetime import datetime
@@ -576,6 +576,12 @@ def rasterization(
             "opacities": opacities,
         }
     )
+    # Some modes (e.g. UT / eval3d) may not produce a differentiable `meta["means2d"]`
+    # tensor, but downstream components (e.g. strategies) can still use camera params
+    # for gradient proxies or logging.
+    if with_ut or with_geer or with_eval3d:
+        meta["viewmats"] = viewmats
+        meta["Ks"] = Ks
 
     # Turn colors into [..., C, N, D] or [..., nnz, D] to pass into rasterize_to_pixels()
     if sh_degree is None:
@@ -613,6 +619,10 @@ def rasterization(
                 B,
                 C,
             )  # [nnz, 3]
+            # Computing gradients w.r.t. view directions is typically unnecessary for
+            # 3DGS training (SH is meant to be view-dependent appearance, not geometry).
+            # Detach to significantly reduce backward memory usage.
+            dirs = dirs.detach()
 
             masks = (radii > 0).all(dim=-1)  # [nnz]
             if colors.dim() == num_batch_dims + 3:
@@ -626,6 +636,8 @@ def rasterization(
             colors = spherical_harmonics(sh_degree, dirs, shs, masks=masks)  # [nnz, 3]
         else:
             dirs = means[..., None, :, :] - campos[..., None, :]  # [..., C, N, 3]
+            # See packed path comment above.
+            dirs = dirs.detach()
             masks = (radii > 0).all(dim=-1)  # [..., C, N]
             if colors.dim() == num_batch_dims + 3:
                 # Turn [..., N, K, 3] into [..., C, N, K, 3]
@@ -746,44 +758,43 @@ def rasterization(
         pass
     
     # TODO: GEER implementation
-    assert packed == False, "Packed is True, remove later"
-    # Identify intersecting tiles
     tile_width = math.ceil(width / float(tile_size))
     tile_height = math.ceil(height / float(tile_size))
-    omni_tan_theta, omni_tan_phi, tanfovx, tanfovy = omni_tan(Ks, width, height, step=0.002)
-    isect_geer_output = isect_tiles_geer(
-        means=means,
-        quats=quats,
-        scales=scales,
-        opacities=opacities,
-        viewmats=viewmats,
-        camera_model=camera_model,
-        Ks=Ks,
-        radial_coeffs=radial_coeffs,
-        near_plane=near_plane,
-        far_plane=far_plane,
-
-        omni_tan_theta=omni_tan_theta,
-        omni_tan_phi=omni_tan_phi,
-        image_width=width,
-        image_height=height,
-        tanfovx=tanfovx,
-        tanfovy=tanfovy,
-
-        tile_size=tile_size,
-        tile_width=tile_width,
-        tile_height=tile_height,
-
-        segmented=segmented,
-        packed=packed,
-        n_images=I,
-        image_ids=image_ids,
-        gaussian_ids=gaussian_ids
-    )
     if with_geer:
-        tiles_per_gauss, isect_ids, flatten_ids, beap_xxyy = isect_geer_output
+        assert packed == False, "Packed is True, remove later"
+        # Identify intersecting tiles
+        tanfovx, tanfovy, mirror_transformed_tan_theta, mirror_transformed_tan_phi = get_camera_tanfov(camera_model, Ks, width, height)
+        tiles_per_gauss, isect_ids, flatten_ids, beap_xxyy = isect_tiles_geer(
+            means=means,
+            quats=quats,
+            scales=scales,
+            opacities=opacities,
+            viewmats=viewmats,
+            camera_model=camera_model,
+            Ks=Ks,
+            radial_coeffs=radial_coeffs,
+            near_plane=near_plane,
+            far_plane=far_plane,
+
+            mirror_transformed_tan_theta=mirror_transformed_tan_theta,
+            mirror_transformed_tan_phi=mirror_transformed_tan_phi,
+            image_width=width,
+            image_height=height,
+            tanfovx=tanfovx,
+            tanfovy=tanfovy,
+
+            tile_size=tile_size,
+            tile_width=tile_width,
+            tile_height=tile_height,
+
+            segmented=segmented,
+            packed=packed,
+            n_images=I,
+            image_ids=image_ids,
+            gaussian_ids=gaussian_ids
+        )
     else:
-        tiles_per_gauss, isect_ids, flatten_ids, ranges, unsorted_isect_ids = isect_tiles(
+        tiles_per_gauss, isect_ids, flatten_ids = isect_tiles(
             means2d,
             radii,
             depths,
@@ -797,7 +808,6 @@ def rasterization(
             gaussian_ids=gaussian_ids
         )
         beap_xxyy = None
-        # _, _, _, beap_xxyy = isect_geer_output
     
     # print(np.allclose(isect_ids.cpu().numpy(), unsorted_isect_ids.cpu().numpy()))
     
