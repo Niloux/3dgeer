@@ -128,4 +128,4 @@ CUDA_VISIBLE_DEVICES=0 python simple_viewer.py \
 
 ## 💡License
 `gsplat-geer` is released under the AGPL-3.0 License. See the [LICENSE](./LICENSE.md) file for details.
-This project is built upon `gsplat` (Apache-2.0 License) by UCB. We thank the authors for their excellent open-source work. The original license and copyright notice are included in this repository, see the file [3rd-party-licenses.txt](./3rd-party-licenses.txt).
+This project is built upon `gsplat` (Apache-2.0 License) by UCB. We thank the authors for their excellent open-source work. The original license and copyright notice are included in this repository, see the file [gsplat-license.txt](./gsplat-license.txt).
