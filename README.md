@@ -76,8 +76,9 @@ This repository contains the official authors implementation associated with the
   <img src="assets/drive-geer.gif" alt="teaser" style="width: 100%;">
 </p> -->
 
+<p align="center"><img src="assets/drivestudio_viewer_fisheye_demo.gif" alt="teaser" style="width: 100%;"></p>
+
 <p align="center">
-  <a href='https://github.com/boschresearch/3dgeer/blob/gsplat-geer/app/drivestudio-geer/README.md'><img src="assets/drivestudio_viewer_fisheye_demo.gif" alt="teaser" style="width: 100%;"></a>
   3DGEER now has <code>drivestudio</code> integration. <br />Check out the <a href='https://github.com/boschresearch/3dgeer/blob/gsplat-geer/app/drivestudio-geer/README.md'><code>drivestudio-geer</code></a> README in our <code>gsplat-geer</code> branch to get started.
 </p>
 
