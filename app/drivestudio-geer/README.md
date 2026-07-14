@@ -1,6 +1,6 @@
 # `drivestudio-geer`
 
-We have released integration with [DriveStudio](https://github.com/ziyc/drivestudio)! In our patch, we provide 3DGEER and 3DGUT training and rendering with a dynamic, temporal Viser viewer for viewing trained representations!
+We have released integration with [DriveStudio](https://github.com/ziyc/drivestudio)! In our patch, we provide 3DGEER training and rendering with a dynamic, temporal Viser viewer for viewing trained representations!
 <img src='../../assets/drivestudio_viewer_fisheye_demo.gif' alt='drivestudio-geer' style='width: 100%;'>
 
 ## 🏃Quick Start
@@ -44,7 +44,7 @@ cd ../..
 Follow [DriveStudio Prepare Data](https://github.com/ziyc/drivestudio#-prepare-data) or process your own data.
 
 ### Train a Model
-To train a model with 3DGEER or 3DGUT, in the training YAML configs in the `configs` directory, under `trainer` > `render`, add the `render_mode` parameter, which can be set to be `default` (3DGS splatting), `ut` (3DGUT), or `geer` (3DGEER). An example can be seen in `configs/omnire_geer.yaml`. Then follow [DriveStudio Training](https://github.com/ziyc/drivestudio#training).
+To train a model with 3DGEER, in the training YAML configs in the `configs` directory, under `trainer` > `render`, add the `render_mode` parameter, which can be set to be `default` (3DGS splatting), or `geer` (3DGEER). An example can be seen in `configs/omnire_geer.yaml`. Then follow [DriveStudio Training](https://github.com/ziyc/drivestudio#training).
 
 *Note*: `gsplat-geer` does not support camera pose optimization at this time, so `model` > `CamPose` may have to be removed from the config.
 
@@ -56,7 +56,7 @@ python tools/viewer.py --ckpt /path/to/ckpt
 This viewer can
 - Render DriveStudio checkpoints
 - Move between novel views
-- Render with 3DGS, 3DGUT, or 3DGEER
+- Render with 3DGS or 3DGEER
 - Change between pinhole and fisheye rendering, with changeable distortion parameters
 - Filter Gaussian classes in checkpoint, such as background and RigidNodes
 - Snap to dataset camera views and added keyframes
