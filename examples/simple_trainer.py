@@ -15,7 +15,8 @@ import tqdm
 import tyro
 import viser
 import yaml
-from datasets.colmap import Dataset, Parser
+from datasets.gsplat import Dataset as GsplatDataset
+from datasets.gsplat import Parser as GsplatParser
 from datasets.traj import (
     generate_ellipse_path_z,
     generate_interpolated_path,
@@ -230,7 +231,7 @@ class Config:
 
 
 def create_splats_with_optimizers(
-    parser: Parser,
+    parser,
     init_type: str = "sfm",
     init_num_pts: int = 100_000,
     init_extent: float = 3.0,
@@ -353,20 +354,28 @@ class Runner:
         self.writer = SummaryWriter(log_dir=f"{cfg.result_dir}/tb")
 
         # Load data: Training data should contain initial points and colors.
-        self.parser = Parser(
+        is_gsplat_dataset = (Path(cfg.data_dir) / "dataset.json").is_file()
+        if is_gsplat_dataset:
+            parser_cls, dataset_cls = GsplatParser, GsplatDataset
+        else:
+            from datasets.colmap import Dataset as ColmapDataset
+            from datasets.colmap import Parser as ColmapParser
+
+            parser_cls, dataset_cls = ColmapParser, ColmapDataset
+        self.parser = parser_cls(
             data_dir=cfg.data_dir,
             factor=cfg.data_factor,
             normalize=cfg.normalize_world_space,
             test_every=cfg.test_every,
             undistort=not cfg.keep_distortion,
         )
-        self.trainset = Dataset(
+        self.trainset = dataset_cls(
             self.parser,
             split="train",
             patch_size=cfg.patch_size,
             load_depths=cfg.depth_loss,
         )
-        self.valset = Dataset(self.parser, split="val")
+        self.valset = dataset_cls(self.parser, split="val")
         self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
         print("Scene scale:", self.scene_scale)
 
@@ -649,6 +658,8 @@ class Runner:
             )
             image_ids = data["image_id"].to(device)
             masks = data["mask"].to(device) if "mask" in data else None  # [1, H, W]
+            if masks is not None:
+                pixels = pixels * masks.unsqueeze(-1)
             radial_coeffs = (
                 data["radial_coeffs"].to(device)
                 if (cfg.keep_distortion and "radial_coeffs" in data)
@@ -666,7 +677,7 @@ class Runner:
             height, width = pixels.shape[1:3]
 
             valid_f = None
-            if data["camera_model"] == 5 and radial_coeffs is not None: # camera_model == 5 is fisheye
+            if data["camera_model"] == 5 and radial_coeffs is not None:
                 # Cache by (W,H,K,radial) for multi-camera datasets.
                 K_key = tuple(float(x) for x in data["K"].flatten().tolist())
                 radial_key = tuple(float(x) for x in radial_coeffs.flatten().tolist())
@@ -681,7 +692,7 @@ class Runner:
                             camera_model="fisheye",
                             radial_coeffs=radial_coeffs,
                         )  # [1, H, W, 3]
-                        valid_mask = raymap[..., 2] > 1e-6  # [1, H, W]
+                        valid_mask = torch.linalg.vector_norm(raymap, dim=-1) > 1e-6
                     self._fisheye_valid_mask_cache[key] = valid_mask
                 # Zero-out invalid pixels for both prediction and target.
                 valid_f = valid_mask.unsqueeze(-1).to(dtype=pixels.dtype)  # [1,H,W,1]
@@ -1039,6 +1050,8 @@ class Runner:
             Ks = data["K"].to(device)
             pixels = data["image"].to(device) / 255.0
             masks = data["mask"].to(device) if "mask" in data else None
+            if masks is not None:
+                pixels = pixels * masks.unsqueeze(-1)
             radial_coeffs = (
                 data["radial_coeffs"].to(device)
                 if (cfg.keep_distortion and "radial_coeffs" in data)
@@ -1167,6 +1180,16 @@ class Runner:
         camtoworlds_all = torch.from_numpy(camtoworlds_all).float().to(device)
         K = torch.from_numpy(list(self.parser.Ks_dict.values())[0]).float().to(device)
         width, height = list(self.parser.imsize_dict.values())[0]
+        camera_id = next(iter(self.parser.Ks_dict))
+        is_fisheye = (
+            cfg.keep_distortion
+            and self.parser.camera_models_dict[camera_id] == 5
+        )
+        radial_coeffs = (
+            torch.from_numpy(self.parser.params_dict[camera_id])[None].float().to(device)
+            if is_fisheye
+            else None
+        )
 
         # save to video
         video_dir = f"{cfg.result_dir}/videos"
@@ -1185,6 +1208,8 @@ class Runner:
                 near_plane=cfg.near_plane,
                 far_plane=cfg.far_plane,
                 render_mode="RGB+ED",
+                camera_model="fisheye" if is_fisheye else "pinhole",
+                radial_coeffs=radial_coeffs,
             )  # [1, H, W, 4]
             colors = torch.clamp(renders[..., 0:3], 0.0, 1.0)  # [1, H, W, 3]
             depths = renders[..., 3:4]  # [1, H, W, 1]
@@ -1350,6 +1375,26 @@ if __name__ == "__main__":
                 opacity_reg=0.01,
                 scale_reg=0.01,
                 strategy=MCMCStrategy(verbose=True),
+            ),
+        ),
+        "gsplat": (
+            "Train the local dual-fisheye gsdata dataset with LiDAR initialization.",
+            Config(
+                disable_viewer=True,
+                data_dir="data/gsplat_dataset",
+                data_factor=4,
+                result_dir="results/gsplat_dataset",
+                disable_video=True,
+                normalize_world_space=False,
+                camera_model="fisheye",
+                keep_distortion=True,
+                with_geer=True,
+                with_eval3d=True,
+                strategy=DefaultStrategy(
+                    max_gaussians=4_000_000,
+                    max_grow_per_refine=50_000,
+                    verbose=True,
+                ),
             ),
         ),
     }

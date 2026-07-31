@@ -128,6 +128,30 @@ def test_strategy_requires_grad():
     assert_consistent_sizes(params)
 
 
+def test_default_strategy_state_does_not_retain_autograd_graph():
+    from gsplat.strategy import DefaultStrategy
+
+    params = {"means": torch.nn.Parameter(torch.zeros(2, 3))}
+    state = DefaultStrategy().initialize_state()
+    info = {
+        "width": 10,
+        "height": 10,
+        "n_cameras": 1,
+        "radii": torch.ones(1, 2, 2),
+        "gaussian_ids": None,
+        "means2d": torch.zeros(1, 2, 2),
+        "viewmats": torch.eye(4).unsqueeze(0),
+        "Ks": torch.eye(3).unsqueeze(0),
+        "depths": torch.ones(1, 2, requires_grad=True),
+        "_strategy_means_grad": torch.ones(2, 3),
+    }
+
+    DefaultStrategy().step_post_backward(params, {}, state, step=1, info=info)
+
+    assert state["grad2d"].grad_fn is None
+    assert not state["grad2d"].requires_grad
+
+
 if __name__ == "__main__":
     test_strategy()
     test_strategy_requires_grad()

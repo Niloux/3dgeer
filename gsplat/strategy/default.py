@@ -330,6 +330,7 @@ class DefaultStrategy(Strategy):
                 value=self.prune_opa * 2.0,
             )
 
+    @torch.no_grad()
     def _update_state(
         self,
         params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
