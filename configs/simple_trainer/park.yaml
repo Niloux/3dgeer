@@ -1,30 +1,58 @@
 preset: default
-disable_viewer: true
+
+# 数据集
 data_dir: data/park_colmap
 data_factor: 4
 frame_id_min: 63
 frame_id_max: 187
-result_dir: results/park_colmap_default
+test_every: 16
+
+# 输出与运行
+result_dir: results/park_default1549
+disable_viewer: true
 disable_video: true
+
+# 相机与畸变
 camera_model: fisheye
-max_steps: 15000
-eval_steps: [7000, 15000]
-save_steps: [7000, 15000]
-save_ply: true
-ply_steps: [7000, 15000]
 keep_distortion: true
 max_fisheye_fov: 178.0
+
+# 训练步数
+max_steps: 15000
+
+# 评估与保存
+eval_steps: [3000, 7000, 15000, 30000]
+save_steps: [7000, 15000, 30000]
+save_ply: true
+ply_steps: [7000, 15000, 30000]
+
+# 外观与损失
 sh_degree: 0
 ssim_lambda: 0.2
+
+# 渲染后端（二选一：GEER 或 3DGUT）
 with_geer: true
+with_ut: false
 with_eval3d: true
-save_ply: true
+
+# Gaussian 初始化
+# init_type: "lidar"
+# init_lidar_path: "/home/wuyou/3dgeer/data/park_colmap/lidar.ply"
 init_opa: 0.1
 init_scale: 1.0
+
+# 正则化
 opacity_reg: 0.0
 scale_reg: 0.0
+
+# 增密策略
 strategy:
+  absgrad: true
   max_gaussians: 2000000
   max_grow_per_refine: 100000
+  refine_stop_iter: 25000
+  refine_scale2d_stop_iter: 25000
 
-pose_opt: false
+  # cap_max: 3000000
+  # noise_lr: 5e3
+  # verbose: true

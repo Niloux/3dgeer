@@ -42,6 +42,93 @@ from gsplat_viewer import GsplatViewer, GsplatRenderTabState
 from nerfview import CameraState, RenderTabState, apply_float_colormap
 
 
+_PLY_VERTEX_DTYPE = np.dtype(
+    [
+        ("x", "<f4"),
+        ("y", "<f4"),
+        ("z", "<f4"),
+        ("red", "u1"),
+        ("green", "u1"),
+        ("blue", "u1"),
+    ]
+)
+
+
+def _read_lidar_ply(
+    path: Path, transform: Optional[np.ndarray] = None
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Read the binary RGB LiDAR PLY used for Gaussian initialization."""
+    if not path.is_file():
+        raise FileNotFoundError(f"LiDAR initialization PLY not found: {path}")
+
+    with path.open("rb") as stream:
+        header = []
+        while True:
+            line = stream.readline()
+            if not line:
+                raise ValueError(f"Invalid PLY header: {path}")
+            try:
+                decoded = line.decode("ascii").strip()
+            except UnicodeDecodeError as error:
+                raise ValueError(f"Invalid PLY header: {path}") from error
+            header.append(decoded)
+            if decoded == "end_header":
+                break
+
+        count_line = next(
+            (line for line in header if line.startswith("element vertex ")), None
+        )
+        if header[:1] != ["ply"] or "format binary_little_endian 1.0" not in header:
+            raise ValueError(f"Unsupported LiDAR PLY format: {path}")
+        if count_line is None:
+            raise ValueError(f"PLY header is missing vertex count: {path}")
+        try:
+            count = int(count_line.split()[2])
+        except (IndexError, ValueError) as error:
+            raise ValueError(f"Invalid PLY vertex count: {path}") from error
+        if count < 1:
+            raise ValueError(f"LiDAR PLY is empty: {path}")
+
+        properties = [line for line in header if line.startswith("property ")]
+        expected_properties = [
+            "property float x",
+            "property float y",
+            "property float z",
+            "property uchar red",
+            "property uchar green",
+            "property uchar blue",
+        ]
+        if properties != expected_properties:
+            raise ValueError(f"Unsupported LiDAR PLY layout: {path}")
+
+        vertices = np.fromfile(stream, dtype=_PLY_VERTEX_DTYPE, count=count)
+        if len(vertices) != count:
+            raise ValueError(f"LiDAR PLY payload is truncated: {path}")
+        if stream.read(1):
+            raise ValueError(f"LiDAR PLY has unexpected trailing data: {path}")
+
+    structured = vertices
+    points = np.column_stack((structured["x"], structured["y"], structured["z"]))
+    if not np.all(np.isfinite(points)):
+        raise ValueError(f"LiDAR PLY contains non-finite coordinates: {path}")
+    rgbs = np.column_stack(
+        (structured["red"], structured["green"], structured["blue"])
+    )
+
+    if transform is not None:
+        transform = np.asarray(transform)
+        if transform.shape != (4, 4) or not np.all(np.isfinite(transform)):
+            raise ValueError("LiDAR transform must be a finite 4x4 matrix")
+        points = points @ transform[:3, :3].T + transform[:3, 3]
+        if not np.all(np.isfinite(points)):
+            raise ValueError("LiDAR transform produced non-finite coordinates")
+
+    return (
+        np.ascontiguousarray(points, dtype=np.float32),
+        np.ascontiguousarray(rgbs, dtype=np.float32) / 255.0,
+    )
+
+
 @dataclass
 class Config:
     # Disable viewer
@@ -100,10 +187,13 @@ class Config:
     disable_video: bool = False
 
     # Initialization strategy
-    init_type: str = "sfm"
-    # Initial number of GSs. Ignored if using sfm
+    init_type: Literal["sfm", "random", "lidar"] = "sfm"
+    # Optional RGB LiDAR PLY. Defaults to <data_dir>/lidar.ply for init_type=lidar.
+    init_lidar_path: Optional[str] = None
+    # Initial number of GSs. Ignored if using sfm or lidar
     init_num_pts: int = 100_000
-    # Initial extent of GSs as a multiple of the camera extent. Ignored if using sfm
+    # Initial extent of GSs as a multiple of the camera extent. Ignored if using
+    # sfm or lidar
     init_extent: float = 3.0
     # Degree of spherical harmonics
     sh_degree: int = 3
@@ -330,6 +420,7 @@ def create_splats_with_optimizers(
     init_type: str = "sfm",
     init_num_pts: int = 100_000,
     init_extent: float = 3.0,
+    init_lidar_path: Optional[Union[str, Path]] = None,
     init_opacity: float = 0.1,
     init_scale: float = 1.0,
     means_lr: float = 1.6e-4,
@@ -354,8 +445,20 @@ def create_splats_with_optimizers(
     elif init_type == "random":
         points = init_extent * scene_scale * (torch.rand((init_num_pts, 3)) * 2 - 1)
         rgbs = torch.rand((init_num_pts, 3))
+    elif init_type == "lidar":
+        lidar_path = (
+            Path(init_lidar_path)
+            if init_lidar_path is not None
+            else Path(parser.data_dir) / "lidar.ply"
+        )
+        lidar_points, lidar_rgbs = _read_lidar_ply(
+            lidar_path, transform=getattr(parser, "transform", None)
+        )
+        points = torch.from_numpy(lidar_points).float()
+        rgbs = torch.from_numpy(lidar_rgbs).float()
+        print(f"Initializing Gaussians from LiDAR PLY: {lidar_path}")
     else:
-        raise ValueError("Please specify a correct init_type: sfm or random")
+        raise ValueError("Please specify a correct init_type: sfm, random, or lidar")
 
     # Initialize the GS size to be the average dist of the 3 nearest neighbors
     dist2_avg = (knn(points, 4)[:, 1:] ** 2).mean(dim=-1)  # [N,]
@@ -471,6 +574,18 @@ class Runner:
             load_depths=cfg.depth_loss,
         )
         self.valset = dataset_cls(self.parser, split="val")
+        # Keep the validation split disjoint from training while rendering a
+        # lightweight, deterministic sample of training images at eval time.
+        self.train_evalset = torch.utils.data.Subset(
+            self.trainset,
+            range(0, len(self.trainset), cfg.test_every),
+        )
+        if world_rank == 0:
+            print(
+                f"[Eval] {len(self.valset)} validation images; "
+                f"{len(self.train_evalset)} sampled training images "
+                f"(every {cfg.test_every})."
+            )
         self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
         print("Scene scale:", self.scene_scale)
 
@@ -486,6 +601,7 @@ class Runner:
             init_type=cfg.init_type,
             init_num_pts=cfg.init_num_pts,
             init_extent=cfg.init_extent,
+            init_lidar_path=cfg.init_lidar_path,
             init_opacity=cfg.init_opa,
             init_scale=cfg.init_scale,
             means_lr=cfg.means_lr,
@@ -1139,27 +1255,42 @@ class Runner:
                 # Update the scene.
                 self.viewer.update(step, num_train_rays_per_step)
 
+    def _metric_value(self, metric, prediction: Tensor, target: Tensor) -> Tensor:
+        """Compute one image metric without retaining state across images/splits."""
+        metric.reset()
+        value = metric(prediction, target).detach().clone()
+        metric.reset()
+        return value
+
     @torch.no_grad()
-    def eval(self, step: int, stage: str = "val"):
-        """Entry for evaluation."""
-        print("Running evaluation...")
+    def _eval_dataset(
+        self,
+        dataset,
+        step: int,
+        stage: str,
+        apply_train_adjustment: bool,
+    ) -> Dict[str, float]:
+        """Render and score one dataset split."""
         cfg = self.cfg
         device = self.device
         world_rank = self.world_rank
-        world_size = self.world_size
-
-        valloader = torch.utils.data.DataLoader(
-            self.valset, batch_size=1, shuffle=False, num_workers=1
+        dataloader = torch.utils.data.DataLoader(
+            dataset, batch_size=1, shuffle=False, num_workers=1
         )
-        ellipse_time = 0
+        ellipse_time = 0.0
         metrics = defaultdict(list)
-        for i, data in enumerate(valloader):
+
+        for i, data in enumerate(dataloader):
             camtoworlds = data["camtoworld"].to(device)
             Ks = data["K"].to(device)
             pixels = data["image"].to(device) / 255.0
             masks = data["mask"].to(device) if "mask" in data else None
             if masks is not None:
                 pixels = pixels * masks.unsqueeze(-1)
+            image_ids = data["image_id"].to(device)
+            if apply_train_adjustment and cfg.pose_opt:
+                camtoworlds = self.pose_adjust(camtoworlds, image_ids)
+
             radial_coeffs = (
                 data["radial_coeffs"].to(device)
                 if (cfg.keep_distortion and "radial_coeffs" in data)
@@ -1182,6 +1313,7 @@ class Runner:
                 sh_degree=cfg.sh_degree,
                 near_plane=cfg.near_plane,
                 far_plane=cfg.far_plane,
+                image_ids=image_ids if apply_train_adjustment else None,
                 masks=masks,
                 camera_model="fisheye" if cfg.keep_distortion and data["camera_model"] == 5 else "pinhole",
                 radial_coeffs=radial_coeffs,
@@ -1191,11 +1323,8 @@ class Runner:
             ellipse_time += max(time.time() - tic, 1e-10)
 
             colors = torch.clamp(colors, 0.0, 1.0)
-            canvas_list = [pixels, colors]
-
             if world_rank == 0:
-                # write images
-                canvas = torch.cat(canvas_list, dim=2).squeeze(0).cpu().numpy()
+                canvas = torch.cat([pixels, colors], dim=2).squeeze(0).cpu().numpy()
                 canvas = (canvas * 255).astype(np.uint8)
                 imageio.imwrite(
                     f"{self.render_dir}/{stage}_step{step}_{i:04d}.png",
@@ -1204,45 +1333,100 @@ class Runner:
 
                 pixels_p = pixels.permute(0, 3, 1, 2)  # [1, 3, H, W]
                 colors_p = colors.permute(0, 3, 1, 2)  # [1, 3, H, W]
-                metrics["psnr"].append(self.psnr(colors_p, pixels_p))
-                metrics["ssim"].append(self.ssim(colors_p, pixels_p))
-                metrics["lpips"].append(self.lpips(colors_p, pixels_p))
+                metrics["psnr"].append(
+                    self._metric_value(self.psnr, colors_p, pixels_p)
+                )
+                metrics["ssim"].append(
+                    self._metric_value(self.ssim, colors_p, pixels_p)
+                )
+                metrics["lpips"].append(
+                    self._metric_value(self.lpips, colors_p, pixels_p)
+                )
                 if cfg.use_bilateral_grid:
                     cc_colors = color_correct(colors, pixels)
                     cc_colors_p = cc_colors.permute(0, 3, 1, 2)  # [1, 3, H, W]
-                    metrics["cc_psnr"].append(self.psnr(cc_colors_p, pixels_p))
-                    metrics["cc_ssim"].append(self.ssim(cc_colors_p, pixels_p))
-                    metrics["cc_lpips"].append(self.lpips(cc_colors_p, pixels_p))
+                    metrics["cc_psnr"].append(
+                        self._metric_value(self.psnr, cc_colors_p, pixels_p)
+                    )
+                    metrics["cc_ssim"].append(
+                        self._metric_value(self.ssim, cc_colors_p, pixels_p)
+                    )
+                    metrics["cc_lpips"].append(
+                        self._metric_value(self.lpips, cc_colors_p, pixels_p)
+                    )
+
+        if world_rank != 0:
+            return {}
+        if len(dataloader) == 0:
+            return {"ellipse_time": 0.0, "num_images": 0}
+
+        stats = {k: torch.stack(v).mean().item() for k, v in metrics.items()}
+        stats["ellipse_time"] = ellipse_time / len(dataloader)
+        stats["num_images"] = len(dataloader)
+        return stats
+
+    @torch.no_grad()
+    def eval(self, step: int, stage: str = "val"):
+        """Render validation images and a sampled subset of training images."""
+        print("Running evaluation...")
+        cfg = self.cfg
+        world_rank = self.world_rank
+        val_stats = self._eval_dataset(
+            self.valset,
+            step,
+            stage,
+            apply_train_adjustment=False,
+        )
+        train_stats = self._eval_dataset(
+            self.train_evalset,
+            step,
+            "train",
+            apply_train_adjustment=True,
+        )
 
         if world_rank == 0:
-            ellipse_time /= len(valloader)
-
-            stats = {k: torch.stack(v).mean().item() for k, v in metrics.items()}
+            val_image_count = val_stats.pop("num_images", 0.0)
+            train_image_count = train_stats.pop("num_images", 0.0)
+            stats = dict(val_stats)
+            stats.update({f"train_{k}": v for k, v in train_stats.items()})
             stats.update(
                 {
-                    "ellipse_time": ellipse_time,
+                    "num_val_images": val_image_count,
+                    "num_train_images": train_image_count,
                     "num_GS": len(self.splats["means"]),
                 }
             )
+
             if cfg.use_bilateral_grid:
                 print(
-                    f"PSNR: {stats['psnr']:.3f}, SSIM: {stats['ssim']:.4f}, LPIPS: {stats['lpips']:.3f} "
-                    f"CC_PSNR: {stats['cc_psnr']:.3f}, CC_SSIM: {stats['cc_ssim']:.4f}, CC_LPIPS: {stats['cc_lpips']:.3f} "
-                    f"Time: {stats['ellipse_time']:.3f}s/image "
+                    f"Val PSNR: {stats['psnr']:.3f}, SSIM: {stats['ssim']:.4f}, LPIPS: {stats['lpips']:.3f}, "
+                    f"CC_PSNR: {stats['cc_psnr']:.3f}, CC_SSIM: {stats['cc_ssim']:.4f}, CC_LPIPS: {stats['cc_lpips']:.3f}; "
+                    f"Train PSNR: {stats['train_psnr']:.3f}, SSIM: {stats['train_ssim']:.4f}, LPIPS: {stats['train_lpips']:.3f}, "
+                    f"CC_PSNR: {stats['train_cc_psnr']:.3f}, CC_SSIM: {stats['train_cc_ssim']:.4f}, CC_LPIPS: {stats['train_cc_lpips']:.3f}; "
+                    f"Val time: {stats['ellipse_time']:.3f}s/image, "
+                    f"Train time: {stats['train_ellipse_time']:.3f}s/image, "
                     f"Number of GS: {stats['num_GS']}"
                 )
             else:
                 print(
-                    f"PSNR: {stats['psnr']:.3f}, SSIM: {stats['ssim']:.4f}, LPIPS: {stats['lpips']:.3f} "
-                    f"Time: {stats['ellipse_time']:.3f}s/image "
+                    f"Val PSNR: {stats['psnr']:.3f}, SSIM: {stats['ssim']:.4f}, LPIPS: {stats['lpips']:.3f}; "
+                    f"Train PSNR: {stats['train_psnr']:.3f}, SSIM: {stats['train_ssim']:.4f}, LPIPS: {stats['train_lpips']:.3f}; "
+                    f"Val time: {stats['ellipse_time']:.3f}s/image, "
+                    f"Train time: {stats['train_ellipse_time']:.3f}s/image, "
                     f"Number of GS: {stats['num_GS']}"
                 )
-            # save stats as json
             with open(f"{self.stats_dir}/{stage}_step{step:04d}.json", "w") as f:
                 json.dump(stats, f)
-            # save stats to tensorboard
-            for k, v in stats.items():
-                self.writer.add_scalar(f"{stage}/{k}", v, step)
+            for key, value in stats.items():
+                if key.startswith("train_"):
+                    metric_stage, metric_name = "train", key[len("train_") :]
+                elif key == "num_train_images":
+                    metric_stage, metric_name = "train", "num_images"
+                elif key == "num_val_images":
+                    metric_stage, metric_name = stage, "num_images"
+                else:
+                    metric_stage, metric_name = stage, key
+                self.writer.add_scalar(f"{metric_stage}/{metric_name}", value, step)
             self.writer.flush()
 
     @torch.no_grad()
