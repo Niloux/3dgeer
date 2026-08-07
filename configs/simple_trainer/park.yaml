@@ -1,0 +1,30 @@
+preset: default
+disable_viewer: true
+data_dir: data/park_colmap
+data_factor: 4
+frame_id_min: 63
+frame_id_max: 187
+result_dir: results/park_colmap_default
+disable_video: true
+camera_model: fisheye
+max_steps: 15000
+eval_steps: [7000, 15000]
+save_steps: [7000, 15000]
+save_ply: true
+ply_steps: [7000, 15000]
+keep_distortion: true
+max_fisheye_fov: 178.0
+sh_degree: 0
+ssim_lambda: 0.2
+with_geer: true
+with_eval3d: true
+save_ply: true
+init_opa: 0.1
+init_scale: 1.0
+opacity_reg: 0.0
+scale_reg: 0.0
+strategy:
+  max_gaussians: 2000000
+  max_grow_per_refine: 100000
+
+pose_opt: false

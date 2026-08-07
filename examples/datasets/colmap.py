@@ -1,6 +1,7 @@
 import json
 import math
 import os
+import re
 from typing import Any, Dict, List, Optional
 
 import cv2
@@ -83,6 +84,8 @@ class Parser:
         test_every: int = 8,
         undistort: bool = True,
         max_fisheye_fov: Optional[float] = None,
+        frame_id_min: Optional[int] = None,
+        frame_id_max: Optional[int] = None,
     ):
         self.data_dir = data_dir
         self.factor = factor
@@ -183,6 +186,32 @@ class Parser:
         image_names = [image_names[i] for i in inds]
         camtoworlds = camtoworlds[inds]
         camera_ids = [camera_ids[i] for i in inds]
+
+        if frame_id_min is not None or frame_id_max is not None:
+            def in_frame_range(name: str) -> bool:
+                match = re.search(r"_(\d+)-[LR](?:\.[^.]+)?$", name)
+                if match is None:
+                    raise ValueError(
+                        f"Cannot parse frame id from COLMAP image name {name!r}"
+                    )
+                frame_id = int(match.group(1))
+                return (
+                    (frame_id_min is None or frame_id >= frame_id_min)
+                    and (frame_id_max is None or frame_id <= frame_id_max)
+                )
+
+            frame_keep = np.array([in_frame_range(name) for name in image_names])
+            image_names = [name for name, keep in zip(image_names, frame_keep) if keep]
+            camtoworlds = camtoworlds[frame_keep]
+            camera_ids = [camera_id for camera_id, keep in zip(camera_ids, frame_keep) if keep]
+            if not image_names:
+                raise ValueError(
+                    f"No COLMAP images found in frame range {frame_id_min}..{frame_id_max}."
+                )
+            print(
+                f"[Parser] frame filter kept {len(image_names)} images "
+                f"({frame_id_min}..{frame_id_max}, inclusive)."
+            )
 
         # Load extended metadata. Used by Bilarf dataset.
         self.extconf = {

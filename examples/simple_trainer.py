@@ -17,8 +17,6 @@ import tqdm
 import tyro
 import viser
 import yaml
-from datasets.gsplat import Dataset as GsplatDataset
-from datasets.gsplat import Parser as GsplatParser
 from datasets.traj import (
     generate_ellipse_path_z,
     generate_interpolated_path,
@@ -63,6 +61,9 @@ class Config:
     result_dir: str = "results/garden"
     # Every N images there is a test image
     test_every: int = 8
+    # Optional inclusive frame-id range parsed from names such as *_00063-L.png.
+    frame_id_min: Optional[int] = None
+    frame_id_max: Optional[int] = None
     # Random crop size for training  (experimental)
     patch_size: Optional[int] = None
     # A global scaler that applies to the scene size related parameters
@@ -448,14 +449,10 @@ class Runner:
         self.writer = SummaryWriter(log_dir=f"{cfg.result_dir}/tb")
 
         # Load data: Training data should contain initial points and colors.
-        is_gsplat_dataset = (Path(cfg.data_dir) / "dataset.json").is_file()
-        if is_gsplat_dataset:
-            parser_cls, dataset_cls = GsplatParser, GsplatDataset
-        else:
-            from datasets.colmap import Dataset as ColmapDataset
-            from datasets.colmap import Parser as ColmapParser
+        from datasets.colmap import Dataset as ColmapDataset
+        from datasets.colmap import Parser as ColmapParser
 
-            parser_cls, dataset_cls = ColmapParser, ColmapDataset
+        parser_cls, dataset_cls = ColmapParser, ColmapDataset
         parser_kwargs = dict(
             data_dir=cfg.data_dir,
             factor=cfg.data_factor,
@@ -463,8 +460,9 @@ class Runner:
             test_every=cfg.test_every,
             undistort=not cfg.keep_distortion,
         )
-        if not is_gsplat_dataset:
-            parser_kwargs["max_fisheye_fov"] = cfg.max_fisheye_fov
+        parser_kwargs["max_fisheye_fov"] = cfg.max_fisheye_fov
+        parser_kwargs["frame_id_min"] = cfg.frame_id_min
+        parser_kwargs["frame_id_max"] = cfg.frame_id_max
         self.parser = parser_cls(**parser_kwargs)
         self.trainset = dataset_cls(
             self.parser,
