@@ -1,11 +1,13 @@
+import argparse
 import json
 import math
 import os
+import sys
 import time
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import imageio
 import numpy as np
@@ -230,6 +232,96 @@ class Config:
             strategy.refine_every = int(strategy.refine_every * factor)
         else:
             assert_never(strategy)
+
+
+CONFIG_DIR = Path(__file__).resolve().parents[1] / "configs" / "simple_trainer"
+
+
+def _flatten_yaml_args(
+    values: Dict[str, object], prefix: Tuple[str, ...] = ()
+) -> List[str]:
+    args: List[str] = []
+    for key, value in values.items():
+        if not isinstance(key, str):
+            raise SystemExit("YAML config keys must be strings.")
+        path = prefix + (key.replace("_", "-"),)
+        if isinstance(value, dict):
+            args.extend(_flatten_yaml_args(value, path))
+            continue
+
+        if isinstance(value, bool):
+            if not value:
+                path = path[:-1] + (f"no-{path[-1]}",)
+            args.append("--" + ".".join(path))
+            continue
+
+        flag = "--" + ".".join(path)
+        args.append(flag)
+        if isinstance(value, list):
+            if any(isinstance(item, (dict, list)) for item in value):
+                raise SystemExit(f"Unsupported nested YAML list: {flag}")
+            args.extend("None" if item is None else str(item) for item in value)
+        else:
+            args.append("None" if value is None else str(value))
+    return args
+
+
+def _yaml_config_args(path: Path) -> List[str]:
+    try:
+        values = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except OSError as error:
+        raise SystemExit(f"Could not read config file {path}: {error}") from error
+    except yaml.YAMLError as error:
+        raise SystemExit(f"Invalid YAML config {path}: {error}") from error
+    if not isinstance(values, dict):
+        raise SystemExit(f"YAML config must contain a mapping: {path}")
+
+    preset = values.pop("preset", "default")
+    if not isinstance(preset, str):
+        raise SystemExit(f"YAML preset must be a string: {path}")
+    return [preset, *_flatten_yaml_args(values)]
+
+
+def parse_config(args: Optional[Sequence[str]] = None) -> Config:
+    cli_args = list(sys.argv[1:] if args is None else args)
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--config", type=Path)
+    known, overrides = parser.parse_known_args(cli_args)
+
+    config_path = known.config
+    if config_path is None and overrides and not overrides[0].startswith("-"):
+        candidate = CONFIG_DIR / f"{overrides[0]}.yaml"
+        if candidate.is_file():
+            config_path = candidate
+            overrides = overrides[1:]
+
+    configs = {
+        "default": (
+            "Gaussian splatting training using densification heuristics from the original paper.",
+            Config(strategy=DefaultStrategy(verbose=True)),
+        ),
+        "mcmc": (
+            "Gaussian splatting training using densification from the paper '3D Gaussian Splatting as Markov Chain Monte Carlo'.",
+            Config(
+                init_opa=0.5,
+                init_scale=0.1,
+                opacity_reg=0.01,
+                scale_reg=0.01,
+                strategy=MCMCStrategy(verbose=True),
+            ),
+        ),
+    }
+    if config_path is not None:
+        base = tyro.extras.overridable_config_cli(
+            configs, args=_yaml_config_args(config_path)
+        )
+        return tyro.cli(
+            Config,
+            default=base,
+            args=overrides,
+            config=(tyro.conf.AvoidSubcommands,),
+        )
+    return tyro.extras.overridable_config_cli(configs, args=overrides)
 
 
 def create_splats_with_optimizers(
@@ -594,7 +686,10 @@ class Runner:
         # Dump cfg.
         if world_rank == 0:
             with open(f"{cfg.result_dir}/cfg.yml", "w") as f:
-                yaml.dump(vars(cfg), f)
+                preset = "mcmc" if isinstance(cfg.strategy, MCMCStrategy) else "default"
+                values = asdict(cfg)
+                values["steps_scaler"] = 1.0
+                yaml.safe_dump({"preset": preset, **values}, f, sort_keys=False)
 
         max_steps = cfg.max_steps
         init_step = 0
@@ -1368,70 +1463,15 @@ if __name__ == "__main__":
     # Single GPU training
     CUDA_VISIBLE_DEVICES=9 python -m examples.simple_trainer default
 
+    # Load YAML; later CLI arguments override YAML values.
+    CUDA_VISIBLE_DEVICES=9 python examples/simple_trainer.py --config configs/simple_trainer/park.yaml
+
     # Distributed training on 4 GPUs: Effectively 4x batch size so run 4x less steps.
     CUDA_VISIBLE_DEVICES=0,1,2,3 python simple_trainer.py default --steps_scaler 0.25
 
     """
 
-    # Config objects we can choose between.
-    # Each is a tuple of (CLI description, config object).
-    configs = {
-        "default": (
-            "Gaussian splatting training using densification heuristics from the original paper.",
-            Config(
-                strategy=DefaultStrategy(verbose=True),
-            ),
-        ),
-        "mcmc": (
-            "Gaussian splatting training using densification from the paper '3D Gaussian Splatting as Markov Chain Monte Carlo'.",
-            Config(
-                init_opa=0.5,
-                init_scale=0.1,
-                opacity_reg=0.01,
-                scale_reg=0.01,
-                strategy=MCMCStrategy(verbose=True),
-            ),
-        ),
-        "gsplat": (
-            "Train the local dual-fisheye gsdata dataset with LiDAR initialization.",
-            Config(
-                disable_viewer=True,
-                data_dir="data/gsplat_dataset",
-                data_factor=4,
-                result_dir="results/gsplat_dataset",
-                disable_video=True,
-                normalize_world_space=False,
-                camera_model="fisheye",
-                keep_distortion=True,
-                with_geer=True,
-                with_eval3d=True,
-                strategy=DefaultStrategy(
-                    max_gaussians=4_000_000,
-                    max_grow_per_refine=50_000,
-                    verbose=True,
-                ),
-            ),
-        ),
-        "park": (
-            "Train Park frames 62-187 with static-foreground fisheye supervision.",
-            Config(
-                disable_viewer=True,
-                data_dir="data/park_colmap",
-                data_factor=4,
-                result_dir="results/park_colmap",
-                disable_video=True,
-                camera_model="fisheye",
-                keep_distortion=True,
-                max_fisheye_fov=178.0,
-                ssim_lambda=0.0,
-                with_geer=True,
-                with_eval3d=True,
-                save_ply=True,
-                strategy=DefaultStrategy(verbose=True),
-            ),
-        ),
-    }
-    cfg = tyro.extras.overridable_config_cli(configs)
+    cfg = parse_config()
     cfg.adjust_steps(cfg.steps_scaler)
 
     # Import BilateralGrid and related functions based on configuration
