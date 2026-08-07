@@ -1,4 +1,5 @@
 import json
+import math
 import os
 from typing import Any, Dict, List, Optional
 
@@ -41,6 +42,7 @@ def _resize_image_folder(image_dir: str, resized_dir: str, factor: int) -> str:
         )
         if os.path.isfile(resized_path):
             continue
+        os.makedirs(os.path.dirname(resized_path), exist_ok=True)
         image = imageio.imread(image_path)[..., :3]
         resized_size = (
             int(round(image.shape[1] / factor)),
@@ -53,6 +55,23 @@ def _resize_image_folder(image_dir: str, resized_dir: str, factor: int) -> str:
     return resized_dir
 
 
+def _fisheye_fov_mask(K, params, width: int, height: int, max_fov: float):
+    if not 0.0 < max_fov < 180.0:
+        raise ValueError("max_fisheye_fov must be between 0 and 180 degrees")
+    theta = math.radians(max_fov / 2.0)
+    theta2 = theta * theta
+    k1, k2, k3, k4 = params
+    radius = theta * (
+        1.0 + k1 * theta2 + k2 * theta2**2 + k3 * theta2**3 + k4 * theta2**4
+    )
+    ys, xs = np.ogrid[:height, :width]
+    return (
+        ((xs + 0.5 - K[0, 2]) / K[0, 0]) ** 2
+        + ((ys + 0.5 - K[1, 2]) / K[1, 1]) ** 2
+        < radius**2
+    )
+
+
 class Parser:
     """COLMAP parser."""
 
@@ -63,12 +82,16 @@ class Parser:
         normalize: bool = False,
         test_every: int = 8,
         undistort: bool = True,
+        max_fisheye_fov: Optional[float] = None,
     ):
         self.data_dir = data_dir
         self.factor = factor
         self.normalize = normalize
         self.test_every = test_every
         self.undistort = undistort
+        self.max_fisheye_fov = max_fisheye_fov
+        if max_fisheye_fov is not None and undistort:
+            raise ValueError("max_fisheye_fov requires undistort=False")
 
         colmap_dir = os.path.join(data_dir, "sparse/0/")
         if not os.path.exists(colmap_dir):
@@ -184,13 +207,20 @@ class Parser:
             image_dir_suffix = ""
         colmap_image_dir = os.path.join(data_dir, "images")
         image_dir = os.path.join(data_dir, "images" + image_dir_suffix)
-        for d in [image_dir, colmap_image_dir]:
-            if not os.path.exists(d):
-                raise ValueError(f"Image folder {d} does not exist.")
+        training_mask_dir = os.path.join(data_dir, "training_masks")
+        has_training_masks = os.path.isdir(training_mask_dir)
+        if not os.path.exists(colmap_image_dir):
+            raise ValueError(f"Image folder {colmap_image_dir} does not exist.")
+        colmap_files = sorted(_get_rel_paths(colmap_image_dir))
+        if not os.path.exists(image_dir):
+            if factor == 1:
+                raise ValueError(f"Image folder {image_dir} does not exist.")
+            image_dir = _resize_image_folder(colmap_image_dir, image_dir, factor)
+        elif factor > 1 and len(_get_rel_paths(image_dir)) < len(colmap_files):
+            image_dir = _resize_image_folder(colmap_image_dir, image_dir, factor)
 
         # Downsampled images may have different names vs images used for COLMAP,
         # so we need to map between the two sorted lists of files.
-        colmap_files = sorted(_get_rel_paths(colmap_image_dir))
         image_files = sorted(_get_rel_paths(image_dir))
         if factor > 1 and os.path.splitext(image_files[0])[1].lower() == ".jpg":
             image_dir = _resize_image_folder(
@@ -202,6 +232,7 @@ class Parser:
         # Skip images referenced by COLMAP but missing on disk.
         kept_image_names = []
         kept_image_paths = []
+        kept_mask_paths = []
         kept_camera_ids = []
         kept_camtoworlds = []
         skipped = []
@@ -213,6 +244,13 @@ class Parser:
                 continue
             kept_image_names.append(name)
             kept_image_paths.append(os.path.join(image_dir, rel_path))
+            if has_training_masks:
+                mask_path = os.path.join(training_mask_dir, name + ".png")
+                if not os.path.isfile(mask_path):
+                    raise FileNotFoundError(mask_path)
+                kept_mask_paths.append(mask_path)
+            else:
+                kept_mask_paths.append(None)
             kept_camera_ids.append(camera_id)
             kept_camtoworlds.append(c2w)
 
@@ -280,6 +318,7 @@ class Parser:
 
         self.image_names = image_names  # List[str], (num_images,)
         self.image_paths = image_paths  # List[str], (num_images,)
+        self.mask_paths = kept_mask_paths  # List[Optional[str]], (num_images,)
         self.camtoworlds = camtoworlds  # np.ndarray, (num_images, 4, 4)
         self.camera_ids = camera_ids  # List[int], (num_images,)
         self.camera_models_dict = camera_models_dict  # Dict of camera_id -> camera_model (int)
@@ -380,6 +419,21 @@ class Parser:
             else:
                 self.roi_dict[camera_id] = [0, 0, *self.imsize_dict[camera_id]]
 
+        if self.max_fisheye_fov is not None:
+            for camera_id, camera_model in self.camera_models_dict.items():
+                if camera_model != 5:
+                    continue
+                width, height = self.imsize_dict[camera_id]
+                fov_mask = _fisheye_fov_mask(
+                    self.Ks_dict[camera_id],
+                    self.params_dict[camera_id],
+                    width,
+                    height,
+                    self.max_fisheye_fov,
+                )
+                mask = self.mask_dict[camera_id]
+                self.mask_dict[camera_id] = fov_mask if mask is None else mask & fov_mask
+
         # size of the scene measured by cameras
         camera_locations = camtoworlds[:, :3, 3]
         scene_center = np.mean(camera_locations, axis=0)
@@ -418,6 +472,19 @@ class Dataset:
         params = self.parser.params_dict[camera_id]
         camtoworlds = self.parser.camtoworlds[index]
         mask = self.parser.mask_dict[camera_id]
+        mask_path = self.parser.mask_paths[index]
+        training_mask = None
+        if mask_path is not None:
+            training_mask = imageio.imread(mask_path)
+            if training_mask.ndim == 3:
+                training_mask = training_mask[..., 0]
+            if training_mask.shape != image.shape[:2]:
+                training_mask = cv2.resize(
+                    training_mask,
+                    (image.shape[1], image.shape[0]),
+                    interpolation=cv2.INTER_NEAREST,
+                )
+            training_mask = training_mask > 127
 
         if self.parser.undistort and len(params) > 0:
             # Images are distorted. Undistort them.
@@ -426,8 +493,20 @@ class Dataset:
                 self.parser.mapy_dict[camera_id],
             )
             image = cv2.remap(image, mapx, mapy, cv2.INTER_LINEAR)
+            if training_mask is not None:
+                training_mask = cv2.remap(
+                    training_mask.astype(np.uint8),
+                    mapx,
+                    mapy,
+                    cv2.INTER_NEAREST,
+                ).astype(bool)
             x, y, w, h = self.parser.roi_dict[camera_id]
             image = image[y : y + h, x : x + w]
+            if training_mask is not None:
+                training_mask = training_mask[y : y + h, x : x + w]
+
+        if training_mask is not None:
+            mask = training_mask if mask is None else mask & training_mask
 
         if self.patch_size is not None:
             # Random crop.
@@ -435,6 +514,8 @@ class Dataset:
             x = np.random.randint(0, max(w - self.patch_size, 1))
             y = np.random.randint(0, max(h - self.patch_size, 1))
             image = image[y : y + self.patch_size, x : x + self.patch_size]
+            if mask is not None:
+                mask = mask[y : y + self.patch_size, x : x + self.patch_size]
             K[0, 2] -= x
             K[1, 2] -= y
 

@@ -72,6 +72,8 @@ class Config:
     # Disable dataset undistortion and train on the original (distorted) images.
     # Useful when using UT/GEER with distortion coefficients.
     keep_distortion: bool = False
+    # Limit fisheye supervision to a front-facing field of view below 180 degrees.
+    max_fisheye_fov: Optional[float] = None
 
     # Port for the viewer server
     port: int = 8080
@@ -362,13 +364,16 @@ class Runner:
             from datasets.colmap import Parser as ColmapParser
 
             parser_cls, dataset_cls = ColmapParser, ColmapDataset
-        self.parser = parser_cls(
+        parser_kwargs = dict(
             data_dir=cfg.data_dir,
             factor=cfg.data_factor,
             normalize=cfg.normalize_world_space,
             test_every=cfg.test_every,
             undistort=not cfg.keep_distortion,
         )
+        if not is_gsplat_dataset:
+            parser_kwargs["max_fisheye_fov"] = cfg.max_fisheye_fov
+        self.parser = parser_cls(**parser_kwargs)
         self.trainset = dataset_cls(
             self.parser,
             split="train",
@@ -761,13 +766,23 @@ class Runner:
             colors_for_loss = (
                 colors.clamp(0.0, 1.0) if cfg.clamp_colors_for_loss else colors
             )
-            l1loss = F.l1_loss(colors_for_loss, pixels)
-            ssimloss = 1.0 - fused_ssim(
-                colors_for_loss.permute(0, 3, 1, 2),
-                pixels.permute(0, 3, 1, 2),
-                padding="valid",
-            )
-            loss = l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda
+            if masks is None:
+                l1loss = F.l1_loss(colors_for_loss, pixels)
+            else:
+                valid = masks.unsqueeze(-1)
+                l1loss = (
+                    (colors_for_loss - pixels).abs().masked_select(valid).mean()
+                )
+            if cfg.ssim_lambda:
+                ssimloss = 1.0 - fused_ssim(
+                    colors_for_loss.permute(0, 3, 1, 2),
+                    pixels.permute(0, 3, 1, 2),
+                    padding="valid",
+                )
+                loss = l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda
+            else:
+                ssimloss = torch.zeros_like(l1loss)
+                loss = l1loss
             if cfg.depth_loss:
                 # query depths from depth map
                 points = torch.stack(
@@ -1395,6 +1410,24 @@ if __name__ == "__main__":
                     max_grow_per_refine=50_000,
                     verbose=True,
                 ),
+            ),
+        ),
+        "park": (
+            "Train Park frames 62-187 with static-foreground fisheye supervision.",
+            Config(
+                disable_viewer=True,
+                data_dir="data/park_colmap",
+                data_factor=4,
+                result_dir="results/park_colmap",
+                disable_video=True,
+                camera_model="fisheye",
+                keep_distortion=True,
+                max_fisheye_fov=178.0,
+                ssim_lambda=0.0,
+                with_geer=True,
+                with_eval3d=True,
+                save_ply=True,
+                strategy=DefaultStrategy(verbose=True),
             ),
         ),
     }
