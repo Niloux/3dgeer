@@ -30,6 +30,42 @@ def _get_rel_paths(path_dir: str) -> List[str]:
     return paths
 
 
+def _resolve_semantic_mask_path(mask_dir: str, image_name: str) -> str:
+    """Resolve nested COLMAP names against flat or nested PNG mask folders."""
+    stem = os.path.splitext(image_name)[0]
+    candidates = [
+        os.path.join(mask_dir, stem + ".png"),
+        os.path.join(mask_dir, os.path.basename(stem) + ".png"),
+        os.path.join(mask_dir, image_name + ".png"),
+    ]
+    for path in dict.fromkeys(candidates):
+        if os.path.isfile(path):
+            return path
+    raise FileNotFoundError(
+        f"Sky mask for COLMAP image {image_name!r} was not found in {mask_dir!r}"
+    )
+
+
+def _combine_supervision_masks(
+    camera_mask: Optional[np.ndarray],
+    training_mask: Optional[np.ndarray],
+    sky_mask: Optional[np.ndarray],
+):
+    """Restore explicit sky supervision without re-enabling invalid camera pixels."""
+    valid = None if camera_mask is None else camera_mask.astype(bool, copy=False)
+    training = (
+        None if training_mask is None else training_mask.astype(bool, copy=False)
+    )
+    sky = None if sky_mask is None else sky_mask.astype(bool, copy=False)
+
+    if training is not None:
+        supervised = training if sky is None else training | sky
+        valid = supervised if valid is None else valid & supervised
+    if sky is not None and valid is not None:
+        sky = sky & valid
+    return valid, sky
+
+
 def _resize_image_folder(image_dir: str, resized_dir: str, factor: int) -> str:
     """Resize image folder."""
     print(f"Downscaling images by {factor}x from {image_dir} to {resized_dir}.")
@@ -86,6 +122,7 @@ class Parser:
         max_fisheye_fov: Optional[float] = None,
         frame_id_min: Optional[int] = None,
         frame_id_max: Optional[int] = None,
+        sky_mask_dir: Optional[str] = None,
     ):
         self.data_dir = data_dir
         self.factor = factor
@@ -93,6 +130,11 @@ class Parser:
         self.test_every = test_every
         self.undistort = undistort
         self.max_fisheye_fov = max_fisheye_fov
+        if sky_mask_dir is not None and not os.path.isabs(sky_mask_dir):
+            sky_mask_dir = os.path.join(data_dir, sky_mask_dir)
+        if sky_mask_dir is not None and not os.path.isdir(sky_mask_dir):
+            raise FileNotFoundError(f"Sky mask directory does not exist: {sky_mask_dir}")
+        self.sky_mask_dir = sky_mask_dir
         if max_fisheye_fov is not None and undistort:
             raise ValueError("max_fisheye_fov requires undistort=False")
 
@@ -262,6 +304,7 @@ class Parser:
         kept_image_names = []
         kept_image_paths = []
         kept_mask_paths = []
+        kept_sky_mask_paths = []
         kept_camera_ids = []
         kept_camtoworlds = []
         skipped = []
@@ -280,6 +323,12 @@ class Parser:
                 kept_mask_paths.append(mask_path)
             else:
                 kept_mask_paths.append(None)
+            if self.sky_mask_dir is not None:
+                kept_sky_mask_paths.append(
+                    _resolve_semantic_mask_path(self.sky_mask_dir, name)
+                )
+            else:
+                kept_sky_mask_paths.append(None)
             kept_camera_ids.append(camera_id)
             kept_camtoworlds.append(c2w)
 
@@ -348,6 +397,7 @@ class Parser:
         self.image_names = image_names  # List[str], (num_images,)
         self.image_paths = image_paths  # List[str], (num_images,)
         self.mask_paths = kept_mask_paths  # List[Optional[str]], (num_images,)
+        self.sky_mask_paths = kept_sky_mask_paths
         self.camtoworlds = camtoworlds  # np.ndarray, (num_images, 4, 4)
         self.camera_ids = camera_ids  # List[int], (num_images,)
         self.camera_models_dict = camera_models_dict  # Dict of camera_id -> camera_model (int)
@@ -502,6 +552,7 @@ class Dataset:
         camtoworlds = self.parser.camtoworlds[index]
         mask = self.parser.mask_dict[camera_id]
         mask_path = self.parser.mask_paths[index]
+        sky_mask_path = self.parser.sky_mask_paths[index]
         training_mask = None
         if mask_path is not None:
             training_mask = imageio.imread(mask_path)
@@ -514,6 +565,18 @@ class Dataset:
                     interpolation=cv2.INTER_NEAREST,
                 )
             training_mask = training_mask > 127
+        sky_mask = None
+        if sky_mask_path is not None:
+            sky_mask = imageio.imread(sky_mask_path)
+            if sky_mask.ndim == 3:
+                sky_mask = sky_mask[..., 0]
+            if sky_mask.shape != image.shape[:2]:
+                sky_mask = cv2.resize(
+                    sky_mask,
+                    (image.shape[1], image.shape[0]),
+                    interpolation=cv2.INTER_NEAREST,
+                )
+            sky_mask = sky_mask > 127
 
         if self.parser.undistort and len(params) > 0:
             # Images are distorted. Undistort them.
@@ -529,13 +592,21 @@ class Dataset:
                     mapy,
                     cv2.INTER_NEAREST,
                 ).astype(bool)
+            if sky_mask is not None:
+                sky_mask = cv2.remap(
+                    sky_mask.astype(np.uint8),
+                    mapx,
+                    mapy,
+                    cv2.INTER_NEAREST,
+                ).astype(bool)
             x, y, w, h = self.parser.roi_dict[camera_id]
             image = image[y : y + h, x : x + w]
             if training_mask is not None:
                 training_mask = training_mask[y : y + h, x : x + w]
+            if sky_mask is not None:
+                sky_mask = sky_mask[y : y + h, x : x + w]
 
-        if training_mask is not None:
-            mask = training_mask if mask is None else mask & training_mask
+        mask, sky_mask = _combine_supervision_masks(mask, training_mask, sky_mask)
 
         if self.patch_size is not None:
             # Random crop.
@@ -545,6 +616,10 @@ class Dataset:
             image = image[y : y + self.patch_size, x : x + self.patch_size]
             if mask is not None:
                 mask = mask[y : y + self.patch_size, x : x + self.patch_size]
+            if sky_mask is not None:
+                sky_mask = sky_mask[
+                    y : y + self.patch_size, x : x + self.patch_size
+                ]
             K[0, 2] -= x
             K[1, 2] -= y
 
@@ -557,6 +632,8 @@ class Dataset:
         }
         if mask is not None:
             data["mask"] = torch.from_numpy(mask).bool()
+        if sky_mask is not None:
+            data["sky_mask"] = torch.from_numpy(sky_mask).bool()
 
         if not self.parser.undistort:
             # Provide distortion coefficients for renderers that support it.

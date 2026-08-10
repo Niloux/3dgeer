@@ -1,43 +1,35 @@
 preset: default
 
-# 数据集
-data_dir: data/park_colmap
+# Generated for examples/simple_trainer.py.
+data_dir: "/home/wuyou/remote/colmap/output/park_camera_ab/d_ba_k_ba_pose"
 data_factor: 4
 frame_id_min: 63
 frame_id_max: 187
 test_every: 16
+normalize_world_space: false
 
-# 输出与运行
-result_dir: results/park_default1549_knn_pca_sky
+result_dir: results/park_0810
 disable_viewer: true
 disable_video: true
 
-# 相机与畸变
 camera_model: fisheye
 keep_distortion: true
 max_fisheye_fov: 178.0
 
-# 训练步数
-max_steps: 15000
-
-# 评估与保存
+max_steps: 30000
 eval_steps: [3000, 7000, 15000, 30000]
 save_steps: [7000, 15000, 30000]
 save_ply: true
 ply_steps: [7000, 15000, 30000]
 
-# 外观与损失
 sh_degree: 0
 ssim_lambda: 0.2
-
-# 渲染后端（二选一：GEER 或 3DGUT）
 with_geer: true
 with_ut: false
 with_eval3d: true
 
-# Gaussian 初始化
 init_type: lidar
-init_lidar_path: data/park_colmap/lidar.ply
+init_lidar_path: "/home/wuyou/remote/colmap/output/park_camera_ab/d_ba_k_ba_pose/lidar.ply"
 init_opa: 0.1
 init_scale: 1.0
 init_use_knn_pca: true
@@ -46,7 +38,6 @@ knn_pca_normal_scale_factor: 0.25
 knn_pca_planarity_threshold: 0.30
 knn_pca_curvature_threshold: 0.10
 
-# 天空单独建模（几何固定，仅优化 SH）
 sky_enabled: true
 sky_mask_dir: semantic_masks/sky
 sky_num_points: 100000
@@ -56,18 +47,12 @@ sky_sh0_lr: 0.0025
 sky_shN_lr: 0.000125
 sky_alpha_lambda: 0.1
 
-# 正则化
 opacity_reg: 0.0
 scale_reg: 0.0
 
-# 增密策略
 strategy:
   absgrad: true
-  max_gaussians: 2000000
+  max_gaussians: 4000000
   max_grow_per_refine: 100000
   refine_stop_iter: 25000
   refine_scale2d_stop_iter: 25000
-
-  # cap_max: 3000000
-  # noise_lr: 5e3
-  # verbose: true

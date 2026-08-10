@@ -22,11 +22,18 @@ from datasets.traj import (
     generate_interpolated_path,
     generate_spiral_path,
 )
+from evaluation import masked_lpips, masked_psnr, masked_ssim
 from fused_ssim import fused_ssim
+from gaussian_models import (
+    clamp_sky_sh_colors,
+    composite_sky,
+    create_sky_splats_with_optimizers,
+    initialize_surface_priors_knn_pca,
+)
 from torch import Tensor
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.tensorboard import SummaryWriter
-from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
+from torchmetrics.image import StructuralSimilarityIndexMeasure
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from typing_extensions import Literal, assert_never
 from utils import AppearanceOptModule, CameraOptModule, knn, rgb_to_sh, set_random_seed
@@ -203,8 +210,31 @@ class Config:
     init_opa: float = 0.1
     # Initial scale of GS
     init_scale: float = 1.0
+    # Use LiDAR KNN-PCA to initialize surface-aligned anisotropic Gaussians.
+    init_use_knn_pca: bool = False
+    # Number of local points used by KNN-PCA (including the query point).
+    knn_pca_k: int = 24
+    # Normal-axis scale relative to the local KNN scale.
+    knn_pca_normal_scale_factor: float = 0.25
+    # Minimum local planarity for accepting the PCA orientation.
+    knn_pca_planarity_threshold: float = 0.30
+    # Maximum local curvature for accepting the PCA orientation.
+    knn_pca_curvature_threshold: float = 0.10
     # Weight for SSIM loss
     ssim_lambda: float = 0.2
+
+    # Train a separate Gaussian sky behind the strategy-managed foreground.
+    sky_enabled: bool = False
+    # PNG semantic sky masks. Relative paths are resolved under data_dir.
+    sky_mask_dir: Optional[str] = None
+    # Fixed Gaussian sky geometry and trainable SH settings.
+    sky_num_points: int = 100_000
+    sky_radius: float = 10_000.0
+    sky_initial_opacity: float = 0.7
+    sky_sh0_lr: float = 2.5e-3
+    sky_shN_lr: float = 2.5e-3 / 20
+    # Penalize foreground opacity over semantic sky pixels.
+    sky_alpha_lambda: float = 0.1
 
     # Near plane clipping distance
     near_plane: float = 0.01
@@ -423,6 +453,11 @@ def create_splats_with_optimizers(
     init_lidar_path: Optional[Union[str, Path]] = None,
     init_opacity: float = 0.1,
     init_scale: float = 1.0,
+    init_use_knn_pca: bool = False,
+    knn_pca_k: int = 24,
+    knn_pca_normal_scale_factor: float = 0.25,
+    knn_pca_planarity_threshold: float = 0.30,
+    knn_pca_curvature_threshold: float = 0.10,
     means_lr: float = 1.6e-4,
     scales_lr: float = 5e-3,
     opacities_lr: float = 5e-2,
@@ -439,6 +474,10 @@ def create_splats_with_optimizers(
     world_rank: int = 0,
     world_size: int = 1,
 ) -> Tuple[torch.nn.ParameterDict, Dict[str, torch.optim.Optimizer]]:
+    if init_scale <= 0.0:
+        raise ValueError("init_scale must be positive")
+    if not 0.0 < init_opacity < 1.0:
+        raise ValueError("init_opacity must be between zero and one")
     if init_type == "sfm":
         points = torch.from_numpy(parser.points).float()
         rgbs = torch.from_numpy(parser.points_rgb / 255.0).float()
@@ -460,18 +499,40 @@ def create_splats_with_optimizers(
     else:
         raise ValueError("Please specify a correct init_type: sfm, random, or lidar")
 
-    # Initialize the GS size to be the average dist of the 3 nearest neighbors
-    dist2_avg = (knn(points, 4)[:, 1:] ** 2).mean(dim=-1)  # [N,]
-    dist_avg = torch.sqrt(dist2_avg)
-    scales = torch.log(dist_avg * init_scale).unsqueeze(-1).repeat(1, 3)  # [N, 3]
+    if init_use_knn_pca:
+        if init_type != "lidar":
+            raise ValueError("KNN-PCA initialization currently requires init_type=lidar")
+        quats, actual_scales, accepted_count = initialize_surface_priors_knn_pca(
+            points,
+            k=knn_pca_k,
+            local_scale_factor=init_scale,
+            normal_scale_factor=knn_pca_normal_scale_factor,
+            planarity_threshold=knn_pca_planarity_threshold,
+            curvature_threshold=knn_pca_curvature_threshold,
+        )
+        scales = torch.log(actual_scales)
+        print(
+            f"KNN-PCA surface initialization: {accepted_count}/{len(points)} "
+            f"({100.0 * accepted_count / max(len(points), 1):.1f}%) points "
+            f"accepted as planar; k={min(knn_pca_k, len(points))}, "
+            f"normal_factor={knn_pca_normal_scale_factor}"
+        )
+    else:
+        # Initialize the GS size to be the average dist of the 3 nearest neighbors.
+        dist2_avg = (knn(points, 4)[:, 1:] ** 2).mean(dim=-1)  # [N,]
+        dist_avg = torch.sqrt(dist2_avg).clamp_min(1e-6)
+        scales = (
+            torch.log(dist_avg * init_scale).unsqueeze(-1).repeat(1, 3)
+        )  # [N, 3]
+        quats = torch.rand((points.shape[0], 4))  # [N, 4]
 
     # Distribute the GSs to different ranks (also works for single rank)
     points = points[world_rank::world_size]
     rgbs = rgbs[world_rank::world_size]
     scales = scales[world_rank::world_size]
+    quats = quats[world_rank::world_size]
 
     N = points.shape[0]
-    quats = torch.rand((N, 4))  # [N, 4]
     opacities = torch.logit(torch.full((N,), init_opacity))  # [N,]
 
     params = [
@@ -534,6 +595,14 @@ class Runner:
         self.local_rank = local_rank
         self.world_size = world_size
         self.device = f"cuda:{local_rank}"
+        if cfg.sky_enabled and cfg.sky_mask_dir is None:
+            raise ValueError("sky_enabled requires sky_mask_dir")
+        if cfg.sky_enabled and cfg.random_bkgd:
+            raise ValueError("sky_enabled and random_bkgd cannot be used together")
+        if cfg.init_use_knn_pca and cfg.init_type != "lidar":
+            raise ValueError("KNN-PCA initialization currently requires init_type=lidar")
+        if cfg.sky_alpha_lambda < 0.0:
+            raise ValueError("sky_alpha_lambda must be non-negative")
 
         # Where to dump results.
         os.makedirs(cfg.result_dir, exist_ok=True)
@@ -566,6 +635,9 @@ class Runner:
         parser_kwargs["max_fisheye_fov"] = cfg.max_fisheye_fov
         parser_kwargs["frame_id_min"] = cfg.frame_id_min
         parser_kwargs["frame_id_max"] = cfg.frame_id_max
+        parser_kwargs["sky_mask_dir"] = (
+            cfg.sky_mask_dir if cfg.sky_enabled else None
+        )
         self.parser = parser_cls(**parser_kwargs)
         self.trainset = dataset_cls(
             self.parser,
@@ -604,6 +676,11 @@ class Runner:
             init_lidar_path=cfg.init_lidar_path,
             init_opacity=cfg.init_opa,
             init_scale=cfg.init_scale,
+            init_use_knn_pca=cfg.init_use_knn_pca,
+            knn_pca_k=cfg.knn_pca_k,
+            knn_pca_normal_scale_factor=cfg.knn_pca_normal_scale_factor,
+            knn_pca_planarity_threshold=cfg.knn_pca_planarity_threshold,
+            knn_pca_curvature_threshold=cfg.knn_pca_curvature_threshold,
             means_lr=cfg.means_lr,
             scales_lr=cfg.scales_lr,
             opacities_lr=cfg.opacities_lr,
@@ -621,6 +698,26 @@ class Runner:
             world_size=world_size,
         )
         print("Model initialized. Number of GS:", len(self.splats["means"]))
+
+        self.sky_splats = None
+        self.sky_optimizers: Dict[str, torch.optim.Optimizer] = {}
+        if cfg.sky_enabled:
+            self.sky_splats, self.sky_optimizers = create_sky_splats_with_optimizers(
+                count=cfg.sky_num_points,
+                radius=cfg.sky_radius,
+                initial_opacity=cfg.sky_initial_opacity,
+                sh_degree=cfg.sh_degree,
+                sh0_lr=cfg.sky_sh0_lr,
+                shN_lr=cfg.sky_shN_lr,
+                seed=42,
+                device=self.device,
+                world_rank=world_rank,
+                world_size=world_size,
+            )
+            print(
+                "Sky model initialized. Number of sky GS:",
+                len(self.sky_splats["means"]),
+            )
 
         # Densification Strategy
         self.cfg.strategy.check_sanity(self.splats, self.optimizers)
@@ -703,7 +800,6 @@ class Runner:
 
         # Losses & Metrics.
         self.ssim = StructuralSimilarityIndexMeasure(data_range=1.0).to(self.device)
-        self.psnr = PeakSignalNoiseRatio(data_range=1.0).to(self.device)
 
         if cfg.lpips_net == "alex":
             self.lpips = LearnedPerceptualImagePatchSimilarity(
@@ -736,27 +832,30 @@ class Runner:
         masks: Optional[Tensor] = None,
         rasterize_mode: Optional[Literal["classic", "antialiased"]] = None,
         camera_model: Optional[Literal["pinhole", "ortho", "fisheye"]] = None,
+        splats: Optional[torch.nn.ParameterDict] = None,
         **kwargs,
     ) -> Tuple[Tensor, Tensor, Dict]:
-        means = self.splats["means"]  # [N, 3]
+        is_foreground = splats is None
+        splats = self.splats if splats is None else splats
+        means = splats["means"]  # [N, 3]
         # quats = F.normalize(self.splats["quats"], dim=-1)  # [N, 4]
         # rasterization does normalization internally
-        quats = self.splats["quats"]  # [N, 4]
-        scales = torch.exp(self.splats["scales"])  # [N, 3]
-        opacities = torch.sigmoid(self.splats["opacities"])  # [N,]
+        quats = splats["quats"]  # [N, 4]
+        scales = torch.exp(splats["scales"])  # [N, 3]
+        opacities = torch.sigmoid(splats["opacities"])  # [N,]
 
         image_ids = kwargs.pop("image_ids", None)
-        if self.cfg.app_opt:
+        if is_foreground and self.cfg.app_opt:
             colors = self.app_module(
-                features=self.splats["features"],
+                features=splats["features"],
                 embed_ids=image_ids,
                 dirs=means[None, :, :] - camtoworlds[:, None, :3, 3],
                 sh_degree=kwargs.pop("sh_degree", self.cfg.sh_degree),
             )
-            colors = colors + self.splats["colors"]
+            colors = colors + splats["colors"]
             colors = torch.sigmoid(colors)
         else:
-            colors = torch.cat([self.splats["sh0"], self.splats["shN"]], 1)  # [N, K, 3]
+            colors = torch.cat([splats["sh0"], splats["shN"]], 1)  # [N, K, 3]
 
         if rasterize_mode is None:
             rasterize_mode = "antialiased" if self.cfg.antialiased else "classic"
@@ -775,10 +874,10 @@ class Runner:
             packed=self.cfg.packed,
             absgrad=(
                 self.cfg.strategy.absgrad
-                if isinstance(self.cfg.strategy, DefaultStrategy)
+                if is_foreground and isinstance(self.cfg.strategy, DefaultStrategy)
                 else False
             ),
-            sparse_grad=self.cfg.sparse_grad,
+            sparse_grad=self.cfg.sparse_grad if is_foreground else False,
             rasterize_mode=rasterize_mode,
             distributed=self.world_size > 1,
             camera_model=camera_model,
@@ -790,6 +889,58 @@ class Runner:
         if masks is not None:
             render_colors[~masks] = 0
         return render_colors, render_alphas, info
+
+    def render_scene(
+        self,
+        camtoworlds: Tensor,
+        Ks: Tensor,
+        width: int,
+        height: int,
+        masks: Optional[Tensor] = None,
+        rasterize_mode: Optional[Literal["classic", "antialiased"]] = None,
+        camera_model: Optional[Literal["pinhole", "ortho", "fisheye"]] = None,
+        **kwargs,
+    ) -> Tuple[Tensor, Tensor, Dict]:
+        """Render foreground and, when enabled, composite an independent sky."""
+        backgrounds = kwargs.pop("backgrounds", None)
+        foreground_kwargs = dict(kwargs)
+        if self.sky_splats is None and backgrounds is not None:
+            foreground_kwargs["backgrounds"] = backgrounds
+        renders, alphas, info = self.rasterize_splats(
+            camtoworlds=camtoworlds,
+            Ks=Ks,
+            width=width,
+            height=height,
+            masks=masks,
+            rasterize_mode=rasterize_mode,
+            camera_model=camera_model,
+            **foreground_kwargs,
+        )
+        if self.sky_splats is None:
+            return renders, alphas, info
+
+        sky_kwargs = dict(kwargs)
+        sky_kwargs["render_mode"] = "RGB"
+        if backgrounds is not None:
+            sky_kwargs["backgrounds"] = backgrounds
+        sky_colors, _, _ = self.rasterize_splats(
+            camtoworlds=camtoworlds,
+            Ks=Ks,
+            width=width,
+            height=height,
+            masks=masks,
+            rasterize_mode=rasterize_mode,
+            camera_model=camera_model,
+            splats=self.sky_splats,
+            **sky_kwargs,
+        )
+        foreground_colors = renders[..., :3]
+        colors = composite_sky(foreground_colors, alphas, sky_colors[..., :3])
+        if renders.shape[-1] > 3:
+            renders = torch.cat((colors, renders[..., 3:]), dim=-1)
+        else:
+            renders = colors
+        return renders, alphas, info
 
     def train(self):
         cfg = self.cfg
@@ -872,6 +1023,11 @@ class Runner:
             )
             image_ids = data["image_id"].to(device)
             masks = data["mask"].to(device) if "mask" in data else None  # [1, H, W]
+            sky_masks = (
+                data["sky_mask"].to(device) if "sky_mask" in data else None
+            )  # [1, H, W]
+            if cfg.sky_enabled and sky_masks is None:
+                raise RuntimeError("Gaussian sky is enabled but the batch has no sky_mask")
             if masks is not None:
                 pixels = pixels * masks.unsqueeze(-1)
             radial_coeffs = (
@@ -908,6 +1064,9 @@ class Runner:
                         )  # [1, H, W, 3]
                         valid_mask = torch.linalg.vector_norm(raymap, dim=-1) > 1e-6
                     self._fisheye_valid_mask_cache[key] = valid_mask
+                masks = valid_mask if masks is None else masks & valid_mask
+                if sky_masks is not None:
+                    sky_masks = sky_masks & valid_mask
                 # Zero-out invalid pixels for both prediction and target.
                 valid_f = valid_mask.unsqueeze(-1).to(dtype=pixels.dtype)  # [1,H,W,1]
                 pixels = pixels * valid_f
@@ -922,7 +1081,7 @@ class Runner:
             sh_degree_to_use = min(step // cfg.sh_degree_interval, cfg.sh_degree)
 
             # forward
-            renders, alphas, info = self.rasterize_splats(
+            renders, alphas, info = self.render_scene(
                 camtoworlds=camtoworlds,
                 Ks=Ks,
                 width=width,
@@ -1020,6 +1179,17 @@ class Runner:
                 loss += cfg.opacity_reg * torch.sigmoid(self.splats["opacities"]).mean()
             if cfg.scale_reg > 0.0:
                 loss += cfg.scale_reg * torch.exp(self.splats["scales"]).mean()
+            sky_alpha_loss = torch.zeros_like(l1loss)
+            if (
+                self.sky_splats is not None
+                and sky_masks is not None
+                and cfg.sky_alpha_lambda > 0.0
+            ):
+                sky_valid = sky_masks.unsqueeze(-1).to(dtype=alphas.dtype)
+                sky_alpha_loss = (alphas * sky_valid).sum() / sky_valid.sum().clamp_min(
+                    1.0
+                )
+                loss += cfg.sky_alpha_lambda * sky_alpha_loss
 
             do_update = True
             if cfg.skip_non_finite_loss and (not torch.isfinite(loss).all()):
@@ -1042,11 +1212,20 @@ class Runner:
                         info["_strategy_means_grad"] = means_grad.detach()
 
                 if cfg.grad_clip_norm and cfg.grad_clip_norm > 0.0:
+                    parameters = list(self.splats.parameters())
+                    if self.sky_splats is not None:
+                        parameters.extend(
+                            parameter
+                            for parameter in self.sky_splats.parameters()
+                            if parameter.requires_grad
+                        )
                     torch.nn.utils.clip_grad_norm_(
-                        list(self.splats.parameters()), max_norm=cfg.grad_clip_norm
+                        parameters, max_norm=cfg.grad_clip_norm
                     )
 
             desc = f"loss={loss.item():.3f}| " f"sh degree={sh_degree_to_use}| "
+            if self.sky_splats is not None:
+                desc += f"sky alpha={sky_alpha_loss.item():.4f}| "
             if cfg.depth_loss:
                 desc += f"depth loss={depthloss.item():.6f}| "
             if cfg.pose_opt and cfg.pose_noise:
@@ -1071,6 +1250,18 @@ class Runner:
                 self.writer.add_scalar("train/ssimloss", ssimloss.item(), step)
                 self.writer.add_scalar("train/num_GS", len(self.splats["means"]), step)
                 self.writer.add_scalar("train/mem", mem, step)
+                if self.sky_splats is not None:
+                    self.writer.add_scalar(
+                        "train/sky_alpha_loss",
+                        cfg.sky_alpha_lambda * sky_alpha_loss.item(),
+                        step,
+                    )
+                    self.writer.add_scalar(
+                        "train/foreground_alpha_on_sky", sky_alpha_loss.item(), step
+                    )
+                    self.writer.add_scalar(
+                        "train/num_sky_GS", len(self.sky_splats["means"]), step
+                    )
                 if cfg.depth_loss:
                     self.writer.add_scalar("train/depthloss", depthloss.item(), step)
                 if cfg.use_bilateral_grid:
@@ -1089,6 +1280,8 @@ class Runner:
                     "ellipse_time": time.time() - global_tic,
                     "num_GS": len(self.splats["means"]),
                 }
+                if self.sky_splats is not None:
+                    stats["num_sky_GS"] = len(self.sky_splats["means"])
                 print("Step: ", step, stats)
                 with open(
                     f"{self.stats_dir}/train_step{step:04d}_rank{self.world_rank}.json",
@@ -1096,6 +1289,8 @@ class Runner:
                 ) as f:
                     json.dump(stats, f)
                 data = {"step": step, "splats": self.splats.state_dict()}
+                if self.sky_splats is not None:
+                    data["sky_splats"] = self.sky_splats.state_dict()
                 if cfg.pose_opt:
                     if world_size > 1:
                         data["pose_adjust"] = self.pose_adjust.module.state_dict()
@@ -1143,6 +1338,17 @@ class Runner:
                     format="ply",
                     save_to=f"{self.ply_dir}/point_cloud_{step}.ply",
                 )
+                if self.sky_splats is not None:
+                    export_splats(
+                        means=self.sky_splats["means"],
+                        scales=self.sky_splats["scales"],
+                        quats=self.sky_splats["quats"],
+                        opacities=self.sky_splats["opacities"],
+                        sh0=self.sky_splats["sh0"],
+                        shN=self.sky_splats["shN"],
+                        format="ply",
+                        save_to=f"{self.ply_dir}/sky_{step}.ply",
+                    )
 
             # Turn Gradients into Sparse Tensor before running optimizer
             if cfg.sparse_grad:
@@ -1180,6 +1386,10 @@ class Runner:
             else:
                 for optimizer in self.optimizers.values():
                     optimizer.zero_grad(set_to_none=True)
+            for optimizer in self.sky_optimizers.values():
+                if do_update:
+                    optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
             for optimizer in self.pose_optimizers:
                 if do_update:
                     optimizer.step()
@@ -1209,6 +1419,8 @@ class Runner:
                     self.splats["quats"].data = F.normalize(
                         self.splats["quats"].data, dim=-1, eps=1e-12
                     )
+                if self.sky_splats is not None:
+                    clamp_sky_sh_colors(self.sky_splats, cfg.sh_degree)
 
             # Run post-backward steps after backward and optimizer
             if do_update:
@@ -1255,12 +1467,21 @@ class Runner:
                 # Update the scene.
                 self.viewer.update(step, num_train_rays_per_step)
 
-    def _metric_value(self, metric, prediction: Tensor, target: Tensor) -> Tensor:
-        """Compute one image metric without retaining state across images/splits."""
-        metric.reset()
-        value = metric(prediction, target).detach().clone()
-        metric.reset()
-        return value
+    def _append_image_metrics(
+        self,
+        metrics,
+        prefix: str,
+        prediction: Tensor,
+        target: Tensor,
+        mask: Optional[Tensor],
+    ) -> None:
+        metrics[f"{prefix}psnr"].append(masked_psnr(prediction, target, mask))
+        metrics[f"{prefix}ssim"].append(
+            masked_ssim(self.ssim, prediction, target, mask)
+        )
+        metrics[f"{prefix}lpips"].append(
+            masked_lpips(self.lpips, prediction, target, mask)
+        )
 
     @torch.no_grad()
     def _eval_dataset(
@@ -1285,6 +1506,9 @@ class Runner:
             Ks = data["K"].to(device)
             pixels = data["image"].to(device) / 255.0
             masks = data["mask"].to(device) if "mask" in data else None
+            sky_masks = (
+                data["sky_mask"].to(device) if "sky_mask" in data else None
+            )
             if masks is not None:
                 pixels = pixels * masks.unsqueeze(-1)
             image_ids = data["image_id"].to(device)
@@ -1305,7 +1529,7 @@ class Runner:
 
             torch.cuda.synchronize()
             tic = time.time()
-            colors, _, _ = self.rasterize_splats(
+            colors, _, _ = self.render_scene(
                 camtoworlds=camtoworlds,
                 Ks=Ks,
                 width=width,
@@ -1331,29 +1555,28 @@ class Runner:
                     canvas,
                 )
 
-                pixels_p = pixels.permute(0, 3, 1, 2)  # [1, 3, H, W]
-                colors_p = colors.permute(0, 3, 1, 2)  # [1, 3, H, W]
-                metrics["psnr"].append(
-                    self._metric_value(self.psnr, colors_p, pixels_p)
-                )
-                metrics["ssim"].append(
-                    self._metric_value(self.ssim, colors_p, pixels_p)
-                )
-                metrics["lpips"].append(
-                    self._metric_value(self.lpips, colors_p, pixels_p)
-                )
+                self._append_image_metrics(metrics, "", colors, pixels, masks)
+                no_sky_mask = None
+                if sky_masks is not None:
+                    no_sky_mask = ~sky_masks
+                    if masks is not None:
+                        no_sky_mask = no_sky_mask & masks
+                    self._append_image_metrics(
+                        metrics, "no_sky_", colors, pixels, no_sky_mask
+                    )
                 if cfg.use_bilateral_grid:
-                    cc_colors = color_correct(colors, pixels)
-                    cc_colors_p = cc_colors.permute(0, 3, 1, 2)  # [1, 3, H, W]
-                    metrics["cc_psnr"].append(
-                        self._metric_value(self.psnr, cc_colors_p, pixels_p)
+                    cc_colors = color_correct(colors, pixels).clamp(0.0, 1.0)
+                    self._append_image_metrics(
+                        metrics, "cc_", cc_colors, pixels, masks
                     )
-                    metrics["cc_ssim"].append(
-                        self._metric_value(self.ssim, cc_colors_p, pixels_p)
-                    )
-                    metrics["cc_lpips"].append(
-                        self._metric_value(self.lpips, cc_colors_p, pixels_p)
-                    )
+                    if no_sky_mask is not None:
+                        self._append_image_metrics(
+                            metrics,
+                            "no_sky_cc_",
+                            cc_colors,
+                            pixels,
+                            no_sky_mask,
+                        )
 
         if world_rank != 0:
             return {}
@@ -1396,12 +1619,14 @@ class Runner:
                     "num_GS": len(self.splats["means"]),
                 }
             )
+            if self.sky_splats is not None:
+                stats["num_sky_GS"] = len(self.sky_splats["means"])
 
             if cfg.use_bilateral_grid:
                 print(
-                    f"Val PSNR: {stats['psnr']:.3f}, SSIM: {stats['ssim']:.4f}, LPIPS: {stats['lpips']:.3f}, "
+                    f"Val full PSNR: {stats['psnr']:.3f}, SSIM: {stats['ssim']:.4f}, LPIPS: {stats['lpips']:.3f}, "
                     f"CC_PSNR: {stats['cc_psnr']:.3f}, CC_SSIM: {stats['cc_ssim']:.4f}, CC_LPIPS: {stats['cc_lpips']:.3f}; "
-                    f"Train PSNR: {stats['train_psnr']:.3f}, SSIM: {stats['train_ssim']:.4f}, LPIPS: {stats['train_lpips']:.3f}, "
+                    f"Train full PSNR: {stats['train_psnr']:.3f}, SSIM: {stats['train_ssim']:.4f}, LPIPS: {stats['train_lpips']:.3f}, "
                     f"CC_PSNR: {stats['train_cc_psnr']:.3f}, CC_SSIM: {stats['train_cc_ssim']:.4f}, CC_LPIPS: {stats['train_cc_lpips']:.3f}; "
                     f"Val time: {stats['ellipse_time']:.3f}s/image, "
                     f"Train time: {stats['train_ellipse_time']:.3f}s/image, "
@@ -1409,11 +1634,20 @@ class Runner:
                 )
             else:
                 print(
-                    f"Val PSNR: {stats['psnr']:.3f}, SSIM: {stats['ssim']:.4f}, LPIPS: {stats['lpips']:.3f}; "
-                    f"Train PSNR: {stats['train_psnr']:.3f}, SSIM: {stats['train_ssim']:.4f}, LPIPS: {stats['train_lpips']:.3f}; "
+                    f"Val full PSNR: {stats['psnr']:.3f}, SSIM: {stats['ssim']:.4f}, LPIPS: {stats['lpips']:.3f}; "
+                    f"Train full PSNR: {stats['train_psnr']:.3f}, SSIM: {stats['train_ssim']:.4f}, LPIPS: {stats['train_lpips']:.3f}; "
                     f"Val time: {stats['ellipse_time']:.3f}s/image, "
                     f"Train time: {stats['train_ellipse_time']:.3f}s/image, "
                     f"Number of GS: {stats['num_GS']}"
+                )
+            if "no_sky_psnr" in stats:
+                print(
+                    f"Val no-sky PSNR: {stats['no_sky_psnr']:.3f}, "
+                    f"SSIM: {stats['no_sky_ssim']:.4f}, "
+                    f"LPIPS: {stats['no_sky_lpips']:.3f}; "
+                    f"Train no-sky PSNR: {stats['train_no_sky_psnr']:.3f}, "
+                    f"SSIM: {stats['train_no_sky_ssim']:.4f}, "
+                    f"LPIPS: {stats['train_no_sky_lpips']:.3f}"
                 )
             with open(f"{self.stats_dir}/{stage}_step{step:04d}.json", "w") as f:
                 json.dump(stats, f)
@@ -1491,7 +1725,7 @@ class Runner:
             camtoworlds = camtoworlds_all[i : i + 1]
             Ks = K[None]
 
-            renders, _, _ = self.rasterize_splats(
+            renders, _, _ = self.render_scene(
                 camtoworlds=camtoworlds,
                 Ks=Ks,
                 width=width,
@@ -1556,7 +1790,7 @@ class Runner:
             "alpha": "RGB",
         }
 
-        render_colors, render_alphas, info = self.rasterize_splats(
+        render_colors, render_alphas, info = self.render_scene(
             camtoworlds=c2w[None],
             Ks=K[None],
             width=width,
@@ -1623,6 +1857,16 @@ def main(local_rank: int, world_rank, world_size: int, cfg: Config):
         ]
         for k in runner.splats.keys():
             runner.splats[k].data = torch.cat([ckpt["splats"][k] for ckpt in ckpts])
+        if runner.sky_splats is not None:
+            if any("sky_splats" not in ckpt for ckpt in ckpts):
+                raise ValueError(
+                    "The selected checkpoint predates Gaussian sky state; "
+                    "evaluate it with --no-sky-enabled or use a sky checkpoint."
+                )
+            for k in runner.sky_splats.keys():
+                runner.sky_splats[k].data = torch.cat(
+                    [ckpt["sky_splats"][k] for ckpt in ckpts]
+                )
         step = ckpts[0]["step"]
         runner.eval(step=step)
         runner.render_traj(step=step)

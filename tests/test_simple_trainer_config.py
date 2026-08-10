@@ -17,6 +17,10 @@ class SimpleTrainerConfigTest(unittest.TestCase):
 preset: default
 save_ply: true
 eval_steps: [10, 20]
+init_type: lidar
+init_use_knn_pca: true
+sky_enabled: true
+sky_mask_dir: semantic_masks/sky
 strategy:
   max_gaussians: 100
 """,
@@ -31,6 +35,9 @@ strategy:
             self.assertEqual(cfg.eval_steps, [10, 20])
             self.assertEqual(cfg.max_steps, 30)
             self.assertEqual(cfg.strategy.max_gaussians, 100)
+            self.assertTrue(cfg.init_use_knn_pca)
+            self.assertTrue(cfg.sky_enabled)
+            self.assertEqual(cfg.sky_mask_dir, "semantic_masks/sky")
 
 
 if __name__ == "__main__":
