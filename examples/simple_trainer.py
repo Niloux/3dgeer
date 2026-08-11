@@ -155,6 +155,9 @@ class Config:
     result_dir: str = "results/garden"
     # Every N images there is a test image
     test_every: int = 8
+    # Disable the held-out test/validation split while keeping test_every as the
+    # interval for sampled training-set evaluation.
+    use_test_split: bool = True
     # Optional inclusive frame-id range parsed from names such as *_00063-L.png.
     frame_id_min: Optional[int] = None
     frame_id_max: Optional[int] = None
@@ -630,6 +633,7 @@ class Runner:
             factor=cfg.data_factor,
             normalize=cfg.normalize_world_space,
             test_every=cfg.test_every,
+            use_test_split=cfg.use_test_split,
             undistort=not cfg.keep_distortion,
         )
         parser_kwargs["max_fisheye_fov"] = cfg.max_fisheye_fov
@@ -646,8 +650,8 @@ class Runner:
             load_depths=cfg.depth_loss,
         )
         self.valset = dataset_cls(self.parser, split="val")
-        # Keep the validation split disjoint from training while rendering a
-        # lightweight, deterministic sample of training images at eval time.
+        # Render a lightweight, deterministic sample of training images at eval
+        # time. When the held-out split is disabled, trainset contains all images.
         self.train_evalset = torch.utils.data.Subset(
             self.trainset,
             range(0, len(self.trainset), cfg.test_every),
@@ -1594,12 +1598,14 @@ class Runner:
         print("Running evaluation...")
         cfg = self.cfg
         world_rank = self.world_rank
-        val_stats = self._eval_dataset(
-            self.valset,
-            step,
-            stage,
-            apply_train_adjustment=False,
-        )
+        val_stats = {}
+        if len(self.valset) > 0:
+            val_stats = self._eval_dataset(
+                self.valset,
+                step,
+                stage,
+                apply_train_adjustment=False,
+            )
         train_stats = self._eval_dataset(
             self.train_evalset,
             step,
@@ -1608,21 +1614,35 @@ class Runner:
         )
 
         if world_rank == 0:
-            val_image_count = val_stats.pop("num_images", 0.0)
+            val_image_count = val_stats.pop("num_images", 0)
             train_image_count = train_stats.pop("num_images", 0.0)
             stats = dict(val_stats)
             stats.update({f"train_{k}": v for k, v in train_stats.items()})
             stats.update(
                 {
-                    "num_val_images": val_image_count,
                     "num_train_images": train_image_count,
                     "num_GS": len(self.splats["means"]),
                 }
             )
+            if val_image_count:
+                stats["num_val_images"] = val_image_count
             if self.sky_splats is not None:
                 stats["num_sky_GS"] = len(self.sky_splats["means"])
 
-            if cfg.use_bilateral_grid:
+            if not val_image_count and cfg.use_bilateral_grid:
+                print(
+                    f"Train full PSNR: {stats['train_psnr']:.3f}, SSIM: {stats['train_ssim']:.4f}, LPIPS: {stats['train_lpips']:.3f}, "
+                    f"CC_PSNR: {stats['train_cc_psnr']:.3f}, CC_SSIM: {stats['train_cc_ssim']:.4f}, CC_LPIPS: {stats['train_cc_lpips']:.3f}; "
+                    f"Train time: {stats['train_ellipse_time']:.3f}s/image, "
+                    f"Number of GS: {stats['num_GS']}"
+                )
+            elif not val_image_count:
+                print(
+                    f"Train full PSNR: {stats['train_psnr']:.3f}, SSIM: {stats['train_ssim']:.4f}, LPIPS: {stats['train_lpips']:.3f}; "
+                    f"Train time: {stats['train_ellipse_time']:.3f}s/image, "
+                    f"Number of GS: {stats['num_GS']}"
+                )
+            elif cfg.use_bilateral_grid:
                 print(
                     f"Val full PSNR: {stats['psnr']:.3f}, SSIM: {stats['ssim']:.4f}, LPIPS: {stats['lpips']:.3f}, "
                     f"CC_PSNR: {stats['cc_psnr']:.3f}, CC_SSIM: {stats['cc_ssim']:.4f}, CC_LPIPS: {stats['cc_lpips']:.3f}; "
@@ -1645,6 +1665,12 @@ class Runner:
                     f"Val no-sky PSNR: {stats['no_sky_psnr']:.3f}, "
                     f"SSIM: {stats['no_sky_ssim']:.4f}, "
                     f"LPIPS: {stats['no_sky_lpips']:.3f}; "
+                    f"Train no-sky PSNR: {stats['train_no_sky_psnr']:.3f}, "
+                    f"SSIM: {stats['train_no_sky_ssim']:.4f}, "
+                    f"LPIPS: {stats['train_no_sky_lpips']:.3f}"
+                )
+            elif "train_no_sky_psnr" in stats:
+                print(
                     f"Train no-sky PSNR: {stats['train_no_sky_psnr']:.3f}, "
                     f"SSIM: {stats['train_no_sky_ssim']:.4f}, "
                     f"LPIPS: {stats['train_no_sky_lpips']:.3f}"

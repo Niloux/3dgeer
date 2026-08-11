@@ -123,11 +123,15 @@ class Parser:
         frame_id_min: Optional[int] = None,
         frame_id_max: Optional[int] = None,
         sky_mask_dir: Optional[str] = None,
+        use_test_split: bool = True,
     ):
         self.data_dir = data_dir
         self.factor = factor
         self.normalize = normalize
+        if test_every <= 0:
+            raise ValueError("test_every must be positive")
         self.test_every = test_every
+        self.use_test_split = use_test_split
         self.undistort = undistort
         self.max_fisheye_fov = max_fisheye_fov
         if sky_mask_dir is not None and not os.path.isabs(sky_mask_dir):
@@ -535,7 +539,9 @@ class Dataset:
         self.patch_size = patch_size
         self.load_depths = load_depths
         indices = np.arange(len(self.parser.image_names))
-        if split == "train":
+        if not self.parser.use_test_split:
+            self.indices = indices if split == "train" else indices[:0]
+        elif split == "train":
             self.indices = indices[indices % self.parser.test_every != 0]
         else:
             self.indices = indices[indices % self.parser.test_every == 0]
