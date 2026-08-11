@@ -608,7 +608,13 @@ rasterize_to_pixels_from_world_3dgs_fwd(
     const at::Tensor flatten_ids   // [n_isects]
 );
 
-std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+std::tuple<
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor>
 rasterize_to_pixels_from_world_3dgs_bwd(
     // Gaussian parameters
     const at::Tensor means,                     // [..., N, 3]
@@ -643,7 +649,8 @@ rasterize_to_pixels_from_world_3dgs_bwd(
     const at::Tensor last_ids,        // [..., C, image_height, image_width]
     // gradients of outputs
     const at::Tensor v_render_colors, // [..., C, image_height, image_width, 3]
-    const at::Tensor v_render_alphas  // [..., C, image_height, image_width, 1]
+    const at::Tensor v_render_alphas, // [..., C, image_height, image_width, 1]
+    const bool viewmats_requires_grad
 );
 
 } // namespace gsplat

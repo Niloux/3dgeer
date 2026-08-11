@@ -818,7 +818,13 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> rasterize_to_pixels_from_world_3d
 };
 
 
-std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+std::tuple<
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor>
 rasterize_to_pixels_from_world_3dgs_bwd(
     // Gaussian parameters
     const at::Tensor means,  // [..., N, 3]
@@ -852,7 +858,8 @@ rasterize_to_pixels_from_world_3dgs_bwd(
     const at::Tensor last_ids,      // [..., C, image_height, image_width]
     // gradients of outputs
     const at::Tensor v_render_colors, // [..., C, image_height, image_width, 3]
-    const at::Tensor v_render_alphas // [..., C, image_height, image_width, 1]
+    const at::Tensor v_render_alphas, // [..., C, image_height, image_width, 1]
+    const bool viewmats_requires_grad
 ) {
     DEVICE_GUARD(means);
     CHECK_INPUT(means);
@@ -880,6 +887,7 @@ rasterize_to_pixels_from_world_3dgs_bwd(
     at::Tensor v_scales = at::zeros_like(scales);
     at::Tensor v_colors = at::zeros_like(colors);
     at::Tensor v_opacities = at::zeros_like(opacities);
+    at::Tensor v_viewmats = at::zeros_like(viewmats0);
 
 #define __LAUNCH_KERNEL__(N)                                                   \
     case N:                                                                    \
@@ -910,11 +918,13 @@ rasterize_to_pixels_from_world_3dgs_bwd(
             last_ids,                                                          \
             v_render_colors,                                                   \
             v_render_alphas,                                                   \
+            viewmats_requires_grad,                                            \
             v_means,                                                           \
             v_quats,                                                           \
             v_scales,                                                          \
             v_colors,                                                          \
-            v_opacities                                                        \
+            v_opacities,                                                       \
+            v_viewmats                                                         \
         );                                                                     \
         break;
 
@@ -947,7 +957,7 @@ rasterize_to_pixels_from_world_3dgs_bwd(
 #undef __LAUNCH_KERNEL__
 
     return std::make_tuple(
-        v_means, v_quats, v_scales, v_colors, v_opacities
+        v_means, v_quats, v_scales, v_colors, v_opacities, v_viewmats
     );
 }
 

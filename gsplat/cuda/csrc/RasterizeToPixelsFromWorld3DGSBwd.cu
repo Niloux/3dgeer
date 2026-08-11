@@ -62,7 +62,8 @@ __global__ void rasterize_to_pixels_from_world_3dgs_bwd_kernel(
     vec4 *__restrict__ v_quats,        // [B, N, 4]
     vec3 *__restrict__ v_scales,       // [B, N, 3]
     scalar_t *__restrict__ v_colors,   // [B, C, N, CDIM] or [nnz, CDIM]
-    scalar_t *__restrict__ v_opacities // [B, C, N] or [nnz]
+    scalar_t *__restrict__ v_opacities, // [B, C, N] or [nnz]
+    scalar_t *__restrict__ v_viewmats   // [B, C, 4, 4] optional
 ) {
     auto block = cg::this_thread_block();
     uint32_t iid = block.group_index().x;
@@ -201,6 +202,8 @@ __global__ void rasterize_to_pixels_from_world_3dgs_bwd_kernel(
         v_render_c[k] = v_render_colors[pix_id * CDIM + k];
     }
     const float v_render_a = v_render_alphas[pix_id];
+    vec3 v_ray_o = {0.f, 0.f, 0.f};
+    vec3 v_ray_d = {0.f, 0.f, 0.f};
 
     // collect and process batches of gaussians
     // each thread loads one gaussian at a time before rasterizing
@@ -343,6 +346,8 @@ __global__ void rasterize_to_pixels_from_world_3dgs_bwd_kernel(
                         glm::outerProduct(v_gro, o_minus_mu);
                     vec3 v_o_minus_mu = glm::transpose(Mt) * v_gro;
 
+                    v_ray_o += v_o_minus_mu;
+                    v_ray_d += glm::transpose(Mt) * v_grd;
                     v_mean_local += -v_o_minus_mu;
                     quat_scale_to_preci_half_vjp(
                         quat, scale, R, glm::transpose(v_Mt), v_quat_local, v_scale_local
@@ -391,6 +396,43 @@ __global__ void rasterize_to_pixels_from_world_3dgs_bwd_kernel(
             }
         }
     }
+
+    if (v_viewmats != nullptr) {
+        const scalar_t *viewmat = viewmats0 + iid * 16;
+        const mat3 view_R(
+            viewmat[0],
+            viewmat[4],
+            viewmat[8],
+            viewmat[1],
+            viewmat[5],
+            viewmat[9],
+            viewmat[2],
+            viewmat[6],
+            viewmat[10]
+        );
+        const vec3 view_t = {viewmat[3], viewmat[7], viewmat[11]};
+        const vec3 camera_ray_d = view_R * ray_d;
+        // Global shutter: ray_o = -R^T t and ray_d = R^T camera_ray_d.
+        mat3 v_view_R = glm::outerProduct(camera_ray_d, v_ray_d) -
+                        glm::outerProduct(view_t, v_ray_o);
+        vec3 v_view_t = -view_R * v_ray_o;
+
+        warpSum(v_view_R, warp);
+        warpSum(v_view_t, warp);
+        if (warp.thread_rank() == 0) {
+            scalar_t *v_viewmat = v_viewmats + iid * 16;
+#pragma unroll
+            for (uint32_t row = 0; row < 3; ++row) {
+#pragma unroll
+                for (uint32_t col = 0; col < 3; ++col) {
+                    gpuAtomicAdd(
+                        v_viewmat + row * 4 + col, v_view_R[col][row]
+                    );
+                }
+                gpuAtomicAdd(v_viewmat + row * 4 + 3, v_view_t[row]);
+            }
+        }
+    }
 }
 
 template <uint32_t CDIM>
@@ -428,12 +470,14 @@ void launch_rasterize_to_pixels_from_world_3dgs_bwd_kernel(
     // gradients of outputs
     const at::Tensor v_render_colors, // [..., C, image_height, image_width, 3]
     const at::Tensor v_render_alphas, // [..., C, image_height, image_width, 1]
+    const bool viewmats_requires_grad,
     // outputs
     at::Tensor v_means,      // [..., N, 3]
     at::Tensor v_quats,      // [..., N, 4]
     at::Tensor v_scales,     // [..., N, 3]
     at::Tensor v_colors,     // [..., C, N, 3] or [nnz, 3]
-    at::Tensor v_opacities   // [..., C, N] or [nnz]
+    at::Tensor v_opacities,  // [..., C, N] or [nnz]
+    at::Tensor v_viewmats    // [..., C, 4, 4]
 ) {
     bool packed = opacities.dim() == 1;
     assert (packed == false); // only support non-packed for now
@@ -525,7 +569,8 @@ void launch_rasterize_to_pixels_from_world_3dgs_bwd_kernel(
             reinterpret_cast<vec4 *>(v_quats.data_ptr<float>()),
             reinterpret_cast<vec3 *>(v_scales.data_ptr<float>()),
             v_colors.data_ptr<float>(),
-            v_opacities.data_ptr<float>()
+            v_opacities.data_ptr<float>(),
+            viewmats_requires_grad ? v_viewmats.data_ptr<float>() : nullptr
         );
 }
 
@@ -560,11 +605,13 @@ void launch_rasterize_to_pixels_from_world_3dgs_bwd_kernel(
         const at::Tensor last_ids,                                             \
         const at::Tensor v_render_colors,                                      \
         const at::Tensor v_render_alphas,                                      \
+        const bool viewmats_requires_grad,                                     \
         at::Tensor v_means,                                                    \
         at::Tensor v_quats,                                                    \
         at::Tensor v_scales,                                                   \
         at::Tensor v_colors,                                                   \
-        at::Tensor v_opacities                                                 \
+        at::Tensor v_opacities,                                                \
+        at::Tensor v_viewmats                                                  \
     );
 
 __INS__(1)

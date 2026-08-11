@@ -1728,6 +1728,7 @@ class _RasterizeToPixelsEval3D(torch.autograd.Function):
         rolling_shutter: RollingShutterType = RollingShutterType.GLOBAL,
         viewmats_rs: Optional[Tensor] = None,  # [..., C, 4, 4]
     ) -> Tuple[Tensor, Tensor]:
+        ctx.rolling_shutter = rolling_shutter
         ut_params = ut_params.to_cpp()
         rs_type = rolling_shutter.to_cpp()
         camera_model_type = _make_lazy_cuda_obj(
@@ -1827,10 +1828,28 @@ class _RasterizeToPixelsEval3D(torch.autograd.Function):
         camera_model_type = ctx.camera_model_type
         tile_size = ctx.tile_size
         ftheta_coeffs = ctx.ftheta_coeffs
+        viewmats_requires_grad = ctx.needs_input_grad[7]
+        viewmats_rs_requires_grad = ctx.needs_input_grad[21]
 
-        (v_means, v_quats, v_scales, v_colors, v_opacities,) = _make_lazy_cuda_func(
-            "rasterize_to_pixels_from_world_3dgs_bwd"
-        )(
+        if viewmats_rs_requires_grad:
+            raise NotImplementedError(
+                "eval3d camera gradients do not support viewmats_rs"
+            )
+        if viewmats_requires_grad and (
+            ctx.rolling_shutter is not RollingShutterType.GLOBAL
+        ):
+            raise NotImplementedError(
+                "eval3d camera gradients currently support global shutter only"
+            )
+
+        (
+            v_means,
+            v_quats,
+            v_scales,
+            v_colors,
+            v_opacities,
+            v_viewmats,
+        ) = _make_lazy_cuda_func("rasterize_to_pixels_from_world_3dgs_bwd")(
             means,
             quats,
             scales,
@@ -1857,6 +1876,7 @@ class _RasterizeToPixelsEval3D(torch.autograd.Function):
             last_ids,
             v_render_colors.contiguous(),
             v_render_alphas.contiguous(),
+            viewmats_requires_grad,
         )
 
         if ctx.needs_input_grad[5]:  # backgrounds
@@ -1866,8 +1886,8 @@ class _RasterizeToPixelsEval3D(torch.autograd.Function):
         else:
             v_backgrounds = None
 
-        if ctx.needs_input_grad[7]:  # viewmats
-            raise NotImplementedError
+        if not viewmats_requires_grad:
+            v_viewmats = None
 
         return (
             v_means,
@@ -1877,8 +1897,7 @@ class _RasterizeToPixelsEval3D(torch.autograd.Function):
             v_opacities,
             v_backgrounds,
             None,
-            None,
-            None,
+            v_viewmats,
             None,
             None,
             None,
