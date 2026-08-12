@@ -303,6 +303,8 @@ class Config:
 
     # Enable camera optimization.
     pose_opt: bool = False
+    # Start camera optimization at this training step (inclusive).
+    pose_opt_start_step: int = 0
     # Learning rate for camera optimization
     pose_opt_lr: float = 1e-5
     # Regularization for camera optimization as weight decay
@@ -364,6 +366,7 @@ class Config:
         self.save_steps = [int(i * factor) for i in self.save_steps]
         self.ply_steps = [int(i * factor) for i in self.ply_steps]
         self.max_steps = int(self.max_steps * factor)
+        self.pose_opt_start_step = int(self.pose_opt_start_step * factor)
         self.sh_degree_interval = int(self.sh_degree_interval * factor)
 
         strategy = self.strategy
@@ -640,6 +643,8 @@ class Runner:
             cfg.calib_opt_max_radial_delta,
         ) <= 0.0:
             raise ValueError("calib_opt parameter bounds must be positive")
+        if cfg.pose_opt_start_step < 0:
+            raise ValueError("pose_opt_start_step must be non-negative")
 
         # Where to dump results.
         os.makedirs(cfg.result_dir, exist_ok=True)
@@ -1070,12 +1075,12 @@ class Runner:
                 self.optimizers["means"], gamma=0.01 ** (1.0 / max_steps)
             ),
         ]
-        if cfg.pose_opt:
+        pose_scheduler = None
+        if cfg.pose_opt and cfg.pose_opt_start_step < max_steps:
             # pose optimization has a learning rate schedule
-            schedulers.append(
-                torch.optim.lr_scheduler.ExponentialLR(
-                    self.pose_optimizers[0], gamma=0.01 ** (1.0 / max_steps)
-                )
+            pose_opt_steps = max_steps - cfg.pose_opt_start_step
+            pose_scheduler = torch.optim.lr_scheduler.ExponentialLR(
+                self.pose_optimizers[0], gamma=0.01 ** (1.0 / pose_opt_steps)
             )
         if cfg.calib_opt:
             schedulers.append(
@@ -1196,7 +1201,8 @@ class Runner:
             if cfg.pose_noise:
                 camtoworlds = self.pose_perturb(camtoworlds, image_ids)
 
-            if cfg.pose_opt:
+            pose_opt_active = cfg.pose_opt and step >= cfg.pose_opt_start_step
+            if pose_opt_active:
                 camtoworlds = self.pose_adjust(camtoworlds, image_ids)
 
             # sh schedule
@@ -1534,7 +1540,7 @@ class Runner:
                     optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
             for optimizer in self.pose_optimizers:
-                if do_update:
+                if do_update and pose_opt_active:
                     optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
             for optimizer in self.calibration_optimizers:
@@ -1552,6 +1558,8 @@ class Runner:
             if do_update:
                 for scheduler in schedulers:
                     scheduler.step()
+                if pose_opt_active and pose_scheduler is not None:
+                    pose_scheduler.step()
 
                 # Post-step parameter clamps for numerical stability.
                 if cfg.scales_log_max > cfg.scales_log_min:

@@ -9,11 +9,19 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "examples"))
 
-from simple_trainer import Runner, parse_config
+from simple_trainer import Config, Runner, parse_config
 from utils import CameraCalibrationOptModule
 
 
 class SimpleTrainerConfigTest(unittest.TestCase):
+    def test_step_scaling_includes_pose_optimization_start(self):
+        cfg = Config(max_steps=30_000, pose_opt_start_step=1_000)
+
+        cfg.adjust_steps(0.5)
+
+        self.assertEqual(cfg.max_steps, 15_000)
+        self.assertEqual(cfg.pose_opt_start_step, 500)
+
     def test_camera_calibration_module_shares_physical_camera_parameters(self):
         module = CameraCalibrationOptModule(2)
         with torch.no_grad():
@@ -93,6 +101,8 @@ init_type: lidar
 init_use_knn_pca: true
 calib_opt: true
 calib_opt_radial_lr: 2.0e-6
+pose_opt: true
+pose_opt_start_step: 1000
 sky_enabled: true
 sky_mask_dir: semantic_masks/sky
 strategy:
@@ -113,6 +123,8 @@ strategy:
             self.assertTrue(cfg.init_use_knn_pca)
             self.assertTrue(cfg.calib_opt)
             self.assertEqual(cfg.calib_opt_radial_lr, 2.0e-6)
+            self.assertTrue(cfg.pose_opt)
+            self.assertEqual(cfg.pose_opt_start_step, 1000)
             self.assertTrue(cfg.sky_enabled)
             self.assertEqual(cfg.sky_mask_dir, "semantic_masks/sky")
 
