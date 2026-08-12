@@ -4,7 +4,7 @@ import math
 import os
 import sys
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple, Union
@@ -348,6 +348,8 @@ class Config:
 
     # Dump information to tensorboard every this steps
     tb_every: int = 100
+    # Number of training steps used for TensorBoard loss moving averages.
+    tb_loss_window: int = 100
     # Save training images to tensorboard
     tb_save_image: bool = False
 
@@ -645,6 +647,8 @@ class Runner:
             raise ValueError("calib_opt parameter bounds must be positive")
         if cfg.pose_opt_start_step < 0:
             raise ValueError("pose_opt_start_step must be non-negative")
+        if cfg.tb_loss_window <= 0:
+            raise ValueError("tb_loss_window must be positive")
 
         # Where to dump results.
         os.makedirs(cfg.result_dir, exist_ok=True)
@@ -1115,6 +1119,9 @@ class Runner:
             pin_memory=True,
         )
         trainloader_iter = iter(trainloader)
+        loss_history = deque(maxlen=cfg.tb_loss_window)
+        l1loss_history = deque(maxlen=cfg.tb_loss_window)
+        ssimloss_history = deque(maxlen=cfg.tb_loss_window)
 
         # Training loop.
         global_tic = time.time()
@@ -1351,6 +1358,16 @@ class Runner:
                         parameters, max_norm=cfg.grad_clip_norm
                     )
 
+            loss_value = loss.detach().item()
+            l1loss_value = l1loss.detach().item()
+            ssimloss_value = ssimloss.detach().item()
+            if math.isfinite(loss_value):
+                loss_history.append(loss_value)
+            if math.isfinite(l1loss_value):
+                l1loss_history.append(l1loss_value)
+            if math.isfinite(ssimloss_value):
+                ssimloss_history.append(ssimloss_value)
+
             desc = f"loss={loss.item():.3f}| " f"sh degree={sh_degree_to_use}| "
             if self.sky_splats is not None:
                 desc += f"sky alpha={sky_alpha_loss.item():.4f}| "
@@ -1376,6 +1393,46 @@ class Runner:
                 self.writer.add_scalar("train/loss", loss.item(), step)
                 self.writer.add_scalar("train/l1loss", l1loss.item(), step)
                 self.writer.add_scalar("train/ssimloss", ssimloss.item(), step)
+                self.writer.add_scalar(
+                    "train/loss_ma",
+                    sum(loss_history) / len(loss_history)
+                    if loss_history
+                    else float("nan"),
+                    step,
+                )
+                self.writer.add_scalar(
+                    "train/l1loss_ma",
+                    sum(l1loss_history) / len(l1loss_history)
+                    if l1loss_history
+                    else float("nan"),
+                    step,
+                )
+                self.writer.add_scalar(
+                    "train/ssimloss_ma",
+                    sum(ssimloss_history) / len(ssimloss_history)
+                    if ssimloss_history
+                    else float("nan"),
+                    step,
+                )
+                image_ids_cpu = image_ids.detach().cpu().reshape(-1).tolist()
+                image_details = []
+                for image_id in image_ids_cpu:
+                    dataset_index = int(self.trainset.indices[int(image_id)])
+                    image_details.append(
+                        {
+                            "image_id": int(image_id),
+                            "image_name": self.parser.image_names[dataset_index],
+                            "image_path": self.parser.image_paths[dataset_index],
+                        }
+                    )
+                self.writer.add_text(
+                    "train/image",
+                    json.dumps(image_details, ensure_ascii=False),
+                    step,
+                )
+                self.writer.add_scalar(
+                    "train/image_id", image_details[0]["image_id"], step
+                )
                 self.writer.add_scalar("train/num_GS", len(self.splats["means"]), step)
                 self.writer.add_scalar("train/mem", mem, step)
                 if cfg.calib_opt:

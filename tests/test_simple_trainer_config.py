@@ -103,6 +103,7 @@ calib_opt: true
 calib_opt_radial_lr: 2.0e-6
 pose_opt: true
 pose_opt_start_step: 1000
+tb_loss_window: 50
 sky_enabled: true
 sky_mask_dir: semantic_masks/sky
 strategy:
@@ -125,6 +126,7 @@ strategy:
             self.assertEqual(cfg.calib_opt_radial_lr, 2.0e-6)
             self.assertTrue(cfg.pose_opt)
             self.assertEqual(cfg.pose_opt_start_step, 1000)
+            self.assertEqual(cfg.tb_loss_window, 50)
             self.assertTrue(cfg.sky_enabled)
             self.assertEqual(cfg.sky_mask_dir, "semantic_masks/sky")
 

@@ -1,14 +1,16 @@
 preset: default
 
 # Generated for examples/simple_trainer.py.
-data_dir: "/home/wuyou/remote/colmap/output/park_camera_ab/d_ba_k_ba_pose"
+data_dir: "/home/wuyou/remote/colmap/output/park_camera_ab/a_vendor_k_vendor_pose"
 data_factor: 4
 frame_id_min: 63
 frame_id_max: 187
-test_every: 16
+test_every: 8
+use_test_split: false
 normalize_world_space: false
+tb_loss_window: 100
 
-result_dir: results/park_0810
+result_dir: results/0812/A组(原内参原pose)pose_1e-4
 disable_viewer: true
 disable_video: true
 
@@ -16,7 +18,7 @@ camera_model: fisheye
 keep_distortion: true
 max_fisheye_fov: 178.0
 
-max_steps: 30000
+max_steps: 7000
 eval_steps: [3000, 7000, 15000, 30000]
 save_steps: [7000, 15000, 30000]
 save_ply: true
@@ -38,7 +40,7 @@ knn_pca_normal_scale_factor: 0.25
 knn_pca_planarity_threshold: 0.30
 knn_pca_curvature_threshold: 0.10
 
-sky_enabled: true
+sky_enabled: false
 sky_mask_dir: semantic_masks/sky
 sky_num_points: 100000
 sky_radius: 10000.0
@@ -56,3 +58,17 @@ strategy:
   max_grow_per_refine: 100000
   refine_stop_iter: 25000
   refine_scale2d_stop_iter: 25000
+
+  # cap_max: 4000000
+  # noise_lr: 5e3
+  # verbose: true
+
+
+pose_opt: true
+pose_opt_start_step: 1000
+pose_opt_lr: 1.0e-4
+
+calib_opt: false
+calib_opt_reg: 1e-6
+
+app_opt: false
