@@ -5,12 +5,44 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
+import torch
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "examples"))
 
 from simple_trainer import Runner, parse_config
+from utils import CameraCalibrationOptModule
 
 
 class SimpleTrainerConfigTest(unittest.TestCase):
+    def test_camera_calibration_module_shares_physical_camera_parameters(self):
+        module = CameraCalibrationOptModule(2)
+        with torch.no_grad():
+            module.focal_log_scales.weight[0] = torch.tensor([0.1, -0.1])
+            module.principal_offsets.weight[0] = torch.tensor([0.01, -0.02])
+            module.radial_deltas.weight[0] = torch.tensor(
+                [0.001, -0.002, 0.003, -0.004]
+            )
+        K = torch.tensor(
+            [[[100.0, 0.0, 50.0], [0.0, 120.0, 60.0], [0.0, 0.0, 1.0]]]
+        ).repeat(2, 1, 1)
+        radial = torch.zeros((2, 4))
+
+        optimized_K, optimized_radial = module(
+            K, radial, torch.tensor([0, 0])
+        )
+
+        self.assertTrue(torch.equal(optimized_K[0], optimized_K[1]))
+        self.assertTrue(torch.equal(optimized_radial[0], optimized_radial[1]))
+        detached_K = optimized_K.detach()
+        self.assertGreater(float(detached_K[..., 0, 0].min()), 0.0)
+        self.assertGreater(float(detached_K[..., 1, 1].min()), 0.0)
+        self.assertAlmostEqual(float(detached_K[0, 0, 2]), 51.0)
+        self.assertAlmostEqual(float(detached_K[0, 1, 2]), 57.6, places=5)
+        torch.testing.assert_close(
+            optimized_radial[0],
+            torch.tensor([0.001, -0.002, 0.003, -0.004]),
+        )
+
     def test_eval_without_test_split_writes_only_training_metrics(self):
         with tempfile.TemporaryDirectory() as directory:
             runner = object.__new__(Runner)
@@ -59,6 +91,8 @@ eval_steps: [10, 20]
 use_test_split: false
 init_type: lidar
 init_use_knn_pca: true
+calib_opt: true
+calib_opt_radial_lr: 2.0e-6
 sky_enabled: true
 sky_mask_dir: semantic_masks/sky
 strategy:
@@ -77,6 +111,8 @@ strategy:
             self.assertEqual(cfg.max_steps, 30)
             self.assertEqual(cfg.strategy.max_gaussians, 100)
             self.assertTrue(cfg.init_use_knn_pca)
+            self.assertTrue(cfg.calib_opt)
+            self.assertEqual(cfg.calib_opt_radial_lr, 2.0e-6)
             self.assertTrue(cfg.sky_enabled)
             self.assertEqual(cfg.sky_mask_dir, "semantic_masks/sky")
 

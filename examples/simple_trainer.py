@@ -36,7 +36,14 @@ from torch.utils.tensorboard import SummaryWriter
 from torchmetrics.image import StructuralSimilarityIndexMeasure
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from typing_extensions import Literal, assert_never
-from utils import AppearanceOptModule, CameraOptModule, knn, rgb_to_sh, set_random_seed
+from utils import (
+    AppearanceOptModule,
+    CameraCalibrationOptModule,
+    CameraOptModule,
+    knn,
+    rgb_to_sh,
+    set_random_seed,
+)
 
 from gsplat import export_splats
 from gsplat.compression import PngCompression
@@ -302,6 +309,21 @@ class Config:
     pose_opt_reg: float = 1e-6
     # Add noise to camera extrinsics. This is only to test the camera pose optimization.
     pose_noise: float = 0.0
+
+    # Optimize shared OPENCV_FISHEYE intrinsics and radial distortion.
+    calib_opt: bool = False
+    # Learning rate for focal log-scales.
+    calib_opt_focal_lr: float = 1e-5
+    # Learning rate for principal-point offsets normalized by focal length.
+    calib_opt_principal_lr: float = 1e-5
+    # Learning rate for k1, k2, k3, k4 deltas.
+    calib_opt_radial_lr: float = 1e-6
+    # Regularization for all calibration deltas as optimizer weight decay.
+    calib_opt_reg: float = 1e-3
+    # Hard bounds keep joint pose/calibration optimization identifiable.
+    calib_opt_max_focal_log_scale: float = 0.1
+    calib_opt_max_principal_offset: float = 0.05
+    calib_opt_max_radial_delta: float = 0.1
 
     # Enable appearance optimization. (experimental)
     app_opt: bool = False
@@ -606,6 +628,18 @@ class Runner:
             raise ValueError("KNN-PCA initialization currently requires init_type=lidar")
         if cfg.sky_alpha_lambda < 0.0:
             raise ValueError("sky_alpha_lambda must be non-negative")
+        if cfg.calib_opt and not cfg.keep_distortion:
+            raise ValueError("calib_opt requires keep_distortion")
+        if cfg.calib_opt and not cfg.with_eval3d:
+            raise ValueError("calib_opt requires with_eval3d")
+        if cfg.calib_opt and not (cfg.with_ut or cfg.with_geer):
+            raise ValueError("calib_opt requires with_ut or with_geer")
+        if cfg.calib_opt and min(
+            cfg.calib_opt_max_focal_log_scale,
+            cfg.calib_opt_max_principal_offset,
+            cfg.calib_opt_max_radial_delta,
+        ) <= 0.0:
+            raise ValueError("calib_opt parameter bounds must be positive")
 
         # Where to dump results.
         os.makedirs(cfg.result_dir, exist_ok=True)
@@ -757,6 +791,54 @@ class Runner:
             if world_size > 1:
                 self.pose_adjust = DDP(self.pose_adjust)
 
+        self.calibration_optimizers = []
+        if cfg.calib_opt:
+            camera_ids = sorted(set(self.parser.camera_ids))
+            unsupported_camera_ids = [
+                camera_id
+                for camera_id in camera_ids
+                if self.parser.camera_models_dict[camera_id] != 5
+            ]
+            if unsupported_camera_ids:
+                raise ValueError(
+                    "calib_opt only supports OPENCV_FISHEYE cameras; "
+                    f"unsupported camera ids: {unsupported_camera_ids}"
+                )
+            self.calibration_camera_indices = {
+                camera_id: index for index, camera_id in enumerate(camera_ids)
+            }
+            self.calibration_adjust = CameraCalibrationOptModule(
+                len(camera_ids)
+            ).to(self.device)
+            self.calibration_optimizers = [
+                torch.optim.Adam(
+                    [
+                        {
+                            "params": (
+                                self.calibration_adjust.focal_log_scales.parameters()
+                            ),
+                            "lr": cfg.calib_opt_focal_lr * math.sqrt(cfg.batch_size),
+                        },
+                        {
+                            "params": (
+                                self.calibration_adjust.principal_offsets.parameters()
+                            ),
+                            "lr": cfg.calib_opt_principal_lr
+                            * math.sqrt(cfg.batch_size),
+                        },
+                        {
+                            "params": (
+                                self.calibration_adjust.radial_deltas.parameters()
+                            ),
+                            "lr": cfg.calib_opt_radial_lr * math.sqrt(cfg.batch_size),
+                        },
+                    ],
+                    weight_decay=cfg.calib_opt_reg,
+                )
+            ]
+            if world_size > 1:
+                self.calibration_adjust = DDP(self.calibration_adjust)
+
         if cfg.pose_noise > 0.0:
             self.pose_perturb = CameraOptModule(len(self.trainset)).to(self.device)
             self.pose_perturb.random_init(cfg.pose_noise)
@@ -826,6 +908,25 @@ class Runner:
                 output_dir=Path(cfg.result_dir),
                 mode="training",
             )
+
+    def _apply_calibration_adjustment(
+        self, Ks: Tensor, radial_coeffs: Tensor, camera_ids: Tensor
+    ) -> Tuple[Tensor, Tensor]:
+        """Map raw COLMAP camera ids to shared learnable calibration rows."""
+        calibration_ids = torch.tensor(
+            [
+                self.calibration_camera_indices[int(camera_id)]
+                for camera_id in camera_ids.detach().cpu().reshape(-1).tolist()
+            ],
+            dtype=torch.long,
+            device=Ks.device,
+        ).reshape(camera_ids.shape)
+        return self.calibration_adjust(Ks, radial_coeffs, calibration_ids)
+
+    def _calibration_module(self) -> CameraCalibrationOptModule:
+        if self.world_size > 1:
+            return self.calibration_adjust.module
+        return self.calibration_adjust
 
     def rasterize_splats(
         self,
@@ -976,6 +1077,13 @@ class Runner:
                     self.pose_optimizers[0], gamma=0.01 ** (1.0 / max_steps)
                 )
             )
+        if cfg.calib_opt:
+            schedulers.append(
+                torch.optim.lr_scheduler.ExponentialLR(
+                    self.calibration_optimizers[0],
+                    gamma=0.01 ** (1.0 / max_steps),
+                )
+            )
         if cfg.use_bilateral_grid:
             # bilateral grid has a learning rate schedule. Linear warmup for 1000 steps.
             schedulers.append(
@@ -1026,6 +1134,7 @@ class Runner:
                 pixels.shape[0] * pixels.shape[1] * pixels.shape[2]
             )
             image_ids = data["image_id"].to(device)
+            camera_ids = data["camera_id"].to(device)
             masks = data["mask"].to(device) if "mask" in data else None  # [1, H, W]
             sky_masks = (
                 data["sky_mask"].to(device) if "sky_mask" in data else None
@@ -1074,6 +1183,15 @@ class Runner:
                 # Zero-out invalid pixels for both prediction and target.
                 valid_f = valid_mask.unsqueeze(-1).to(dtype=pixels.dtype)  # [1,H,W,1]
                 pixels = pixels * valid_f
+
+            if cfg.calib_opt:
+                if radial_coeffs is None:
+                    raise RuntimeError(
+                        "calib_opt requires a four-coefficient fisheye calibration"
+                    )
+                Ks, radial_coeffs = self._apply_calibration_adjustment(
+                    Ks, radial_coeffs, camera_ids
+                )
 
             if cfg.pose_noise:
                 camtoworlds = self.pose_perturb(camtoworlds, image_ids)
@@ -1254,6 +1372,23 @@ class Runner:
                 self.writer.add_scalar("train/ssimloss", ssimloss.item(), step)
                 self.writer.add_scalar("train/num_GS", len(self.splats["means"]), step)
                 self.writer.add_scalar("train/mem", mem, step)
+                if cfg.calib_opt:
+                    calibration = self._calibration_module()
+                    self.writer.add_scalar(
+                        "train/calib_focal_log_scale_max",
+                        calibration.focal_log_scales.weight.detach().abs().max(),
+                        step,
+                    )
+                    self.writer.add_scalar(
+                        "train/calib_principal_offset_max",
+                        calibration.principal_offsets.weight.detach().abs().max(),
+                        step,
+                    )
+                    self.writer.add_scalar(
+                        "train/calib_radial_delta_max",
+                        calibration.radial_deltas.weight.detach().abs().max(),
+                        step,
+                    )
                 if self.sky_splats is not None:
                     self.writer.add_scalar(
                         "train/sky_alpha_loss",
@@ -1300,6 +1435,10 @@ class Runner:
                         data["pose_adjust"] = self.pose_adjust.module.state_dict()
                     else:
                         data["pose_adjust"] = self.pose_adjust.state_dict()
+                if cfg.calib_opt:
+                    data["calibration_adjust"] = (
+                        self._calibration_module().state_dict()
+                    )
                 if cfg.app_opt:
                     if world_size > 1:
                         data["app_module"] = self.app_module.module.state_dict()
@@ -1398,6 +1537,10 @@ class Runner:
                 if do_update:
                     optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
+            for optimizer in self.calibration_optimizers:
+                if do_update:
+                    optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
             for optimizer in self.app_optimizers:
                 if do_update:
                     optimizer.step()
@@ -1425,6 +1568,20 @@ class Runner:
                     )
                 if self.sky_splats is not None:
                     clamp_sky_sh_colors(self.sky_splats, cfg.sh_degree)
+                if cfg.calib_opt:
+                    calibration = self._calibration_module()
+                    calibration.focal_log_scales.weight.data.clamp_(
+                        -cfg.calib_opt_max_focal_log_scale,
+                        cfg.calib_opt_max_focal_log_scale,
+                    )
+                    calibration.principal_offsets.weight.data.clamp_(
+                        -cfg.calib_opt_max_principal_offset,
+                        cfg.calib_opt_max_principal_offset,
+                    )
+                    calibration.radial_deltas.weight.data.clamp_(
+                        -cfg.calib_opt_max_radial_delta,
+                        cfg.calib_opt_max_radial_delta,
+                    )
 
             # Run post-backward steps after backward and optimizer
             if do_update:
@@ -1516,6 +1673,7 @@ class Runner:
             if masks is not None:
                 pixels = pixels * masks.unsqueeze(-1)
             image_ids = data["image_id"].to(device)
+            camera_ids = data["camera_id"].to(device)
             if apply_train_adjustment and cfg.pose_opt:
                 camtoworlds = self.pose_adjust(camtoworlds, image_ids)
 
@@ -1529,6 +1687,14 @@ class Runner:
                 if (cfg.keep_distortion and "tangential_coeffs" in data)
                 else None
             )
+            if cfg.calib_opt:
+                if radial_coeffs is None:
+                    raise RuntimeError(
+                        "calib_opt requires a four-coefficient fisheye calibration"
+                    )
+                Ks, radial_coeffs = self._apply_calibration_adjustment(
+                    Ks, radial_coeffs, camera_ids
+                )
             height, width = pixels.shape[1:3]
 
             torch.cuda.synchronize()
@@ -1742,6 +1908,17 @@ class Runner:
             if is_fisheye
             else None
         )
+        if cfg.calib_opt:
+            if radial_coeffs is None:
+                raise RuntimeError(
+                    "calib_opt requires a four-coefficient fisheye calibration"
+                )
+            K_batch, radial_coeffs = self._apply_calibration_adjustment(
+                K[None],
+                radial_coeffs,
+                torch.tensor([camera_id], device=device),
+            )
+            K = K_batch[0]
 
         # save to video
         video_dir = f"{cfg.result_dir}/videos"
@@ -1893,6 +2070,14 @@ def main(local_rank: int, world_rank, world_size: int, cfg: Config):
                 runner.sky_splats[k].data = torch.cat(
                     [ckpt["sky_splats"][k] for ckpt in ckpts]
                 )
+        if cfg.calib_opt:
+            if "calibration_adjust" not in ckpts[0]:
+                raise ValueError(
+                    "calib_opt evaluation requires calibration_adjust in the checkpoint"
+                )
+            runner._calibration_module().load_state_dict(
+                ckpts[0]["calibration_adjust"]
+            )
         step = ckpts[0]["step"]
         runner.eval(step=step)
         runner.render_traj(step=step)

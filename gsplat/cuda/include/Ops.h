@@ -614,6 +614,8 @@ std::tuple<
     at::Tensor,
     at::Tensor,
     at::Tensor,
+    at::Tensor,
+    at::Tensor,
     at::Tensor>
 rasterize_to_pixels_from_world_3dgs_bwd(
     // Gaussian parameters
@@ -650,7 +652,9 @@ rasterize_to_pixels_from_world_3dgs_bwd(
     // gradients of outputs
     const at::Tensor v_render_colors, // [..., C, image_height, image_width, 3]
     const at::Tensor v_render_alphas, // [..., C, image_height, image_width, 1]
-    const bool viewmats_requires_grad
+    const bool viewmats_requires_grad,
+    const bool Ks_requires_grad,
+    const bool radial_coeffs_requires_grad
 );
 
 } // namespace gsplat

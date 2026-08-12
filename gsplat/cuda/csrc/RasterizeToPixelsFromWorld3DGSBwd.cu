@@ -13,6 +13,71 @@ namespace gsplat {
 
 namespace cg = cooperative_groups;
 
+inline __device__ void opencv_fisheye_camera_ray_vjp(
+    const vec2 image_point,
+    const vec2 focal_length,
+    const vec2 principal_point,
+    const float *radial_coeffs,
+    const vec3 camera_ray,
+    const vec3 v_camera_ray,
+    vec4 &v_intrinsics,
+    vec4 &v_radial_coeffs
+) {
+    const vec2 uv = (image_point - principal_point) / focal_length;
+    const float delta = glm::length(uv);
+    if (delta < 1e-6f) {
+        return;
+    }
+
+    const float camera_ray_xy_norm = glm::length(vec2(camera_ray));
+    const float theta = atan2f(camera_ray_xy_norm, camera_ray.z);
+    const float theta2 = theta * theta;
+    const float theta3 = theta * theta2;
+    const float theta5 = theta3 * theta2;
+    const float theta7 = theta5 * theta2;
+    const float theta9 = theta7 * theta2;
+    const vec4 coeffs = radial_coeffs == nullptr
+        ? vec4(0.f)
+        : vec4(
+              radial_coeffs[0],
+              radial_coeffs[1],
+              radial_coeffs[2],
+              radial_coeffs[3]
+          );
+    const float d_forward_d_theta =
+        1.f + 3.f * coeffs.x * theta2 +
+        5.f * coeffs.y * theta2 * theta2 +
+        7.f * coeffs.z * theta2 * theta2 * theta2 +
+        9.f * coeffs.w * theta2 * theta2 * theta2 * theta2;
+    if (fabsf(d_forward_d_theta) < 1e-8f) {
+        return;
+    }
+
+    const float sin_theta = sinf(theta);
+    const float cos_theta = cosf(theta);
+    const float inv_delta = 1.f / delta;
+    const float scale = sin_theta * inv_delta;
+    const float v_scale = v_camera_ray.x * uv.x + v_camera_ray.y * uv.y;
+    float v_theta = -v_camera_ray.z * sin_theta;
+    v_theta += v_scale * cos_theta * inv_delta;
+    float v_delta = -v_scale * sin_theta * inv_delta * inv_delta;
+    v_delta += v_theta / d_forward_d_theta;
+
+    const vec2 v_uv = {
+        v_camera_ray.x * scale + v_delta * uv.x * inv_delta,
+        v_camera_ray.y * scale + v_delta * uv.y * inv_delta,
+    };
+    v_intrinsics = {
+        -v_uv.x * uv.x / focal_length.x,
+        -v_uv.y * uv.y / focal_length.y,
+        -v_uv.x / focal_length.x,
+        -v_uv.y / focal_length.y,
+    };
+    const float v_implicit = -v_theta / d_forward_d_theta;
+    v_radial_coeffs =
+        v_implicit * vec4(theta3, theta5, theta7, theta9);
+}
+
 template <uint32_t CDIM, typename scalar_t>
 __global__ void rasterize_to_pixels_from_world_3dgs_bwd_kernel(
     const uint32_t B,
@@ -63,7 +128,9 @@ __global__ void rasterize_to_pixels_from_world_3dgs_bwd_kernel(
     vec3 *__restrict__ v_scales,       // [B, N, 3]
     scalar_t *__restrict__ v_colors,   // [B, C, N, CDIM] or [nnz, CDIM]
     scalar_t *__restrict__ v_opacities, // [B, C, N] or [nnz]
-    scalar_t *__restrict__ v_viewmats   // [B, C, 4, 4] optional
+    scalar_t *__restrict__ v_viewmats,  // [B, C, 4, 4] optional
+    scalar_t *__restrict__ v_Ks,        // [B, C, 3, 3] optional
+    scalar_t *__restrict__ v_radial_coeffs // [B, C, 4] optional
 ) {
     auto block = cg::this_thread_block();
     uint32_t iid = block.group_index().x;
@@ -397,7 +464,10 @@ __global__ void rasterize_to_pixels_from_world_3dgs_bwd_kernel(
         }
     }
 
-    if (v_viewmats != nullptr) {
+    if (
+        v_viewmats != nullptr || v_Ks != nullptr ||
+        v_radial_coeffs != nullptr
+    ) {
         const scalar_t *viewmat = viewmats0 + iid * 16;
         const mat3 view_R(
             viewmat[0],
@@ -412,24 +482,64 @@ __global__ void rasterize_to_pixels_from_world_3dgs_bwd_kernel(
         );
         const vec3 view_t = {viewmat[3], viewmat[7], viewmat[11]};
         const vec3 camera_ray_d = view_R * ray_d;
-        // Global shutter: ray_o = -R^T t and ray_d = R^T camera_ray_d.
-        mat3 v_view_R = glm::outerProduct(camera_ray_d, v_ray_d) -
-                        glm::outerProduct(view_t, v_ray_o);
-        vec3 v_view_t = -view_R * v_ray_o;
+        const vec3 v_camera_ray_d = view_R * v_ray_d;
 
-        warpSum(v_view_R, warp);
-        warpSum(v_view_t, warp);
-        if (warp.thread_rank() == 0) {
-            scalar_t *v_viewmat = v_viewmats + iid * 16;
+        if (v_viewmats != nullptr) {
+            // Global shutter: ray_o = -R^T t and ray_d = R^T camera_ray_d.
+            mat3 v_view_R = glm::outerProduct(camera_ray_d, v_ray_d) -
+                            glm::outerProduct(view_t, v_ray_o);
+            vec3 v_view_t = -view_R * v_ray_o;
+
+            warpSum(v_view_R, warp);
+            warpSum(v_view_t, warp);
+            if (warp.thread_rank() == 0) {
+                scalar_t *v_viewmat = v_viewmats + iid * 16;
 #pragma unroll
-            for (uint32_t row = 0; row < 3; ++row) {
+                for (uint32_t row = 0; row < 3; ++row) {
 #pragma unroll
-                for (uint32_t col = 0; col < 3; ++col) {
-                    gpuAtomicAdd(
-                        v_viewmat + row * 4 + col, v_view_R[col][row]
-                    );
+                    for (uint32_t col = 0; col < 3; ++col) {
+                        gpuAtomicAdd(
+                            v_viewmat + row * 4 + col, v_view_R[col][row]
+                        );
+                    }
+                    gpuAtomicAdd(v_viewmat + row * 4 + 3, v_view_t[row]);
                 }
-                gpuAtomicAdd(v_viewmat + row * 4 + 3, v_view_t[row]);
+            }
+        }
+
+        if (v_Ks != nullptr || v_radial_coeffs != nullptr) {
+            vec4 v_intrinsics = {0.f, 0.f, 0.f, 0.f};
+            vec4 v_radial = {0.f, 0.f, 0.f, 0.f};
+            if (ray.valid_flag && i < image_height && j < image_width) {
+                opencv_fisheye_camera_ray_vjp(
+                    vec2(px, py),
+                    focal_length,
+                    principal_point,
+                    radial_coeffs == nullptr ? nullptr
+                                             : radial_coeffs + iid * 4,
+                    camera_ray_d,
+                    v_camera_ray_d,
+                    v_intrinsics,
+                    v_radial
+                );
+            }
+            warpSum(v_intrinsics, warp);
+            warpSum(v_radial, warp);
+            if (warp.thread_rank() == 0) {
+                if (v_Ks != nullptr) {
+                    scalar_t *v_K = v_Ks + iid * 9;
+                    gpuAtomicAdd(v_K + 0, v_intrinsics.x);
+                    gpuAtomicAdd(v_K + 4, v_intrinsics.y);
+                    gpuAtomicAdd(v_K + 2, v_intrinsics.z);
+                    gpuAtomicAdd(v_K + 5, v_intrinsics.w);
+                }
+                if (v_radial_coeffs != nullptr) {
+                    scalar_t *v_radial_ptr = v_radial_coeffs + iid * 4;
+                    gpuAtomicAdd(v_radial_ptr + 0, v_radial.x);
+                    gpuAtomicAdd(v_radial_ptr + 1, v_radial.y);
+                    gpuAtomicAdd(v_radial_ptr + 2, v_radial.z);
+                    gpuAtomicAdd(v_radial_ptr + 3, v_radial.w);
+                }
             }
         }
     }
@@ -471,13 +581,17 @@ void launch_rasterize_to_pixels_from_world_3dgs_bwd_kernel(
     const at::Tensor v_render_colors, // [..., C, image_height, image_width, 3]
     const at::Tensor v_render_alphas, // [..., C, image_height, image_width, 1]
     const bool viewmats_requires_grad,
+    const bool Ks_requires_grad,
+    const bool radial_coeffs_requires_grad,
     // outputs
     at::Tensor v_means,      // [..., N, 3]
     at::Tensor v_quats,      // [..., N, 4]
     at::Tensor v_scales,     // [..., N, 3]
     at::Tensor v_colors,     // [..., C, N, 3] or [nnz, 3]
     at::Tensor v_opacities,  // [..., C, N] or [nnz]
-    at::Tensor v_viewmats    // [..., C, 4, 4]
+    at::Tensor v_viewmats,   // [..., C, 4, 4]
+    at::Tensor v_Ks,         // [..., C, 3, 3]
+    at::Tensor v_radial_coeffs // [..., C, 4]
 ) {
     bool packed = opacities.dim() == 1;
     assert (packed == false); // only support non-packed for now
@@ -570,7 +684,11 @@ void launch_rasterize_to_pixels_from_world_3dgs_bwd_kernel(
             reinterpret_cast<vec3 *>(v_scales.data_ptr<float>()),
             v_colors.data_ptr<float>(),
             v_opacities.data_ptr<float>(),
-            viewmats_requires_grad ? v_viewmats.data_ptr<float>() : nullptr
+            viewmats_requires_grad ? v_viewmats.data_ptr<float>() : nullptr,
+            Ks_requires_grad ? v_Ks.data_ptr<float>() : nullptr,
+            radial_coeffs_requires_grad
+                ? v_radial_coeffs.data_ptr<float>()
+                : nullptr
         );
 }
 
@@ -606,12 +724,16 @@ void launch_rasterize_to_pixels_from_world_3dgs_bwd_kernel(
         const at::Tensor v_render_colors,                                      \
         const at::Tensor v_render_alphas,                                      \
         const bool viewmats_requires_grad,                                     \
+        const bool Ks_requires_grad,                                           \
+        const bool radial_coeffs_requires_grad,                                \
         at::Tensor v_means,                                                    \
         at::Tensor v_quats,                                                    \
         at::Tensor v_scales,                                                   \
         at::Tensor v_colors,                                                   \
         at::Tensor v_opacities,                                                \
-        at::Tensor v_viewmats                                                  \
+        at::Tensor v_viewmats,                                                 \
+        at::Tensor v_Ks,                                                       \
+        at::Tensor v_radial_coeffs                                             \
     );
 
 __INS__(1)

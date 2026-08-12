@@ -237,8 +237,10 @@ def rasterization(
         reference from the paper `3DGUT: Enabling Distorted Cameras and Secondary Rays in Gaussian Splatting
         <https://arxiv.org/abs/2412.12507>`_.
 
-    .. warning::
-        This function is currently not differentiable w.r.t. the camera intrinsics `Ks`.
+    .. note::
+        Global-shutter eval3d rasterization supports gradients w.r.t. `viewmats`
+        and, for OPENCV_FISHEYE cameras, `Ks` plus the four `radial_coeffs`.
+        Other camera models and distortion terms do not expose calibration gradients.
 
     Args:
         means: The 3D centers of the Gaussians. [..., N, 3]

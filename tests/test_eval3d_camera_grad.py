@@ -33,33 +33,70 @@ def _viewmat_from_delta(delta: torch.Tensor) -> torch.Tensor:
     return torch.cat((upper, bottom), dim=0).unsqueeze(0)
 
 
-def _eval3d_objective_from_viewmats(viewmats: torch.Tensor) -> torch.Tensor:
+def _eval3d_objective_from_viewmats(
+    viewmats: torch.Tensor,
+    Ks: torch.Tensor | None = None,
+    radial_coeffs: torch.Tensor | None = None,
+    wide_angle: bool = False,
+) -> torch.Tensor:
     device = viewmats.device
     dtype = viewmats.dtype
-    means = torch.tensor(
-        [[-0.30, 0.12, 3.0], [0.42, -0.18, 4.0]], device=device, dtype=dtype
-    )
-    quats = torch.tensor(
-        [[1.0, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]],
-        device=device,
-        dtype=dtype,
-    )
-    scales = torch.tensor(
-        [[0.24, 0.18, 0.20], [0.22, 0.28, 0.18]], device=device, dtype=dtype
-    )
-    opacities = torch.tensor([0.82, 0.74], device=device, dtype=dtype)
-    colors = torch.tensor(
-        [[0.9, 0.2, 0.1], [0.1, 0.35, 0.85]], device=device, dtype=dtype
-    )
+    if wide_angle:
+        means = torch.tensor(
+            [
+                [-1.85, 0.30, 2.00],
+                [1.90, -0.35, 2.10],
+                [0.25, 1.45, 1.90],
+                [-0.30, -1.50, 2.00],
+            ],
+            device=device,
+            dtype=dtype,
+        )
+        scales = torch.tensor(
+            [
+                [0.34, 0.28, 0.30],
+                [0.32, 0.36, 0.28],
+                [0.30, 0.34, 0.26],
+                [0.36, 0.30, 0.28],
+            ],
+            device=device,
+            dtype=dtype,
+        )
+        opacities = torch.tensor([0.82, 0.74, 0.78, 0.70], device=device, dtype=dtype)
+        colors = torch.tensor(
+            [
+                [0.9, 0.2, 0.1],
+                [0.1, 0.35, 0.85],
+                [0.2, 0.85, 0.25],
+                [0.75, 0.15, 0.7],
+            ],
+            device=device,
+            dtype=dtype,
+        )
+    else:
+        means = torch.tensor(
+            [[-0.30, 0.12, 3.0], [0.42, -0.18, 4.0]], device=device, dtype=dtype
+        )
+        scales = torch.tensor(
+            [[0.24, 0.18, 0.20], [0.22, 0.28, 0.18]], device=device, dtype=dtype
+        )
+        opacities = torch.tensor([0.82, 0.74], device=device, dtype=dtype)
+        colors = torch.tensor(
+            [[0.9, 0.2, 0.1], [0.1, 0.35, 0.85]], device=device, dtype=dtype
+        )
+    quats = torch.zeros((len(means), 4), device=device, dtype=dtype)
+    quats[:, 0] = 1.0
     width, height = 32, 24
-    Ks = torch.tensor(
-        [[[19.0, 0.0, 16.0], [0.0, 18.0, 12.0], [0.0, 0.0, 1.0]]],
-        device=device,
-        dtype=dtype,
-    )
-    radial_coeffs = torch.tensor(
-        [[-0.025, 0.004, -0.0005, 0.00005]], device=device, dtype=dtype
-    )
+    if Ks is None:
+        Ks = torch.tensor(
+            [[[19.0, 0.0, 16.0], [0.0, 18.0, 12.0], [0.0, 0.0, 1.0]]],
+            device=device,
+            dtype=dtype,
+        )
+    if radial_coeffs is None:
+        radial_coeffs = torch.tensor(
+            [[-0.025, 0.004, -0.0005, 0.00005]], device=device, dtype=dtype
+        )
 
     renders, alphas, _ = rasterization(
         means=means,
@@ -132,6 +169,73 @@ class Eval3DCameraGradientTest(unittest.TestCase):
         self.assertIsNotNone(pose_grad)
         self.assertTrue(torch.isfinite(pose_grad).all())
         self.assertGreater(pose_grad.norm().item(), 1e-5)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "No CUDA device")
+    def test_global_shutter_fisheye_calibration_vjp_matches_finite_difference(self):
+        viewmats = torch.eye(4, device="cuda").unsqueeze(0)
+        Ks = torch.tensor(
+            [[[19.0, 0.0, 16.0], [0.0, 18.0, 12.0], [0.0, 0.0, 1.0]]],
+            device="cuda",
+            requires_grad=True,
+        )
+        radial_coeffs = torch.tensor(
+            [[-0.025, 0.004, -0.0005, 0.00005]],
+            device="cuda",
+            requires_grad=True,
+        )
+        objective = _eval3d_objective_from_viewmats(
+            viewmats, Ks, radial_coeffs, wide_angle=True
+        )
+        analytic_Ks, analytic_radial = torch.autograd.grad(
+            objective, (Ks, radial_coeffs)
+        )
+        analytic_intrinsics = analytic_Ks[0, (0, 1, 0, 1), (0, 1, 2, 2)]
+
+        numeric_intrinsics = []
+        intrinsic_indices = ((0, 0), (1, 1), (0, 2), (1, 2))
+        with torch.no_grad():
+            for row, col in intrinsic_indices:
+                step = torch.zeros_like(Ks)
+                step[0, row, col] = 2e-2
+                numeric_intrinsics.append(
+                    (
+                        _eval3d_objective_from_viewmats(
+                            viewmats, Ks + step, radial_coeffs, wide_angle=True
+                        )
+                        - _eval3d_objective_from_viewmats(
+                            viewmats, Ks - step, radial_coeffs, wide_angle=True
+                        )
+                    )
+                    / (4e-2)
+                )
+
+            numeric_radial = []
+            radial_eps = (1e-3, 2e-3, 5e-3, 1e-2)
+            for axis, eps in enumerate(radial_eps):
+                step = torch.zeros_like(radial_coeffs)
+                step[0, axis] = eps
+                numeric_radial.append(
+                    (
+                        _eval3d_objective_from_viewmats(
+                            viewmats, Ks, radial_coeffs + step, wide_angle=True
+                        )
+                        - _eval3d_objective_from_viewmats(
+                            viewmats, Ks, radial_coeffs - step, wide_angle=True
+                        )
+                    )
+                    / (2.0 * eps)
+                )
+
+        numeric_intrinsics = torch.stack(numeric_intrinsics)
+        numeric_radial = torch.stack(numeric_radial)
+        self.assertTrue(torch.isfinite(analytic_intrinsics).all())
+        self.assertTrue(torch.isfinite(analytic_radial).all())
+        torch.testing.assert_close(
+            analytic_intrinsics, numeric_intrinsics, rtol=5e-2, atol=2e-4
+        )
+        torch.testing.assert_close(
+            analytic_radial.flatten(), numeric_radial, rtol=7e-2, atol=3e-4
+        )
 
     @unittest.skipUnless(torch.cuda.is_available(), "No CUDA device")
     def test_standard_rasterizer_viewmat_gradient_still_works(self):

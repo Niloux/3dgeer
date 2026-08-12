@@ -631,6 +631,7 @@ class Dataset:
 
         data = {
             "camera_model": self.parser.camera_models_dict[camera_id],
+            "camera_id": camera_id,
             "K": torch.from_numpy(K).float(),
             "camtoworld": torch.from_numpy(camtoworlds).float(),
             "image": torch.from_numpy(image).float(),

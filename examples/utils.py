@@ -48,6 +48,51 @@ class CameraOptModule(torch.nn.Module):
         return torch.matmul(camtoworlds, transform)
 
 
+class CameraCalibrationOptModule(torch.nn.Module):
+    """Shared OPENCV_FISHEYE intrinsics and distortion optimization."""
+
+    def __init__(self, n: int):
+        super().__init__()
+        self.focal_log_scales = torch.nn.Embedding(n, 2)
+        self.principal_offsets = torch.nn.Embedding(n, 2)
+        self.radial_deltas = torch.nn.Embedding(n, 4)
+        self.zero_init()
+
+    def zero_init(self):
+        torch.nn.init.zeros_(self.focal_log_scales.weight)
+        torch.nn.init.zeros_(self.principal_offsets.weight)
+        torch.nn.init.zeros_(self.radial_deltas.weight)
+
+    def forward(
+        self, Ks: Tensor, radial_coeffs: Tensor, camera_ids: Tensor
+    ) -> tuple[Tensor, Tensor]:
+        """Apply calibration deltas shared by physical camera.
+
+        Focal deltas are log-scales, so optimized focal lengths stay positive.
+        Principal-point offsets are represented relative to the original focal
+        lengths, which keeps their parameter scale independent of resolution.
+        """
+        assert Ks.shape[:-2] == camera_ids.shape
+        assert radial_coeffs.shape[:-1] == camera_ids.shape
+        assert radial_coeffs.shape[-1] == 4
+
+        focal_log_scales = self.focal_log_scales(camera_ids)
+        principal_offsets = self.principal_offsets(camera_ids)
+        focal_lengths = torch.stack((Ks[..., 0, 0], Ks[..., 1, 1]), dim=-1)
+        optimized_focals = focal_lengths * torch.exp(focal_log_scales)
+        optimized_principal = torch.stack(
+            (Ks[..., 0, 2], Ks[..., 1, 2]), dim=-1
+        ) + principal_offsets * focal_lengths
+
+        optimized_Ks = Ks.clone()
+        optimized_Ks[..., 0, 0] = optimized_focals[..., 0]
+        optimized_Ks[..., 1, 1] = optimized_focals[..., 1]
+        optimized_Ks[..., 0, 2] = optimized_principal[..., 0]
+        optimized_Ks[..., 1, 2] = optimized_principal[..., 1]
+        optimized_radial = radial_coeffs + self.radial_deltas(camera_ids)
+        return optimized_Ks, optimized_radial
+
+
 class AppearanceOptModule(torch.nn.Module):
     """Appearance optimization module."""
 
