@@ -46,6 +46,12 @@ def _resolve_semantic_mask_path(mask_dir: str, image_name: str) -> str:
     )
 
 
+def _frame_key(image_name: str):
+    """Return a rig frame key for names such as ``*_00063-L.png``."""
+    match = re.search(r"_(\d+)-[A-Za-z](?:\.[^.]+)?$", image_name)
+    return ("frame", int(match.group(1))) if match else ("image", image_name)
+
+
 def _combine_supervision_masks(
     camera_mask: Optional[np.ndarray],
     training_mask: Optional[np.ndarray],
@@ -404,6 +410,13 @@ class Parser:
         self.sky_mask_paths = kept_sky_mask_paths
         self.camtoworlds = camtoworlds  # np.ndarray, (num_images, 4, 4)
         self.camera_ids = camera_ids  # List[int], (num_images,)
+        frame_keys = [_frame_key(name) for name in image_names]
+        frame_key_to_index = {
+            key: index for index, key in enumerate(dict.fromkeys(frame_keys))
+        }
+        self.frame_ids = np.asarray(
+            [frame_key_to_index[key] for key in frame_keys], dtype=np.int64
+        )
         self.camera_models_dict = camera_models_dict  # Dict of camera_id -> camera_model (int)
         self.Ks_dict = Ks_dict  # Dict of camera_id -> K
         self.params_dict = params_dict  # Dict of camera_id -> params
@@ -636,6 +649,7 @@ class Dataset:
             "camtoworld": torch.from_numpy(camtoworlds).float(),
             "image": torch.from_numpy(image).float(),
             "image_id": item,  # the index of the image in the dataset
+            "frame_id": int(self.parser.frame_ids[index]),
         }
         if mask is not None:
             data["mask"] = torch.from_numpy(mask).bool()

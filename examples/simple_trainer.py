@@ -40,6 +40,8 @@ from utils import (
     AppearanceOptModule,
     CameraCalibrationOptModule,
     CameraOptModule,
+    CameraRefinementSchedule,
+    CameraRigPoseModule,
     knn,
     rgb_to_sh,
     set_random_seed,
@@ -304,11 +306,26 @@ class Config:
     # Enable camera optimization.
     pose_opt: bool = False
     # Start camera optimization at this training step (inclusive).
-    pose_opt_start_step: int = 0
+    pose_opt_start_step: int = 500
     # Learning rate for camera optimization
     pose_opt_lr: float = 1e-5
+    # Optional independent translation / rotation learning rates. 0 falls back to pose_opt_lr.
+    pose_opt_translation_lr: float = 1e-4
+    pose_opt_rotation_lr: float = 1e-4
+    # SO(3) is the default; 6d is retained for old experiments.
+    pose_opt_rotation_mode: Literal["so3", "6d"] = "so3"
+    # Reference image index in the trainset. -1 disables the single-image anchor.
+    pose_opt_reference_image_id: int = 0
     # Regularization for camera optimization as weight decay
     pose_opt_reg: float = 1e-6
+    # Explicit physical Pose prior.
+    pose_opt_prior_lambda: float = 1e-4
+    pose_opt_translation_sigma: float = 0.02
+    pose_opt_rotation_sigma_deg: float = 2.0
+    # Replace independent image poses with one pose per rig frame.
+    rig_opt: bool = False
+    rig_reference_camera_id: Optional[int] = None
+    rig_reference_frame_id: Optional[int] = None
     # Add noise to camera extrinsics. This is only to test the camera pose optimization.
     pose_noise: float = 0.0
 
@@ -320,12 +337,42 @@ class Config:
     calib_opt_principal_lr: float = 1e-5
     # Learning rate for k1, k2, k3, k4 deltas.
     calib_opt_radial_lr: float = 1e-6
+    # High-order radial learning rate multiplier relative to calib_opt_radial_lr.
+    calib_opt_radial_high_lr: float = 0.0
     # Regularization for all calibration deltas as optimizer weight decay.
     calib_opt_reg: float = 1e-3
+    # Progressive calibration release steps.
+    calib_opt_focal_start_step: int = 3_000
+    calib_opt_principal_start_step: int = 8_000
+    calib_opt_radial_start_step: int = 15_000
+    # -1 keeps k3/k4 frozen for the complete run.
+    calib_opt_high_order_start_step: int = -1
+    # Freeze all camera parameters at this step; -1 disables the freeze.
+    camera_freeze_step: int = 20_000
+    # Shared focal scale is the default. Aspect-ratio correction is optional.
+    calib_opt_shared_focal: bool = True
+    calib_opt_allow_aspect_ratio: bool = False
+    calib_opt_aspect_lr_scale: float = 0.1
+    # Explicit calibration priors.
+    calib_opt_prior_lambda: float = 1e-4
+    calib_opt_focal_sigma: float = 0.03
+    calib_opt_principal_sigma: float = 0.01
+    calib_opt_radial_low_sigma: float = 0.01
+    calib_opt_radial_high_sigma: float = 0.003
+    calib_opt_aspect_sigma: float = 0.005
+    # OpenCV fisheye monotonicity prior over the usable angular domain.
+    calib_opt_monotonic_lambda: float = 1e-3
+    calib_opt_monotonic_samples: int = 32
+    calib_opt_monotonic_eps: float = 1e-3
+    calib_opt_monotonic_fov_deg: float = 170.0
     # Hard bounds keep joint pose/calibration optimization identifiable.
     calib_opt_max_focal_log_scale: float = 0.1
     calib_opt_max_principal_offset: float = 0.05
     calib_opt_max_radial_delta: float = 0.1
+
+    # Densification can be delayed until camera refinement has stabilized.
+    # -1 selects an automatic camera-aware start.
+    densification_start_step: int = -1
 
     # Enable appearance optimization. (experimental)
     app_opt: bool = False
@@ -369,6 +416,17 @@ class Config:
         self.ply_steps = [int(i * factor) for i in self.ply_steps]
         self.max_steps = int(self.max_steps * factor)
         self.pose_opt_start_step = int(self.pose_opt_start_step * factor)
+        for name in (
+            "calib_opt_focal_start_step",
+            "calib_opt_principal_start_step",
+            "calib_opt_radial_start_step",
+            "calib_opt_high_order_start_step",
+            "camera_freeze_step",
+            "densification_start_step",
+        ):
+            value = getattr(self, name)
+            if value >= 0:
+                setattr(self, name, int(value * factor))
         self.sh_degree_interval = int(self.sh_degree_interval * factor)
 
         strategy = self.strategy
@@ -647,6 +705,41 @@ class Runner:
             raise ValueError("calib_opt parameter bounds must be positive")
         if cfg.pose_opt_start_step < 0:
             raise ValueError("pose_opt_start_step must be non-negative")
+        if cfg.rig_opt and not cfg.pose_opt:
+            raise ValueError("rig_opt requires pose_opt")
+        if cfg.pose_opt_rotation_sigma_deg <= 0.0:
+            raise ValueError("pose_opt_rotation_sigma_deg must be positive")
+        if cfg.pose_opt_translation_sigma <= 0.0:
+            raise ValueError("pose_opt_translation_sigma must be positive")
+        if cfg.pose_opt_reference_image_id < -1:
+            raise ValueError("pose_opt_reference_image_id must be -1 or non-negative")
+        if cfg.calib_opt_radial_high_lr < 0.0:
+            raise ValueError("calib_opt_radial_high_lr must be non-negative")
+        for name in (
+            "calib_opt_focal_start_step",
+            "calib_opt_principal_start_step",
+            "calib_opt_radial_start_step",
+        ):
+            if getattr(cfg, name) < 0:
+                raise ValueError(f"{name} must be non-negative")
+        if cfg.calib_opt_high_order_start_step < -1:
+            raise ValueError("calib_opt_high_order_start_step must be -1 or non-negative")
+        if cfg.camera_freeze_step < -1:
+            raise ValueError("camera_freeze_step must be -1 or non-negative")
+        if cfg.densification_start_step < -1:
+            raise ValueError("densification_start_step must be -1 or non-negative")
+        if cfg.calib_opt_high_order_start_step >= 0 and (
+            cfg.calib_opt_high_order_start_step < cfg.calib_opt_radial_start_step
+        ):
+            raise ValueError("high-order distortion cannot start before low-order distortion")
+        if cfg.pose_opt_prior_lambda < 0.0 or cfg.calib_opt_prior_lambda < 0.0:
+            raise ValueError("camera prior weights must be non-negative")
+        if cfg.calib_opt_monotonic_lambda < 0.0:
+            raise ValueError("calib_opt_monotonic_lambda must be non-negative")
+        if cfg.calib_opt_monotonic_samples < 2:
+            raise ValueError("calib_opt_monotonic_samples must be at least 2")
+        if not 0.0 < cfg.calib_opt_monotonic_fov_deg < 180.0:
+            raise ValueError("calib_opt_monotonic_fov_deg must be in (0, 180)")
         if cfg.tb_loss_window <= 0:
             raise ValueError("tb_loss_window must be positive")
 
@@ -693,6 +786,15 @@ class Runner:
             load_depths=cfg.depth_loss,
         )
         self.valset = dataset_cls(self.parser, split="val")
+        if cfg.rig_opt:
+            _, frame_counts = np.unique(self.parser.frame_ids, return_counts=True)
+            if (int(frame_counts.max()) if frame_counts.size else 0) < 2:
+                raise ValueError(
+                    "rig_opt requires image names that group multiple cameras per frame"
+                )
+        if cfg.pose_opt and not cfg.rig_opt:
+            if cfg.pose_opt_reference_image_id >= len(self.trainset):
+                raise ValueError("pose_opt_reference_image_id is outside the trainset")
         # Render a lightweight, deterministic sample of training images at eval
         # time. When the held-out split is disabled, trainset contains all images.
         self.train_evalset = torch.utils.data.Subset(
@@ -707,6 +809,24 @@ class Runner:
             )
         self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
         print("Scene scale:", self.scene_scale)
+
+        self.camera_schedule = CameraRefinementSchedule(
+            pose_start=cfg.pose_opt_start_step,
+            focal_start=cfg.calib_opt_focal_start_step,
+            principal_start=cfg.calib_opt_principal_start_step,
+            radial_start=cfg.calib_opt_radial_start_step,
+            high_order_start=cfg.calib_opt_high_order_start_step,
+            freeze_step=cfg.camera_freeze_step,
+        )
+        if cfg.densification_start_step >= 0:
+            self.densification_start_step = cfg.densification_start_step
+        elif cfg.pose_opt or cfg.calib_opt:
+            self.densification_start_step = max(
+                cfg.pose_opt_start_step + 1000,
+                cfg.calib_opt_focal_start_step,
+            )
+        else:
+            self.densification_start_step = 0
 
         # Precompute a fisheye valid-pixel mask (raymap.valid_flag) when possible.
         # Pixels outside the valid domain yield zero rays from `compute_raymap()`,
@@ -788,12 +908,47 @@ class Runner:
 
         self.pose_optimizers = []
         if cfg.pose_opt:
-            self.pose_adjust = CameraOptModule(len(self.trainset)).to(self.device)
+            reference_image_id = (
+                None if cfg.pose_opt_reference_image_id < 0 else cfg.pose_opt_reference_image_id
+            )
+            if cfg.rig_opt:
+                self.pose_adjust = CameraRigPoseModule(
+                    torch.from_numpy(self.parser.camtoworlds),
+                    torch.from_numpy(self.parser.frame_ids),
+                    torch.tensor(self.parser.camera_ids),
+                    reference_camera_id=cfg.rig_reference_camera_id,
+                    reference_frame_id=cfg.rig_reference_frame_id,
+                    rotation_mode=cfg.pose_opt_rotation_mode,
+                ).to(self.device)
+            else:
+                self.pose_adjust = CameraOptModule(
+                    len(self.trainset),
+                    reference_index=reference_image_id,
+                    rotation_mode=cfg.pose_opt_rotation_mode,
+                ).to(self.device)
             self.pose_adjust.zero_init()
+            translation_lr = (
+                cfg.pose_opt_translation_lr
+                if cfg.pose_opt_translation_lr > 0.0
+                else cfg.pose_opt_lr
+            )
+            rotation_lr = (
+                cfg.pose_opt_rotation_lr
+                if cfg.pose_opt_rotation_lr > 0.0
+                else cfg.pose_opt_lr
+            )
             self.pose_optimizers = [
                 torch.optim.Adam(
-                    self.pose_adjust.parameters(),
-                    lr=cfg.pose_opt_lr * math.sqrt(cfg.batch_size),
+                    [
+                        {
+                            "params": self.pose_adjust.trans.parameters(),
+                            "lr": translation_lr * math.sqrt(cfg.batch_size),
+                        },
+                        {
+                            "params": self.pose_adjust.rot.parameters(),
+                            "lr": rotation_lr * math.sqrt(cfg.batch_size),
+                        },
+                    ],
                     weight_decay=cfg.pose_opt_reg,
                 )
             ]
@@ -817,7 +972,9 @@ class Runner:
                 camera_id: index for index, camera_id in enumerate(camera_ids)
             }
             self.calibration_adjust = CameraCalibrationOptModule(
-                len(camera_ids)
+                len(camera_ids),
+                shared_focal=cfg.calib_opt_shared_focal,
+                allow_aspect_ratio=cfg.calib_opt_allow_aspect_ratio,
             ).to(self.device)
             self.calibration_optimizers = [
                 torch.optim.Adam(
@@ -849,7 +1006,11 @@ class Runner:
                 self.calibration_adjust = DDP(self.calibration_adjust)
 
         if cfg.pose_noise > 0.0:
-            self.pose_perturb = CameraOptModule(len(self.trainset)).to(self.device)
+            self.pose_perturb = CameraOptModule(
+                len(self.trainset),
+                reference_index=None,
+                rotation_mode=cfg.pose_opt_rotation_mode,
+            ).to(self.device)
             self.pose_perturb.random_init(cfg.pose_noise)
             if world_size > 1:
                 self.pose_perturb = DDP(self.pose_perturb)
@@ -936,6 +1097,107 @@ class Runner:
         if self.world_size > 1:
             return self.calibration_adjust.module
         return self.calibration_adjust
+
+    def _pose_module(self):
+        if self.world_size > 1:
+            return self.pose_adjust.module
+        return self.pose_adjust
+
+    def _camera_stage(self, step: int):
+        return self.camera_schedule.at(step, self.cfg.pose_opt, self.cfg.calib_opt)
+
+    def _apply_pose_adjustment(
+        self,
+        camtoworlds: Tensor,
+        image_ids: Tensor,
+        frame_ids: Optional[Tensor] = None,
+        camera_ids: Optional[Tensor] = None,
+    ) -> Tensor:
+        if self.cfg.rig_opt:
+            if frame_ids is None or camera_ids is None:
+                raise RuntimeError("rig_opt requires frame_id and camera_id tensors")
+            return self.pose_adjust(camtoworlds, frame_ids, camera_ids)
+        return self.pose_adjust(camtoworlds, image_ids)
+
+    def _camera_regularization(
+        self,
+        stage,
+        adjusted_radial_coeffs: Optional[Tensor],
+    ) -> Tensor:
+        loss = torch.zeros((), device=self.device)
+        cfg = self.cfg
+        if cfg.pose_opt and stage.pose:
+            loss = loss + cfg.pose_opt_prior_lambda * self._pose_module().prior_loss(
+                cfg.pose_opt_translation_sigma,
+                math.radians(cfg.pose_opt_rotation_sigma_deg),
+            )
+        if cfg.calib_opt and not stage.frozen and (
+            stage.focal or stage.principal or stage.radial_low or stage.radial_high
+        ):
+            calibration = self._calibration_module()
+            loss = loss + cfg.calib_opt_prior_lambda * calibration.prior_loss(
+                cfg.calib_opt_focal_sigma,
+                cfg.calib_opt_principal_sigma,
+                cfg.calib_opt_radial_low_sigma,
+                cfg.calib_opt_radial_high_sigma,
+                cfg.calib_opt_aspect_sigma,
+            )
+            if (
+                adjusted_radial_coeffs is not None
+                and (stage.radial_low or stage.radial_high)
+                and cfg.calib_opt_monotonic_lambda > 0.0
+            ):
+                theta_max = math.radians(cfg.calib_opt_monotonic_fov_deg / 2.0)
+                loss = loss + cfg.calib_opt_monotonic_lambda * calibration.monotonicity_loss(
+                    adjusted_radial_coeffs,
+                    theta_max=theta_max,
+                    samples=cfg.calib_opt_monotonic_samples,
+                    eps=cfg.calib_opt_monotonic_eps,
+                )
+        return loss
+
+    def _apply_camera_gradient_controls(self, stage):
+        if not self.cfg.calib_opt:
+            return
+        calibration = self._calibration_module()
+        radial_lr = max(self.cfg.calib_opt_radial_lr, 1e-12)
+        calibration.apply_gradient_controls(
+            focal_active=stage.focal,
+            principal_active=stage.principal,
+            radial_low_active=stage.radial_low,
+            radial_high_active=stage.radial_high,
+            radial_high_lr_scale=self.cfg.calib_opt_radial_high_lr / radial_lr,
+            aspect_lr_scale=self.cfg.calib_opt_aspect_lr_scale,
+        )
+
+    def _project_camera_parameters(self):
+        if self.cfg.calib_opt:
+            self._calibration_module().project_parameters()
+
+    @torch.no_grad()
+    def _camera_metrics(self) -> Dict[str, Tensor]:
+        metrics = {}
+        if self.cfg.pose_opt:
+            metrics.update({f"pose/{k}": v for k, v in self._pose_module().metrics().items()})
+        if self.cfg.calib_opt:
+            base_focal = torch.tensor(
+                [
+                    [
+                        self.parser.Ks_dict[camera_id][0, 0],
+                        self.parser.Ks_dict[camera_id][1, 1],
+                    ]
+                    for camera_id in sorted(set(self.parser.camera_ids))
+                ],
+                device=self.device,
+                dtype=torch.float32,
+            )
+            metrics.update(
+                {
+                    f"calib/{k}": v
+                    for k, v in self._calibration_module().metrics(base_focal).items()
+                }
+            )
+        return metrics
 
     def rasterize_splats(
         self,
@@ -1086,12 +1348,15 @@ class Runner:
             pose_scheduler = torch.optim.lr_scheduler.ExponentialLR(
                 self.pose_optimizers[0], gamma=0.01 ** (1.0 / pose_opt_steps)
             )
+        calibration_scheduler = None
         if cfg.calib_opt:
-            schedulers.append(
-                torch.optim.lr_scheduler.ExponentialLR(
-                    self.calibration_optimizers[0],
-                    gamma=0.01 ** (1.0 / max_steps),
-                )
+            calibration_steps = max(
+                max_steps - cfg.calib_opt_focal_start_step,
+                1,
+            )
+            calibration_scheduler = torch.optim.lr_scheduler.ExponentialLR(
+                self.calibration_optimizers[0],
+                gamma=0.01 ** (1.0 / calibration_steps),
             )
         if cfg.use_bilateral_grid:
             # bilateral grid has a learning rate schedule. Linear warmup for 1000 steps.
@@ -1147,6 +1412,7 @@ class Runner:
             )
             image_ids = data["image_id"].to(device)
             camera_ids = data["camera_id"].to(device)
+            frame_ids = data["frame_id"].to(device)
             masks = data["mask"].to(device) if "mask" in data else None  # [1, H, W]
             sky_masks = (
                 data["sky_mask"].to(device) if "sky_mask" in data else None
@@ -1170,12 +1436,15 @@ class Runner:
                 depths_gt = data["depths"].to(device)  # [1, M]
 
             height, width = pixels.shape[1:3]
+            stage = self._camera_stage(step)
 
             valid_f = None
             if data["camera_model"] == 5 and radial_coeffs is not None:
-                # Cache by (W,H,K,radial) for multi-camera datasets.
+                # Keep this mask tied to the raw COLMAP model. Camera corrections
+                # are deliberately bounded and the raw mask is a stable, cheap
+                # conservative support for all correction stages.
                 K_key = tuple(float(x) for x in data["K"].flatten().tolist())
-                radial_key = tuple(float(x) for x in radial_coeffs.flatten().tolist())
+                radial_key = tuple(float(x) for x in data["radial_coeffs"].flatten().tolist())
                 key = ("fisheye_valid_mask", int(width), int(height), K_key, radial_key)
                 valid_mask = self._fisheye_valid_mask_cache.get(key, None)
                 if valid_mask is None:
@@ -1208,9 +1477,11 @@ class Runner:
             if cfg.pose_noise:
                 camtoworlds = self.pose_perturb(camtoworlds, image_ids)
 
-            pose_opt_active = cfg.pose_opt and step >= cfg.pose_opt_start_step
-            if pose_opt_active:
-                camtoworlds = self.pose_adjust(camtoworlds, image_ids)
+            pose_opt_active = stage.pose
+            if cfg.pose_opt:
+                camtoworlds = self._apply_pose_adjustment(
+                    camtoworlds, image_ids, frame_ids, camera_ids
+                )
 
             # sh schedule
             sh_degree_to_use = min(step // cfg.sh_degree_interval, cfg.sh_degree)
@@ -1257,13 +1528,15 @@ class Runner:
                 bkgd = torch.rand(1, 3, device=device)
                 colors = colors + bkgd * (1.0 - alphas)
 
-            self.cfg.strategy.step_pre_backward(
-                params=self.splats,
-                optimizers=self.optimizers,
-                state=self.strategy_state,
-                step=step,
-                info=info,
-            )
+            densification_active = step >= self.densification_start_step
+            if densification_active:
+                self.cfg.strategy.step_pre_backward(
+                    params=self.splats,
+                    optimizers=self.optimizers,
+                    state=self.strategy_state,
+                    step=step,
+                    info=info,
+                )
 
             # loss
             colors_for_loss = (
@@ -1326,6 +1599,8 @@ class Runner:
                 )
                 loss += cfg.sky_alpha_lambda * sky_alpha_loss
 
+            loss += self._camera_regularization(stage, radial_coeffs)
+
             do_update = True
             if cfg.skip_non_finite_loss and (not torch.isfinite(loss).all()):
                 do_update = False
@@ -1336,6 +1611,8 @@ class Runner:
                     )
             if do_update:
                 loss.backward()
+
+                self._apply_camera_gradient_controls(stage)
 
                 # Some rendering modes (e.g. UT / eval3d) do not provide a differentiable
                 # `info["means2d"]` tensor for gradient-based refinement strategies.
@@ -1368,7 +1645,10 @@ class Runner:
             if math.isfinite(ssimloss_value):
                 ssimloss_history.append(ssimloss_value)
 
-            desc = f"loss={loss.item():.3f}| " f"sh degree={sh_degree_to_use}| "
+            desc = (
+                f"loss={loss.item():.3f}| stage={stage.name}| "
+                f"sh degree={sh_degree_to_use}| "
+            )
             if self.sky_splats is not None:
                 desc += f"sky alpha={sky_alpha_loss.item():.4f}| "
             if cfg.depth_loss:
@@ -1435,6 +1715,9 @@ class Runner:
                 )
                 self.writer.add_scalar("train/num_GS", len(self.splats["means"]), step)
                 self.writer.add_scalar("train/mem", mem, step)
+                self.writer.add_text("train/camera_stage", stage.name, step)
+                for name, value in self._camera_metrics().items():
+                    self.writer.add_scalar(f"train/{name}", value, step)
                 if cfg.calib_opt:
                     calibration = self._calibration_module()
                     self.writer.add_scalar(
@@ -1601,7 +1884,10 @@ class Runner:
                     optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
             for optimizer in self.calibration_optimizers:
-                if do_update:
+                calibration_opt_active = (
+                    stage.focal or stage.principal or stage.radial_low or stage.radial_high
+                )
+                if do_update and calibration_opt_active and not stage.frozen:
                     optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
             for optimizer in self.app_optimizers:
@@ -1617,6 +1903,12 @@ class Runner:
                     scheduler.step()
                 if pose_opt_active and pose_scheduler is not None:
                     pose_scheduler.step()
+                if (
+                    cfg.calib_opt
+                    and calibration_scheduler is not None
+                    and (stage.focal or stage.principal or stage.radial_low or stage.radial_high)
+                ):
+                    calibration_scheduler.step()
 
                 # Post-step parameter clamps for numerical stability.
                 if cfg.scales_log_max > cfg.scales_log_min:
@@ -1647,9 +1939,12 @@ class Runner:
                         -cfg.calib_opt_max_radial_delta,
                         cfg.calib_opt_max_radial_delta,
                     )
+                    calibration.project_parameters()
+                if cfg.pose_opt:
+                    self._pose_module()._zero_reference()
 
             # Run post-backward steps after backward and optimizer
-            if do_update:
+            if do_update and densification_active:
                 if isinstance(self.cfg.strategy, DefaultStrategy):
                     self.cfg.strategy.step_post_backward(
                         params=self.splats,
@@ -1739,8 +2034,11 @@ class Runner:
                 pixels = pixels * masks.unsqueeze(-1)
             image_ids = data["image_id"].to(device)
             camera_ids = data["camera_id"].to(device)
+            frame_ids = data["frame_id"].to(device)
             if apply_train_adjustment and cfg.pose_opt:
-                camtoworlds = self.pose_adjust(camtoworlds, image_ids)
+                camtoworlds = self._apply_pose_adjustment(
+                    camtoworlds, image_ids, frame_ids, camera_ids
+                )
 
             radial_coeffs = (
                 data["radial_coeffs"].to(device)
@@ -2135,6 +2433,12 @@ def main(local_rank: int, world_rank, world_size: int, cfg: Config):
                 runner.sky_splats[k].data = torch.cat(
                     [ckpt["sky_splats"][k] for ckpt in ckpts]
                 )
+        if cfg.pose_opt:
+            if "pose_adjust" not in ckpts[0]:
+                raise ValueError(
+                    "pose_opt evaluation requires pose_adjust in the checkpoint"
+                )
+            runner._pose_module().load_state_dict(ckpts[0]["pose_adjust"])
         if cfg.calib_opt:
             if "calibration_adjust" not in ckpts[0]:
                 raise ValueError(

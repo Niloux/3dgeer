@@ -346,7 +346,9 @@ class Runner:
             ]
 
         if cfg.pose_noise > 0.0:
-            self.pose_perturb = CameraOptModule(len(self.trainset)).to(self.device)
+            self.pose_perturb = CameraOptModule(
+                len(self.trainset), reference_index=None
+            ).to(self.device)
             self.pose_perturb.random_init(cfg.pose_noise)
 
         self.app_optimizers = []
