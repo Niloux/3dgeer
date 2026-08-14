@@ -70,6 +70,22 @@ _PLY_VERTEX_DTYPE = np.dtype(
 )
 
 
+def _truncate_shN_for_ply(shN: Tensor, sh_degree: int) -> Tensor:
+    """Keep only the higher-order SH coefficients requested for PLY export."""
+    if shN.ndim != 3 or shN.shape[2] != 3:
+        raise ValueError(f"shN must have shape (N, K, 3), got {tuple(shN.shape)}")
+    if sh_degree < 0:
+        raise ValueError("sh_degree must be non-negative")
+
+    num_shN = (sh_degree + 1) ** 2 - 1
+    if num_shN > shN.shape[1]:
+        raise ValueError(
+            f"Requested SH degree {sh_degree}, but shN only has "
+            f"{shN.shape[1]} higher-order coefficients"
+        )
+    return shN[:, :num_shN, :]
+
+
 def _read_lidar_ply(
     path: Path, transform: Optional[np.ndarray] = None
 ) -> Tuple[np.ndarray, np.ndarray]:
@@ -202,6 +218,9 @@ class Config:
     save_ply: bool = False
     # Steps to save the model as ply
     ply_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
+    # Maximum SH degree written to PLY. Keep this at 0 to save only the DC term
+    # while retaining the full SH representation in checkpoints during training.
+    ply_sh_degree: int = 0
     # Whether to disable video generation during training and evaluation
     disable_video: bool = False
 
@@ -820,7 +839,8 @@ class Runner:
         )
         if cfg.densification_start_step >= 0:
             self.densification_start_step = cfg.densification_start_step
-        elif cfg.pose_opt or cfg.calib_opt:
+        elif cfg.calib_opt:
+        # elif cfg.pose_opt or cfg.calib_opt:
             self.densification_start_step = max(
                 cfg.pose_opt_start_step + 1000,
                 cfg.calib_opt_focal_start_step,
@@ -1797,6 +1817,11 @@ class Runner:
                 step in [i - 1 for i in cfg.ply_steps] or step == max_steps - 1
             ) and cfg.save_ply:
 
+                if not 0 <= cfg.ply_sh_degree <= cfg.sh_degree:
+                    raise ValueError(
+                        "ply_sh_degree must be between 0 and sh_degree"
+                    )
+
                 if self.cfg.app_opt:
                     # eval at origin to bake the appeareance into the colors
                     rgb = self.app_module(
@@ -1811,7 +1836,9 @@ class Runner:
                     shN = torch.empty([sh0.shape[0], 0, 3], device=sh0.device)
                 else:
                     sh0 = self.splats["sh0"]
-                    shN = self.splats["shN"]
+                    shN = _truncate_shN_for_ply(
+                        self.splats["shN"], cfg.ply_sh_degree
+                    )
 
                 means = self.splats["means"]
                 scales = self.splats["scales"]
@@ -1834,7 +1861,9 @@ class Runner:
                         quats=self.sky_splats["quats"],
                         opacities=self.sky_splats["opacities"],
                         sh0=self.sky_splats["sh0"],
-                        shN=self.sky_splats["shN"],
+                        shN=_truncate_shN_for_ply(
+                            self.sky_splats["shN"], cfg.ply_sh_degree
+                        ),
                         format="ply",
                         save_to=f"{self.ply_dir}/sky_{step}.ply",
                     )

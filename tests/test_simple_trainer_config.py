@@ -9,8 +9,9 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "examples"))
 
-from simple_trainer import Config, Runner, parse_config
+from simple_trainer import Config, Runner, _truncate_shN_for_ply, parse_config
 from utils import CameraCalibrationOptModule
+from gsplat import export_splats
 
 
 class SimpleTrainerConfigTest(unittest.TestCase):
@@ -129,6 +130,42 @@ strategy:
             self.assertEqual(cfg.tb_loss_window, 50)
             self.assertTrue(cfg.sky_enabled)
             self.assertEqual(cfg.sky_mask_dir, "semantic_masks/sky")
+
+    def test_ply_sh_degree_is_independent_from_training_sh_degree(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "train.yaml"
+            path.write_text(
+                """\
+preset: default
+sh_degree: 3
+ply_sh_degree: 0
+""",
+                encoding="utf-8",
+            )
+
+            cfg = parse_config(["--config", str(path)])
+
+            self.assertEqual(cfg.sh_degree, 3)
+            self.assertEqual(cfg.ply_sh_degree, 0)
+
+    def test_dc_only_ply_export_omits_higher_order_sh(self):
+        shN = torch.randn(1, 15, 3)
+        shN_dc_only = _truncate_shN_for_ply(shN, 0)
+
+        data = export_splats(
+            means=torch.zeros(1, 3),
+            scales=torch.zeros(1, 3),
+            quats=torch.tensor([[1.0, 0.0, 0.0, 0.0]]),
+            opacities=torch.zeros(1),
+            sh0=torch.zeros(1, 1, 3),
+            shN=shN_dc_only,
+            format="ply",
+        )
+        header = data.split(b"end_header\n", 1)[0]
+
+        self.assertEqual(tuple(shN_dc_only.shape), (1, 0, 3))
+        self.assertIn(b"property float f_dc_2", header)
+        self.assertNotIn(b"f_rest_", header)
 
 
 if __name__ == "__main__":
