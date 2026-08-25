@@ -491,6 +491,8 @@ class DefaultStrategy(Strategy):
                 state=state,
                 mask=is_split,
                 revised_opacity=self.revised_opacity,
+                surface_normals=state.get("surface_anchor_normal"),
+                surface_valid=state.get("surface_anchor_valid"),
             )
         return n_dupli, n_split
 
@@ -503,6 +505,13 @@ class DefaultStrategy(Strategy):
         step: int,
     ) -> int:
         is_prune = torch.sigmoid(params["opacities"].flatten()) < self.prune_opa
+        surface_prune_mask = state.get("surface_prune_mask")
+        if surface_prune_mask is not None:
+            if surface_prune_mask.shape != is_prune.shape:
+                raise RuntimeError(
+                    "surface_prune_mask is out of sync with Gaussian parameters"
+                )
+            is_prune = is_prune | surface_prune_mask
         if step > self.reset_every:
             is_too_big = (
                 torch.exp(params["scales"]).max(dim=-1).values

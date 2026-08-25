@@ -127,6 +127,8 @@ def split(
     state: Dict[str, Tensor],
     mask: Tensor,
     revised_opacity: bool = False,
+    surface_normals: Union[Tensor, None] = None,
+    surface_valid: Union[Tensor, None] = None,
 ):
     """Inplace split the Gaussian with the given mask.
 
@@ -136,6 +138,9 @@ def split(
         mask: A boolean mask to split the Gaussians.
         revised_opacity: Whether to use revised opacity formulation
           from arXiv:2404.06109. Default: False.
+        surface_normals: Optional per-Gaussian surface normals. When provided,
+          split displacement is projected into the local tangent plane.
+        surface_valid: Optional mask selecting which normals are reliable.
     """
     device = mask.device
     sel = torch.where(mask)[0]
@@ -150,6 +155,21 @@ def split(
         scales,
         torch.randn(2, len(scales), 3, device=device),
     )  # [2, N, 3]
+    if surface_normals is not None:
+        if surface_normals.shape != params["means"].shape:
+            raise ValueError("surface_normals must match means shape")
+        normals = F.normalize(surface_normals[sel], dim=-1, eps=1e-12)
+        tangent_samples = samples - (
+            samples * normals.unsqueeze(0)
+        ).sum(dim=-1, keepdim=True) * normals.unsqueeze(0)
+        if surface_valid is None:
+            samples = tangent_samples
+        else:
+            if surface_valid.shape != mask.shape:
+                raise ValueError("surface_valid must match split mask shape")
+            samples = torch.where(
+                surface_valid[sel][None, :, None], tangent_samples, samples
+            )
 
     def param_fn(name: str, p: Tensor) -> Tensor:
         repeats = [2] + [1] * (p.dim() - 1)

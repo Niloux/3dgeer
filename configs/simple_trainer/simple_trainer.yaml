@@ -1,37 +1,40 @@
 preset: default
 
 # Generated for examples/simple_trainer.py.
-data_dir: "/home/wuyou/remote/colmap/output/park_camera_ab/a_vendor_k_vendor_pose"
+data_dir: "/home/wuyou/remote/colmap/output/park_colmap_lidar"
+# data_dir: "/home/wuyou/3dgeer/data/park_colmap"
 data_factor: 4
 frame_id_min: 63
 frame_id_max: 187
 test_every: 8
-use_test_split: false
+use_test_split: true
 normalize_world_space: false
 tb_loss_window: 100
 
-result_dir: results/0812/A组(原内参原pose)pose_1e-4
+result_dir: results/0825/base
 disable_viewer: true
 disable_video: true
 
 camera_model: fisheye
 keep_distortion: true
-max_fisheye_fov: 178.0
+max_fisheye_fov: 160
 
-max_steps: 7000
+max_steps: 15000
 eval_steps: [3000, 7000, 15000, 30000]
 save_steps: [7000, 15000, 30000]
 save_ply: true
 ply_steps: [7000, 15000, 30000]
 
 sh_degree: 0
+# Keep the full SH representation for training, but save only the DC term in PLY.
+ply_sh_degree: 0
 ssim_lambda: 0.2
 with_geer: true
 with_ut: false
 with_eval3d: true
 
 init_type: lidar
-init_lidar_path: "/home/wuyou/remote/colmap/output/park_camera_ab/d_ba_k_ba_pose/lidar.ply"
+init_lidar_path: "/home/wuyou/remote/colmap/output/park_colmap_lidar/lidar.ply"
 init_opa: 0.1
 init_scale: 1.0
 init_use_knn_pca: true
@@ -40,7 +43,30 @@ knn_pca_normal_scale_factor: 0.25
 knn_pca_planarity_threshold: 0.30
 knn_pca_curvature_threshold: 0.10
 
-sky_enabled: false
+# Keep Gaussian geometry close to the LiDAR PLY surface manifold.
+surface_enabled: true
+surface_lambda: 0.05
+surface_normal_lambda: 0.01
+surface_thickness_lambda: 0.005
+surface_warmup_steps: 1000
+surface_dead_zone: 0.03
+surface_distance_scale: 0.05
+surface_max_distance: 0.20
+surface_min_confidence: 0.05
+surface_refresh_distance: 0.10
+surface_refresh_every: 500
+surface_query_chunk_size: 262144
+surface_loss_max_gaussians: 500000
+surface_normal_anisotropy_min: 0.10
+surface_normal_anisotropy_max: 0.50
+surface_thickness_ratio: 0.40
+surface_prune_enabled: true
+surface_prune_distance: 0.15
+surface_prune_min_confidence: 0.25
+surface_prune_min_opacity: 0.05
+surface_prune_patience: 3
+
+sky_enabled: true
 sky_mask_dir: semantic_masks/sky
 sky_num_points: 100000
 sky_radius: 10000.0
@@ -54,18 +80,15 @@ scale_reg: 0.0
 
 strategy:
   absgrad: true
-  max_gaussians: 4000000
+  grow_grad2d: 1e-4
+  max_gaussians: 5000000
   max_grow_per_refine: 100000
-  refine_stop_iter: 25000
-  refine_scale2d_stop_iter: 25000
-
-  # cap_max: 4000000
-  # noise_lr: 5e3
-  # verbose: true
+  refine_stop_iter: 30000
+  refine_scale2d_stop_iter: 30000
 
 
-pose_opt: true
-pose_opt_start_step: 1000
+pose_opt: false
+pose_opt_start_step: 500
 pose_opt_lr: 1.0e-4
 
 calib_opt: false

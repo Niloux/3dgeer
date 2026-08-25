@@ -25,11 +25,13 @@ from datasets.traj import (
 from evaluation import masked_lpips, masked_psnr, masked_ssim
 from fused_ssim import fused_ssim
 from gaussian_models import (
+    SurfacePriorData,
+    build_surface_priors_knn_pca,
     clamp_sky_sh_colors,
     composite_sky,
     create_sky_splats_with_optimizers,
-    initialize_surface_priors_knn_pca,
 )
+from lidar_geometry import LidarSurfaceGeometry
 from torch import Tensor
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.tensorboard import SummaryWriter
@@ -412,6 +414,44 @@ class Config:
     # Weight for depth loss
     depth_lambda: float = 1e-2
 
+    # Keep trained Gaussian centers on the LiDAR/PLY surface manifold.
+    surface_enabled: bool = False
+    # Final point-to-plane loss weight after warmup.
+    surface_lambda: float = 0.05
+    # Align each surface-like Gaussian's shortest principal axis to the PLY normal.
+    surface_normal_lambda: float = 0.01
+    # Keep the shortest Gaussian scale thin relative to its middle scale.
+    surface_thickness_lambda: float = 0.005
+    # Linear ramp duration for the surface loss. 0 disables the ramp.
+    surface_warmup_steps: int = 1000
+    # Metric free band around the reference surface.
+    surface_dead_zone: float = 0.03
+    # Distance used to normalize the point-to-plane residual.
+    surface_distance_scale: float = 0.05
+    # Reject an anchor when its Gaussian is farther away than this distance.
+    surface_max_distance: float = 0.20
+    # Minimum PCA surface confidence used by the geometry loss.
+    surface_min_confidence: float = 0.05
+    # Requery an inherited anchor after this much total displacement.
+    surface_refresh_distance: float = 0.10
+    # Refresh displaced anchors every this many training steps.
+    surface_refresh_every: int = 500
+    # Maximum CPU nearest-neighbor query batch during anchor refresh.
+    surface_query_chunk_size: int = 262_144
+    # Deterministic rotating sample size used by geometry losses each step.
+    surface_loss_max_gaussians: int = 500_000
+    # Normal loss ramps from zero to full weight across this anisotropy interval.
+    surface_normal_anisotropy_min: float = 0.10
+    surface_normal_anisotropy_max: float = 0.50
+    # Maximum desired shortest/middle scale ratio.
+    surface_thickness_ratio: float = 0.40
+    # Conservatively prune opaque Gaussians persistently outside reliable surfaces.
+    surface_prune_enabled: bool = True
+    surface_prune_distance: float = 0.15
+    surface_prune_min_confidence: float = 0.25
+    surface_prune_min_opacity: float = 0.05
+    surface_prune_patience: int = 3
+
     # Dump information to tensorboard every this steps
     tb_every: int = 100
     # Number of training steps used for TensorBoard loss moving averages.
@@ -580,7 +620,15 @@ def create_splats_with_optimizers(
     device: str = "cuda",
     world_rank: int = 0,
     world_size: int = 1,
-) -> Tuple[torch.nn.ParameterDict, Dict[str, torch.optim.Optimizer]]:
+    return_surface_priors: bool = False,
+) -> Union[
+    Tuple[torch.nn.ParameterDict, Dict[str, torch.optim.Optimizer]],
+    Tuple[
+        torch.nn.ParameterDict,
+        Dict[str, torch.optim.Optimizer],
+        Optional[SurfacePriorData],
+    ],
+]:
     if init_scale <= 0.0:
         raise ValueError("init_scale must be positive")
     if not 0.0 < init_opacity < 1.0:
@@ -606,10 +654,11 @@ def create_splats_with_optimizers(
     else:
         raise ValueError("Please specify a correct init_type: sfm, random, or lidar")
 
+    surface_priors = None
     if init_use_knn_pca:
         if init_type != "lidar":
             raise ValueError("KNN-PCA initialization currently requires init_type=lidar")
-        quats, actual_scales, accepted_count = initialize_surface_priors_knn_pca(
+        surface_priors = build_surface_priors_knn_pca(
             points,
             k=knn_pca_k,
             local_scale_factor=init_scale,
@@ -617,6 +666,9 @@ def create_splats_with_optimizers(
             planarity_threshold=knn_pca_planarity_threshold,
             curvature_threshold=knn_pca_curvature_threshold,
         )
+        quats = surface_priors.rotations
+        actual_scales = surface_priors.scales
+        accepted_count = surface_priors.accepted_count
         scales = torch.log(actual_scales)
         print(
             f"KNN-PCA surface initialization: {accepted_count}/{len(points)} "
@@ -686,6 +738,8 @@ def create_splats_with_optimizers(
         )
         for name, _, lr in params
     }
+    if return_surface_priors:
+        return splats, optimizers, surface_priors
     return splats, optimizers
 
 
@@ -708,6 +762,18 @@ class Runner:
             raise ValueError("sky_enabled and random_bkgd cannot be used together")
         if cfg.init_use_knn_pca and cfg.init_type != "lidar":
             raise ValueError("KNN-PCA initialization currently requires init_type=lidar")
+        if cfg.surface_enabled and not cfg.init_use_knn_pca:
+            raise ValueError("surface_enabled requires init_use_knn_pca")
+        if cfg.surface_enabled and cfg.init_type != "lidar":
+            raise ValueError("surface_enabled requires init_type=lidar")
+        if min(
+            cfg.surface_lambda,
+            cfg.surface_normal_lambda,
+            cfg.surface_thickness_lambda,
+        ) < 0.0 or cfg.surface_warmup_steps < 0:
+            raise ValueError("Surface loss weight and warmup must be non-negative")
+        if cfg.surface_refresh_every < 1 or cfg.surface_query_chunk_size < 1:
+            raise ValueError("Surface refresh intervals and chunks must be positive")
         if cfg.sky_alpha_lambda < 0.0:
             raise ValueError("sky_alpha_lambda must be non-negative")
         if cfg.calib_opt and not cfg.keep_distortion:
@@ -855,7 +921,7 @@ class Runner:
 
         # Model
         feature_dim = 32 if cfg.app_opt else None
-        self.splats, self.optimizers = create_splats_with_optimizers(
+        self.splats, self.optimizers, surface_priors = create_splats_with_optimizers(
             self.parser,
             init_type=cfg.init_type,
             init_num_pts=cfg.init_num_pts,
@@ -883,6 +949,7 @@ class Runner:
             device=self.device,
             world_rank=world_rank,
             world_size=world_size,
+            return_surface_priors=True,
         )
         print("Model initialized. Number of GS:", len(self.splats["means"]))
 
@@ -917,6 +984,46 @@ class Runner:
             self.strategy_state = self.cfg.strategy.initialize_state()
         else:
             assert_never(self.cfg.strategy)
+
+        self.surface_geometry = None
+        if cfg.surface_enabled:
+            if not isinstance(self.cfg.strategy, DefaultStrategy):
+                raise ValueError(
+                    "surface_enabled currently requires the default densification strategy"
+                )
+            if surface_priors is None:
+                raise RuntimeError("Surface priors were not created during initialization")
+            self.surface_geometry = LidarSurfaceGeometry(
+                surface_priors,
+                distance_scale=cfg.surface_distance_scale,
+                dead_zone=cfg.surface_dead_zone,
+                max_distance=cfg.surface_max_distance,
+                min_confidence=cfg.surface_min_confidence,
+                refresh_distance=cfg.surface_refresh_distance,
+                max_loss_gaussians=cfg.surface_loss_max_gaussians,
+                normal_anisotropy_min=cfg.surface_normal_anisotropy_min,
+                normal_anisotropy_max=cfg.surface_normal_anisotropy_max,
+                thickness_ratio=cfg.surface_thickness_ratio,
+                prune_enabled=cfg.surface_prune_enabled,
+                prune_distance=cfg.surface_prune_distance,
+                prune_min_confidence=cfg.surface_prune_min_confidence,
+                prune_min_opacity=cfg.surface_prune_min_opacity,
+                prune_patience=cfg.surface_prune_patience,
+                query_chunk_size=cfg.surface_query_chunk_size,
+            )
+            self.surface_geometry.attach_to_strategy_state(
+                self.strategy_state,
+                self.splats["means"],
+                world_rank=world_rank,
+                world_size=world_size,
+            )
+            valid_count = int(
+                self.strategy_state["surface_anchor_valid"].sum().item()
+            )
+            print(
+                "LiDAR surface geometry initialized. Valid anchors: "
+                f"{valid_count}/{len(self.splats['means'])}"
+            )
 
         # Compression Strategy
         self.compression_method = None
@@ -1607,6 +1714,41 @@ class Runner:
                 loss += cfg.opacity_reg * torch.sigmoid(self.splats["opacities"]).mean()
             if cfg.scale_reg > 0.0:
                 loss += cfg.scale_reg * torch.exp(self.splats["scales"]).mean()
+            surface_loss = torch.zeros_like(l1loss)
+            surface_normal_loss = torch.zeros_like(l1loss)
+            surface_thickness_loss = torch.zeros_like(l1loss)
+            surface_stats: Dict[str, Tensor] = {}
+            surface_weight = 0.0
+            surface_normal_weight = 0.0
+            surface_thickness_weight = 0.0
+            if self.surface_geometry is not None:
+                compute_surface_stats = (
+                    world_rank == 0
+                    and cfg.tb_every > 0
+                    and step % cfg.tb_every == 0
+                )
+                geometry_losses, surface_stats = self.surface_geometry.compute_loss(
+                    self.splats,
+                    self.strategy_state,
+                    step=step,
+                    compute_stats=compute_surface_stats,
+                )
+                surface_loss = geometry_losses["surface"]
+                surface_normal_loss = geometry_losses["normal"]
+                surface_thickness_loss = geometry_losses["thickness"]
+                warmup = (
+                    1.0
+                    if cfg.surface_warmup_steps == 0
+                    else min(1.0, float(step + 1) / cfg.surface_warmup_steps)
+                )
+                surface_weight = cfg.surface_lambda * warmup
+                surface_normal_weight = cfg.surface_normal_lambda * warmup
+                surface_thickness_weight = cfg.surface_thickness_lambda * warmup
+                loss += (
+                    surface_weight * surface_loss
+                    + surface_normal_weight * surface_normal_loss
+                    + surface_thickness_weight * surface_thickness_loss
+                )
             sky_alpha_loss = torch.zeros_like(l1loss)
             if (
                 self.sky_splats is not None
@@ -1673,6 +1815,12 @@ class Runner:
                 desc += f"sky alpha={sky_alpha_loss.item():.4f}| "
             if cfg.depth_loss:
                 desc += f"depth loss={depthloss.item():.6f}| "
+            if self.surface_geometry is not None:
+                desc += (
+                    f"geo={surface_loss.item():.4f}/"
+                    f"{surface_normal_loss.item():.4f}/"
+                    f"{surface_thickness_loss.item():.4f}| "
+                )
             if cfg.pose_opt and cfg.pose_noise:
                 # monitor the pose error if we inject noise
                 pose_err = F.l1_loss(camtoworlds_gt, camtoworlds)
@@ -1769,6 +1917,31 @@ class Runner:
                     )
                 if cfg.depth_loss:
                     self.writer.add_scalar("train/depthloss", depthloss.item(), step)
+                if self.surface_geometry is not None:
+                    self.writer.add_scalar(
+                        "train/surface_loss", surface_loss.item(), step
+                    )
+                    self.writer.add_scalar(
+                        "train/surface_weight", surface_weight, step
+                    )
+                    self.writer.add_scalar(
+                        "train/surface_normal_loss", surface_normal_loss.item(), step
+                    )
+                    self.writer.add_scalar(
+                        "train/surface_normal_weight", surface_normal_weight, step
+                    )
+                    self.writer.add_scalar(
+                        "train/surface_thickness_loss",
+                        surface_thickness_loss.item(),
+                        step,
+                    )
+                    self.writer.add_scalar(
+                        "train/surface_thickness_weight",
+                        surface_thickness_weight,
+                        step,
+                    )
+                    for name, value in surface_stats.items():
+                        self.writer.add_scalar(f"geometry/{name}", value.item(), step)
                 if cfg.use_bilateral_grid:
                     self.writer.add_scalar("train/tvloss", tvloss.item(), step)
                 if cfg.tb_save_image:
@@ -1971,6 +2144,26 @@ class Runner:
                     calibration.project_parameters()
                 if cfg.pose_opt:
                     self._pose_module()._zero_reference()
+
+            periodic_surface_refresh = (
+                step > 0 and step % cfg.surface_refresh_every == 0
+            )
+            if (
+                do_update
+                and self.surface_geometry is not None
+                and periodic_surface_refresh
+            ):
+                refreshed = self.surface_geometry.refresh_anchors(
+                    self.splats["means"], self.strategy_state
+                )
+                prune_candidates = self.surface_geometry.update_prune_state(
+                    self.splats, self.strategy_state
+                )
+                if world_rank == 0 and (refreshed > 0 or prune_candidates > 0):
+                    print(
+                        f"Step {step}: refreshed {refreshed} surface anchors; "
+                        f"{prune_candidates} persistent off-surface prune candidates."
+                    )
 
             # Run post-backward steps after backward and optimizer
             if do_update and densification_active:
