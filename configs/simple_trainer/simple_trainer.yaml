@@ -12,7 +12,7 @@ normalize_world_space: false
 log_every: 100
 log_loss_window: 100
 
-result_dir: results/0825/app
+result_dir: results/0825/photometric-colorcorrect
 disable_viewer: true
 disable_video: true
 
@@ -46,8 +46,8 @@ knn_pca_curvature_threshold: 0.10
 
 # Keep Gaussian geometry close to the LiDAR PLY surface manifold.
 surface_enabled: true
-surface_lambda: 0.05
-surface_normal_lambda: 0.01
+surface_lambda: 0.10
+surface_normal_lambda: 0.02
 surface_thickness_lambda: 0.005
 surface_warmup_steps: 1000
 surface_dead_zone: 0.03
@@ -57,7 +57,7 @@ surface_min_confidence: 0.05
 surface_refresh_distance: 0.10
 surface_refresh_every: 500
 surface_query_chunk_size: 262144
-surface_loss_max_gaussians: 500000
+surface_loss_max_gaussians: 1000000
 surface_normal_anisotropy_min: 0.10
 surface_normal_anisotropy_max: 0.50
 surface_thickness_ratio: 0.40
@@ -82,11 +82,13 @@ scale_reg: 0.0
 strategy:
   absgrad: true
   grow_grad2d: 1e-4
-  max_gaussians: 5000000
-  max_grow_per_refine: 100000
+  max_gaussians: 3000000
+  max_grow_per_refine: 50000
   refine_stop_iter: 30000
   refine_scale2d_stop_iter: 30000
 
+# Let the lightweight per-image color gains stabilize before adding Gaussians.
+densification_start_step: 1000
 
 pose_opt: false
 pose_opt_start_step: 500
@@ -95,4 +97,8 @@ pose_opt_lr: 1.0e-4
 calib_opt: false
 calib_opt_reg: 1e-6
 
-app_opt: true
+app_opt: false
+
+photometric_opt: true
+photometric_opt_lr: 1.0e-2
+photometric_opt_reg: 1.0e-4

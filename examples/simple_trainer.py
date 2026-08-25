@@ -43,6 +43,7 @@ from utils import (
     CameraOptModule,
     CameraRefinementSchedule,
     CameraRigPoseModule,
+    PhotometricOptModule,
     knn,
     rgb_to_sh,
     set_random_seed,
@@ -450,6 +451,13 @@ class Config:
     app_opt_lr: float = 1e-3
     # Regularization for appearance optimization as weight decay
     app_opt_reg: float = 1e-6
+
+    # Enable low-cost per-image RGB gain optimization.
+    photometric_opt: bool = False
+    # Learning rate for per-image log2 RGB gains.
+    photometric_opt_lr: float = 1e-2
+    # L2 prior weight for centered log2 RGB gains.
+    photometric_opt_reg: float = 1e-4
 
     # Enable bilateral grid. (experimental)
     use_bilateral_grid: bool = False
@@ -859,6 +867,14 @@ class Runner:
             raise ValueError("camera_freeze_step must be -1 or non-negative")
         if cfg.densification_start_step < -1:
             raise ValueError("densification_start_step must be -1 or non-negative")
+        if cfg.photometric_opt_lr <= 0.0:
+            raise ValueError("photometric_opt_lr must be positive")
+        if cfg.photometric_opt_reg < 0.0:
+            raise ValueError("photometric_opt_reg must be non-negative")
+        if sum((cfg.app_opt, cfg.photometric_opt, cfg.use_bilateral_grid)) > 1:
+            raise ValueError(
+                "app_opt, photometric_opt, and use_bilateral_grid are mutually exclusive"
+            )
         if cfg.calib_opt_high_order_start_step >= 0 and (
             cfg.calib_opt_high_order_start_step < cfg.calib_opt_radial_start_step
         ):
@@ -1215,6 +1231,20 @@ class Runner:
             if world_size > 1:
                 self.app_module = DDP(self.app_module)
 
+        self.photometric_optimizers = []
+        if cfg.photometric_opt:
+            self.photometric_adjust = PhotometricOptModule(len(self.trainset)).to(
+                self.device
+            )
+            self.photometric_optimizers = [
+                torch.optim.Adam(
+                    self.photometric_adjust.parameters(),
+                    lr=cfg.photometric_opt_lr * math.sqrt(cfg.batch_size),
+                )
+            ]
+            if world_size > 1:
+                self.photometric_adjust = DDP(self.photometric_adjust)
+
         self.bil_grid_optimizers = []
         if cfg.use_bilateral_grid:
             self.bil_grids = BilateralGrid(
@@ -1279,6 +1309,11 @@ class Runner:
         if self.world_size > 1:
             return self.pose_adjust.module
         return self.pose_adjust
+
+    def _photometric_module(self) -> PhotometricOptModule:
+        if self.world_size > 1:
+            return self.photometric_adjust.module
+        return self.photometric_adjust
 
     def _camera_stage(self, step: int):
         return self.camera_schedule.at(step, self.cfg.pose_opt, self.cfg.calib_opt)
@@ -1694,6 +1729,9 @@ class Runner:
             if valid_f is not None:
                 colors = colors * valid_f
 
+            if cfg.photometric_opt:
+                colors = self.photometric_adjust(colors, image_ids)
+
             if cfg.use_bilateral_grid:
                 grid_y, grid_x = torch.meshgrid(
                     (torch.arange(height, device=self.device) + 0.5) / height,
@@ -1765,6 +1803,9 @@ class Runner:
             if cfg.use_bilateral_grid:
                 tvloss = 10 * total_variation_loss(self.bil_grids.grids)
                 loss += tvloss
+            if cfg.photometric_opt:
+                photometric_prior = self._photometric_module().prior_loss()
+                loss += cfg.photometric_opt_reg * photometric_prior
 
             # regularizations
             if cfg.opacity_reg > 0.0:
@@ -1973,6 +2014,14 @@ class Runner:
                         metrics[f"geometry/{name}"] = value
                 if cfg.use_bilateral_grid:
                     metrics["tv_loss"] = tvloss.item()
+                if cfg.photometric_opt:
+                    metrics["photometric_prior_loss"] = photometric_prior.item()
+                    metrics.update(
+                        {
+                            f"photometric/{name}": value
+                            for name, value in self._photometric_module().metrics().items()
+                        }
+                    )
                 self.train_logger.log("train", step=step, **metrics)
 
             # save checkpoint before updating the model
@@ -2008,6 +2057,10 @@ class Runner:
                         data["app_module"] = self.app_module.module.state_dict()
                     else:
                         data["app_module"] = self.app_module.state_dict()
+                if cfg.photometric_opt:
+                    data["photometric_adjust"] = (
+                        self._photometric_module().state_dict()
+                    )
                 checkpoint_path = (
                     f"{self.ckpt_dir}/ckpt_{step}_rank{self.world_rank}.pt"
                 )
@@ -2040,6 +2093,8 @@ class Runner:
                     sh0 = rgb_to_sh(rgb)
                     shN = torch.empty([sh0.shape[0], 0, 3], device=sh0.device)
                 else:
+                    # Per-image photometric gains are zero-mean training adapters;
+                    # keep the exported PLY on the canonical SH color gauge.
                     sh0 = self.splats["sh0"]
                     shN = _truncate_shN_for_ply(
                         self.splats["shN"], cfg.ply_sh_degree
@@ -2128,6 +2183,12 @@ class Runner:
                 if do_update:
                     optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
+            for optimizer in self.photometric_optimizers:
+                if do_update:
+                    optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+            if do_update and cfg.photometric_opt:
+                self._photometric_module().project_parameters()
             for optimizer in self.bil_grid_optimizers:
                 if do_update:
                     optimizer.step()
@@ -2346,6 +2407,11 @@ class Runner:
                 radial_coeffs=radial_coeffs,
                 tangential_coeffs=tangential_coeffs,
             )  # [1, H, W, 3]
+            if cfg.photometric_opt:
+                colors = self.photometric_adjust(
+                    colors,
+                    image_ids if apply_train_adjustment else None,
+                )
             torch.cuda.synchronize()
             ellipse_time += max(time.time() - tic, 1e-10)
 
@@ -2706,6 +2772,14 @@ def main(local_rank: int, world_rank, world_size: int, cfg: Config):
                 )
             runner._calibration_module().load_state_dict(
                 ckpts[0]["calibration_adjust"]
+            )
+        if cfg.photometric_opt:
+            if "photometric_adjust" not in ckpts[0]:
+                raise ValueError(
+                    "photometric_opt evaluation requires photometric_adjust in the checkpoint"
+                )
+            runner._photometric_module().load_state_dict(
+                ckpts[0]["photometric_adjust"]
             )
         step = ckpts[0]["step"]
         runner.eval(step=step)
