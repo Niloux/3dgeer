@@ -9,9 +9,10 @@ frame_id_max: 187
 test_every: 8
 use_test_split: true
 normalize_world_space: false
-tb_loss_window: 100
+log_every: 100
+log_loss_window: 100
 
-result_dir: results/0825/base
+result_dir: results/0825/app
 disable_viewer: true
 disable_video: true
 
@@ -21,9 +22,9 @@ max_fisheye_fov: 160
 
 max_steps: 15000
 eval_steps: [3000, 7000, 15000, 30000]
-save_steps: [7000, 15000, 30000]
+save_steps: [3000, 7000, 15000, 30000]
 save_ply: true
-ply_steps: [7000, 15000, 30000]
+ply_steps: [3000, 7000, 15000, 30000]
 
 sh_degree: 0
 # Keep the full SH representation for training, but save only the DC term in PLY.
@@ -94,4 +95,4 @@ pose_opt_lr: 1.0e-4
 calib_opt: false
 calib_opt_reg: 1e-6
 
-app_opt: false
+app_opt: true

@@ -34,7 +34,6 @@ from gaussian_models import (
 from lidar_geometry import LidarSurfaceGeometry
 from torch import Tensor
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.tensorboard import SummaryWriter
 from torchmetrics.image import StructuralSimilarityIndexMeasure
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from typing_extensions import Literal, assert_never
@@ -70,6 +69,54 @@ _PLY_VERTEX_DTYPE = np.dtype(
         ("blue", "u1"),
     ]
 )
+
+
+def _json_log_value(value):
+    """Convert training metrics to strict JSON-compatible values."""
+    if isinstance(value, Tensor):
+        value = value.detach().cpu()
+        value = value.item() if value.numel() == 1 else value.tolist()
+        return _json_log_value(value)
+    if isinstance(value, np.ndarray):
+        return _json_log_value(value.tolist())
+    if isinstance(value, np.generic):
+        return _json_log_value(value.item())
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(key): _json_log_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_log_value(item) for item in value]
+    return value
+
+
+class JsonlLogger:
+    """Append rank-zero training events to a human-readable JSON Lines file."""
+
+    def __init__(self, path: Union[str, Path], enabled: bool = True) -> None:
+        self.path = Path(path)
+        self.enabled = enabled
+        self.run_id = time.strftime("%Y%m%dT%H%M%S") + f"-{os.getpid()}"
+
+    def log(self, event: str, step: Optional[int] = None, **fields) -> None:
+        if not self.enabled:
+            return
+        record = {
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "run_id": self.run_id,
+            "event": event,
+        }
+        if step is not None:
+            record["step"] = int(step)
+        record.update(
+            {str(key): _json_log_value(value) for key, value in fields.items()}
+        )
+        with self.path.open("a", encoding="utf-8") as log_file:
+            log_file.write(
+                json.dumps(record, ensure_ascii=False, allow_nan=False) + "\n"
+            )
 
 
 def _truncate_shN_for_ply(shN: Tensor, sh_degree: int) -> Tensor:
@@ -452,12 +499,11 @@ class Config:
     surface_prune_min_opacity: float = 0.05
     surface_prune_patience: int = 3
 
-    # Dump information to tensorboard every this steps
-    tb_every: int = 100
-    # Number of training steps used for TensorBoard loss moving averages.
-    tb_loss_window: int = 100
-    # Save training images to tensorboard
-    tb_save_image: bool = False
+    # Append training metrics to <result_dir>/train.log every this many steps.
+    # Set to 0 to disable periodic training metric records.
+    log_every: int = 100
+    # Number of training steps used for loss moving averages in train.log.
+    log_loss_window: int = 100
 
     lpips_net: Literal["vgg", "alex"] = "alex"
 
@@ -825,8 +871,10 @@ class Runner:
             raise ValueError("calib_opt_monotonic_samples must be at least 2")
         if not 0.0 < cfg.calib_opt_monotonic_fov_deg < 180.0:
             raise ValueError("calib_opt_monotonic_fov_deg must be in (0, 180)")
-        if cfg.tb_loss_window <= 0:
-            raise ValueError("tb_loss_window must be positive")
+        if cfg.log_every < 0:
+            raise ValueError("log_every must be non-negative")
+        if cfg.log_loss_window <= 0:
+            raise ValueError("log_loss_window must be positive")
 
         # Where to dump results.
         os.makedirs(cfg.result_dir, exist_ok=True)
@@ -841,8 +889,10 @@ class Runner:
         self.ply_dir = f"{cfg.result_dir}/ply"
         os.makedirs(self.ply_dir, exist_ok=True)
 
-        # Tensorboard
-        self.writer = SummaryWriter(log_dir=f"{cfg.result_dir}/tb")
+        # Append-only structured log. Only rank zero writes in distributed runs.
+        self.train_logger = JsonlLogger(
+            Path(cfg.result_dir) / "train.log", enabled=world_rank == 0
+        )
 
         # Load data: Training data should contain initial points and colors.
         from datasets.colmap import Dataset as ColmapDataset
@@ -1461,6 +1511,13 @@ class Runner:
 
         max_steps = cfg.max_steps
         init_step = 0
+        self.train_logger.log(
+            "run_start",
+            step=init_step,
+            max_steps=max_steps,
+            world_size=world_size,
+            config_path=Path(cfg.result_dir) / "cfg.yml",
+        )
 
         schedulers = [
             # means has a learning rate schedule, that end at 0.01 of the initial value
@@ -1511,9 +1568,9 @@ class Runner:
             pin_memory=True,
         )
         trainloader_iter = iter(trainloader)
-        loss_history = deque(maxlen=cfg.tb_loss_window)
-        l1loss_history = deque(maxlen=cfg.tb_loss_window)
-        ssimloss_history = deque(maxlen=cfg.tb_loss_window)
+        loss_history = deque(maxlen=cfg.log_loss_window)
+        l1loss_history = deque(maxlen=cfg.log_loss_window)
+        ssimloss_history = deque(maxlen=cfg.log_loss_window)
 
         # Training loop.
         global_tic = time.time()
@@ -1724,8 +1781,8 @@ class Runner:
             if self.surface_geometry is not None:
                 compute_surface_stats = (
                     world_rank == 0
-                    and cfg.tb_every > 0
-                    and step % cfg.tb_every == 0
+                    and cfg.log_every > 0
+                    and step % cfg.log_every == 0
                 )
                 geometry_losses, surface_stats = self.surface_geometry.compute_loss(
                     self.splats,
@@ -1770,6 +1827,12 @@ class Runner:
                     print(
                         f"Step {step}: non-finite loss detected (loss={loss.item()}). "
                         "Skipping optimizer update."
+                    )
+                    self.train_logger.log(
+                        "non_finite_loss",
+                        step=step,
+                        loss=loss,
+                        update_applied=False,
                     )
             if do_update:
                 loss.backward()
@@ -1836,32 +1899,8 @@ class Runner:
             #         (canvas * 255).astype(np.uint8),
             #     )
 
-            if world_rank == 0 and cfg.tb_every > 0 and step % cfg.tb_every == 0:
+            if world_rank == 0 and cfg.log_every > 0 and step % cfg.log_every == 0:
                 mem = torch.cuda.max_memory_allocated() / 1024**3
-                self.writer.add_scalar("train/loss", loss.item(), step)
-                self.writer.add_scalar("train/l1loss", l1loss.item(), step)
-                self.writer.add_scalar("train/ssimloss", ssimloss.item(), step)
-                self.writer.add_scalar(
-                    "train/loss_ma",
-                    sum(loss_history) / len(loss_history)
-                    if loss_history
-                    else float("nan"),
-                    step,
-                )
-                self.writer.add_scalar(
-                    "train/l1loss_ma",
-                    sum(l1loss_history) / len(l1loss_history)
-                    if l1loss_history
-                    else float("nan"),
-                    step,
-                )
-                self.writer.add_scalar(
-                    "train/ssimloss_ma",
-                    sum(ssimloss_history) / len(ssimloss_history)
-                    if ssimloss_history
-                    else float("nan"),
-                    step,
-                )
                 image_ids_cpu = image_ids.detach().cpu().reshape(-1).tolist()
                 image_details = []
                 for image_id in image_ids_cpu:
@@ -1873,82 +1912,68 @@ class Runner:
                             "image_path": self.parser.image_paths[dataset_index],
                         }
                     )
-                self.writer.add_text(
-                    "train/image",
-                    json.dumps(image_details, ensure_ascii=False),
-                    step,
-                )
-                self.writer.add_scalar(
-                    "train/image_id", image_details[0]["image_id"], step
-                )
-                self.writer.add_scalar("train/num_GS", len(self.splats["means"]), step)
-                self.writer.add_scalar("train/mem", mem, step)
-                self.writer.add_text("train/camera_stage", stage.name, step)
+                metrics = {
+                    "loss": loss_value,
+                    "l1_loss": l1loss_value,
+                    "ssim_loss": ssimloss_value,
+                    "loss_ma": (
+                        sum(loss_history) / len(loss_history)
+                        if loss_history
+                        else None
+                    ),
+                    "l1_loss_ma": (
+                        sum(l1loss_history) / len(l1loss_history)
+                        if l1loss_history
+                        else None
+                    ),
+                    "ssim_loss_ma": (
+                        sum(ssimloss_history) / len(ssimloss_history)
+                        if ssimloss_history
+                        else None
+                    ),
+                    "images": image_details,
+                    "num_gaussians": len(self.splats["means"]),
+                    "gpu_memory_gib": mem,
+                    "camera_stage": stage.name,
+                    "sh_degree": sh_degree_to_use,
+                    "means_lr": schedulers[0].get_last_lr()[0],
+                    "update_applied": do_update,
+                }
                 for name, value in self._camera_metrics().items():
-                    self.writer.add_scalar(f"train/{name}", value, step)
+                    metrics[name] = value
                 if cfg.calib_opt:
                     calibration = self._calibration_module()
-                    self.writer.add_scalar(
-                        "train/calib_focal_log_scale_max",
-                        calibration.focal_log_scales.weight.detach().abs().max(),
-                        step,
+                    metrics["calib_focal_log_scale_max"] = (
+                        calibration.focal_log_scales.weight.detach().abs().max()
                     )
-                    self.writer.add_scalar(
-                        "train/calib_principal_offset_max",
-                        calibration.principal_offsets.weight.detach().abs().max(),
-                        step,
+                    metrics["calib_principal_offset_max"] = (
+                        calibration.principal_offsets.weight.detach().abs().max()
                     )
-                    self.writer.add_scalar(
-                        "train/calib_radial_delta_max",
-                        calibration.radial_deltas.weight.detach().abs().max(),
-                        step,
+                    metrics["calib_radial_delta_max"] = (
+                        calibration.radial_deltas.weight.detach().abs().max()
                     )
                 if self.sky_splats is not None:
-                    self.writer.add_scalar(
-                        "train/sky_alpha_loss",
-                        cfg.sky_alpha_lambda * sky_alpha_loss.item(),
-                        step,
+                    metrics["sky_alpha_loss"] = (
+                        cfg.sky_alpha_lambda * sky_alpha_loss.item()
                     )
-                    self.writer.add_scalar(
-                        "train/foreground_alpha_on_sky", sky_alpha_loss.item(), step
-                    )
-                    self.writer.add_scalar(
-                        "train/num_sky_GS", len(self.sky_splats["means"]), step
-                    )
+                    metrics["foreground_alpha_on_sky"] = sky_alpha_loss.item()
+                    metrics["num_sky_gaussians"] = len(self.sky_splats["means"])
                 if cfg.depth_loss:
-                    self.writer.add_scalar("train/depthloss", depthloss.item(), step)
+                    metrics["depth_loss"] = depthloss.item()
                 if self.surface_geometry is not None:
-                    self.writer.add_scalar(
-                        "train/surface_loss", surface_loss.item(), step
+                    metrics["surface_loss"] = surface_loss.item()
+                    metrics["surface_weight"] = surface_weight
+                    metrics["surface_normal_loss"] = surface_normal_loss.item()
+                    metrics["surface_normal_weight"] = surface_normal_weight
+                    metrics["surface_thickness_loss"] = (
+                        surface_thickness_loss.item()
                     )
-                    self.writer.add_scalar(
-                        "train/surface_weight", surface_weight, step
-                    )
-                    self.writer.add_scalar(
-                        "train/surface_normal_loss", surface_normal_loss.item(), step
-                    )
-                    self.writer.add_scalar(
-                        "train/surface_normal_weight", surface_normal_weight, step
-                    )
-                    self.writer.add_scalar(
-                        "train/surface_thickness_loss",
-                        surface_thickness_loss.item(),
-                        step,
-                    )
-                    self.writer.add_scalar(
-                        "train/surface_thickness_weight",
-                        surface_thickness_weight,
-                        step,
-                    )
+                    metrics["surface_thickness_weight"] = surface_thickness_weight
                     for name, value in surface_stats.items():
-                        self.writer.add_scalar(f"geometry/{name}", value.item(), step)
+                        metrics[f"geometry/{name}"] = value
                 if cfg.use_bilateral_grid:
-                    self.writer.add_scalar("train/tvloss", tvloss.item(), step)
-                if cfg.tb_save_image:
-                    canvas = torch.cat([pixels, colors], dim=2).detach().cpu().numpy()
-                    canvas = canvas.reshape(-1, *canvas.shape[2:])
-                    self.writer.add_image("train/render", canvas, step)
-                self.writer.flush()
+                    metrics["tv_loss"] = tvloss.item()
+                self.train_logger.log("train", step=step, **metrics)
 
             # save checkpoint before updating the model
             if step in [i - 1 for i in cfg.save_steps] or step == max_steps - 1:
@@ -1983,8 +2008,15 @@ class Runner:
                         data["app_module"] = self.app_module.module.state_dict()
                     else:
                         data["app_module"] = self.app_module.state_dict()
-                torch.save(
-                    data, f"{self.ckpt_dir}/ckpt_{step}_rank{self.world_rank}.pt"
+                checkpoint_path = (
+                    f"{self.ckpt_dir}/ckpt_{step}_rank{self.world_rank}.pt"
+                )
+                torch.save(data, checkpoint_path)
+                self.train_logger.log(
+                    "checkpoint",
+                    step=step,
+                    path=checkpoint_path,
+                    **stats,
                 )
             if (
                 step in [i - 1 for i in cfg.ply_steps] or step == max_steps - 1
@@ -2164,6 +2196,12 @@ class Runner:
                         f"Step {step}: refreshed {refreshed} surface anchors; "
                         f"{prune_candidates} persistent off-surface prune candidates."
                     )
+                    self.train_logger.log(
+                        "surface_refresh",
+                        step=step,
+                        refreshed_anchors=refreshed,
+                        prune_candidates=prune_candidates,
+                    )
 
             # Run post-backward steps after backward and optimizer
             if do_update and densification_active:
@@ -2209,6 +2247,16 @@ class Runner:
                 )
                 # Update the scene.
                 self.viewer.update(step, num_train_rays_per_step)
+
+        self.train_logger.log(
+            "run_complete",
+            step=max_steps - 1,
+            elapsed_seconds=time.time() - global_tic,
+            num_gaussians=len(self.splats["means"]),
+            num_sky_gaussians=(
+                len(self.sky_splats["means"]) if self.sky_splats is not None else 0
+            ),
+        )
 
     def _append_image_metrics(
         self,
@@ -2428,17 +2476,7 @@ class Runner:
                 )
             with open(f"{self.stats_dir}/{stage}_step{step:04d}.json", "w") as f:
                 json.dump(stats, f)
-            for key, value in stats.items():
-                if key.startswith("train_"):
-                    metric_stage, metric_name = "train", key[len("train_") :]
-                elif key == "num_train_images":
-                    metric_stage, metric_name = "train", "num_images"
-                elif key == "num_val_images":
-                    metric_stage, metric_name = stage, "num_images"
-                else:
-                    metric_stage, metric_name = stage, key
-                self.writer.add_scalar(f"{metric_stage}/{metric_name}", value, step)
-            self.writer.flush()
+            self.train_logger.log("evaluation", step=step, stage=stage, **stats)
 
     @torch.no_grad()
     def render_traj(self, step: int):

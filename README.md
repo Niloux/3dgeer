@@ -52,6 +52,10 @@ CUDA_VISIBLE_DEVICES=0 python simple_trainer.py default \
   --strategy.max_gaussians 1000000 \
   --strategy.max_grow_per_refine 50000
 ```
+Training metrics are appended as JSON Lines to `<result_dir>/train.log` every
+`--log-every` steps. Each record is a standalone JSON object, so the file is
+readable with standard text tools and can also be parsed line by line.
+
 #### Caveats
 Some caveats about training with our script:
 - Default densification is more stable for 3DGEER training. It may be necessary to set the `max_gaussians` and `max_grow_per_refine` (e.g. `--strategy.max_gaussians 1000000 --strategy.max_grow_per_refine 50000`).
