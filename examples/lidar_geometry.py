@@ -1,3 +1,4 @@
+import math
 from typing import Any, Dict, Tuple
 
 import numpy as np
@@ -7,6 +8,21 @@ from torch import Tensor
 
 from gaussian_models import SurfacePriorData
 from gsplat.utils import normalized_quat_to_rotmat
+
+
+def _multiply_wxyz_quaternions(left: Tensor, right: Tensor) -> Tensor:
+    """Compose wxyz quaternions so the left rotation is applied last."""
+    left_w, left_xyz = left[..., :1], left[..., 1:]
+    right_w, right_xyz = right[..., :1], right[..., 1:]
+    return torch.cat(
+        [
+            left_w * right_w - (left_xyz * right_xyz).sum(dim=-1, keepdim=True),
+            left_w * right_xyz
+            + right_w * left_xyz
+            + torch.cross(left_xyz, right_xyz, dim=-1),
+        ],
+        dim=-1,
+    )
 
 
 class LidarSurfaceGeometry:
@@ -32,6 +48,13 @@ class LidarSurfaceGeometry:
         max_loss_gaussians: int,
         normal_anisotropy_min: float,
         normal_anisotropy_max: float,
+        offset_bound: float,
+        offset_bound_min_confidence: float,
+        tilt_bound_deg: float,
+        tilt_min_confidence: float,
+        tilt_min_anisotropy: float,
+        thickness_bound_ratio: float,
+        thickness_bound_min_confidence: float,
         thickness_ratio: float,
         prune_enabled: bool,
         prune_distance: float,
@@ -57,6 +80,22 @@ class LidarSurfaceGeometry:
             raise ValueError("Surface loss sample count must be positive")
         if not 0.0 <= normal_anisotropy_min < normal_anisotropy_max <= 1.0:
             raise ValueError("Surface normal anisotropy bounds must satisfy 0 <= min < max <= 1")
+        if not 0.0 < offset_bound < max_distance:
+            raise ValueError(
+                "Surface offset bound must be positive and below max distance"
+            )
+        if not 0.0 <= offset_bound_min_confidence <= 1.0:
+            raise ValueError("Surface offset confidence must be in [0, 1]")
+        if not 0.0 < tilt_bound_deg < 90.0:
+            raise ValueError("Surface tilt bound must be in (0, 90) degrees")
+        if not 0.0 <= tilt_min_confidence <= 1.0:
+            raise ValueError("Surface tilt confidence must be in [0, 1]")
+        if not 0.0 <= tilt_min_anisotropy <= 1.0:
+            raise ValueError("Surface tilt anisotropy must be in [0, 1]")
+        if not 0.0 < thickness_bound_ratio < 1.0:
+            raise ValueError("Surface thickness bound ratio must be in (0, 1)")
+        if not 0.0 <= thickness_bound_min_confidence <= 1.0:
+            raise ValueError("Surface thickness bound confidence must be in [0, 1]")
         if not 0.0 < thickness_ratio < 1.0:
             raise ValueError("Surface thickness ratio must be in (0, 1)")
         if prune_distance <= dead_zone:
@@ -76,6 +115,15 @@ class LidarSurfaceGeometry:
         self.max_loss_gaussians = int(max_loss_gaussians)
         self.normal_anisotropy_min = float(normal_anisotropy_min)
         self.normal_anisotropy_max = float(normal_anisotropy_max)
+        self.offset_bound = float(offset_bound)
+        self.offset_bound_min_confidence = float(offset_bound_min_confidence)
+        self.tilt_bound_deg = float(tilt_bound_deg)
+        self.tilt_min_confidence = float(tilt_min_confidence)
+        self.tilt_min_anisotropy = float(tilt_min_anisotropy)
+        self.thickness_bound_ratio = float(thickness_bound_ratio)
+        self.thickness_bound_min_confidence = float(
+            thickness_bound_min_confidence
+        )
         self.thickness_ratio = float(thickness_ratio)
         self.prune_enabled = bool(prune_enabled)
         self.prune_distance = float(prune_distance)
@@ -280,6 +328,275 @@ class LidarSurfaceGeometry:
                     }
                 )
         return losses, stats
+
+    @torch.no_grad()
+    def project_bounded_offset(
+        self,
+        splats: Dict[str, Tensor],
+        state: Dict[str, Any],
+        *,
+        compute_stats: bool = False,
+    ) -> Dict[str, Tensor]:
+        """Clamp reliable Gaussian centers along their anchor plane normal."""
+        means = splats["means"]
+        if len(state[self._XYZ_KEY]) != len(means):
+            raise RuntimeError(
+                "Surface anchor state is out of sync with Gaussian parameters"
+            )
+
+        anchor_xyz = state[self._XYZ_KEY]
+        anchor_normal = F.normalize(
+            state[self._NORMAL_KEY], dim=-1, eps=1e-12
+        )
+        offset = means.detach() - anchor_xyz
+        plane_offset = (offset * anchor_normal).sum(dim=-1)
+        anchor_distance = torch.linalg.vector_norm(offset, dim=-1)
+        eligible = (
+            state[self._VALID_KEY]
+            & (state[self._CONF_KEY] >= self.offset_bound_min_confidence)
+            & (anchor_distance <= self.max_distance)
+        )
+        outside = eligible & (plane_offset.abs() > self.offset_bound)
+        outside_ids = torch.where(outside)[0]
+        eligible_count = eligible.sum()
+        outside_count = outside.sum()
+        total = max(len(means), 1)
+        zero = means.new_zeros(())
+        stats = {
+            "offset_bound_eligible_count": eligible_count,
+            "offset_bound_eligible_ratio": eligible_count.to(means.dtype) / total,
+            "offset_bound_projected_count": outside_count,
+            "offset_bound_projected_ratio": outside_count.to(means.dtype) / total,
+            "offset_bound_projected_of_eligible": (
+                outside_count.to(means.dtype)
+                / eligible_count.to(means.dtype).clamp_min(1.0)
+            ),
+            "offset_bound_pre_p90": zero,
+            "offset_bound_post_max": zero,
+        }
+        if outside_ids.numel() == 0:
+            return stats
+
+        projected_offset = plane_offset[outside_ids].clamp(
+            -self.offset_bound, self.offset_bound
+        )
+        correction = plane_offset[outside_ids] - projected_offset
+        splats["means"][outside_ids] -= correction[:, None] * anchor_normal[
+            outside_ids
+        ]
+
+        if compute_stats:
+            pre_offset = plane_offset[outside_ids].abs()
+            if pre_offset.numel() > 100_000:
+                stride = (pre_offset.numel() + 99_999) // 100_000
+                pre_offset = pre_offset[::stride][:100_000]
+            stats["offset_bound_pre_p90"] = torch.quantile(pre_offset, 0.90)
+            post_offset = (
+                (splats["means"].detach()[outside_ids] - anchor_xyz[outside_ids])
+                * anchor_normal[outside_ids]
+            ).sum(dim=-1).abs()
+            stats["offset_bound_post_max"] = post_offset.max()
+        return stats
+
+    @torch.no_grad()
+    def project_bounded_thickness(
+        self,
+        splats: Dict[str, Tensor],
+        state: Dict[str, Any],
+        *,
+        compute_stats: bool = False,
+    ) -> Dict[str, Tensor]:
+        """Give reliable surface Gaussians a unique, bounded shortest axis."""
+        means = splats["means"]
+        if len(state[self._XYZ_KEY]) != len(means):
+            raise RuntimeError(
+                "Surface anchor state is out of sync with Gaussian parameters"
+            )
+
+        log_scales = splats["scales"].detach()
+        sorted_log_scales, sorted_axes = torch.sort(log_scales, dim=-1)
+        thickness = torch.exp(
+            sorted_log_scales[:, 0] - sorted_log_scales[:, 1]
+        )
+        anchor_distance = torch.linalg.vector_norm(
+            means.detach() - state[self._XYZ_KEY], dim=-1
+        )
+        eligible = (
+            state[self._VALID_KEY]
+            & (state[self._CONF_KEY] >= self.thickness_bound_min_confidence)
+            & (anchor_distance <= self.max_distance)
+        )
+        outside = eligible & (thickness > self.thickness_bound_ratio)
+        outside_ids = torch.where(outside)[0]
+        eligible_count = eligible.sum()
+        outside_count = outside.sum()
+        total = max(len(means), 1)
+        zero = means.new_zeros(())
+        stats = {
+            "thickness_bound_eligible_count": eligible_count,
+            "thickness_bound_eligible_ratio": eligible_count.to(means.dtype)
+            / total,
+            "thickness_bound_clamped_count": outside_count,
+            "thickness_bound_clamped_ratio": outside_count.to(means.dtype)
+            / total,
+            "thickness_bound_clamped_of_eligible": (
+                outside_count.to(means.dtype)
+                / eligible_count.to(means.dtype).clamp_min(1.0)
+            ),
+            "thickness_bound_pre_p90": zero,
+            "thickness_bound_post_max": zero,
+        }
+        if outside_ids.numel() == 0:
+            return stats
+
+        min_axes = sorted_axes[outside_ids, 0]
+        target_log_scales = (
+            sorted_log_scales[outside_ids, 1]
+            + math.log(self.thickness_bound_ratio)
+        )
+        splats["scales"][outside_ids, min_axes] = target_log_scales
+
+        if compute_stats:
+            pre_thickness = thickness[outside_ids]
+            if pre_thickness.numel() > 100_000:
+                stride = (pre_thickness.numel() + 99_999) // 100_000
+                pre_thickness = pre_thickness[::stride][:100_000]
+            stats["thickness_bound_pre_p90"] = torch.quantile(
+                pre_thickness, 0.90
+            )
+            projected_log_scales = torch.sort(
+                splats["scales"].detach()[outside_ids], dim=-1
+            ).values
+            stats["thickness_bound_post_max"] = torch.exp(
+                projected_log_scales[:, 0] - projected_log_scales[:, 1]
+            ).max()
+        return stats
+
+    @torch.no_grad()
+    def project_bounded_tilt(
+        self,
+        splats: Dict[str, Tensor],
+        state: Dict[str, Any],
+        *,
+        compute_stats: bool = False,
+    ) -> Dict[str, Tensor]:
+        """Project reliable, surface-like Gaussian normals into the anchor cone.
+
+        The shortest scale axis defines the unoriented Gaussian normal. A minimal
+        world-space rotation moves only normals outside the configured cone onto
+        its boundary, preserving the Gaussian's in-plane orientation as much as
+        possible.
+        """
+        means = splats["means"]
+        if len(state[self._NORMAL_KEY]) != len(means):
+            raise RuntimeError(
+                "Surface anchor state is out of sync with Gaussian parameters"
+            )
+
+        scales = torch.exp(splats["scales"].detach())
+        sorted_scales, sorted_axes = torch.sort(scales, dim=-1)
+        thickness = sorted_scales[:, 0] / sorted_scales[:, 1].clamp_min(1e-8)
+        anisotropy = 1.0 - thickness
+        anchor_distance = torch.linalg.vector_norm(
+            means.detach() - state[self._XYZ_KEY], dim=-1
+        )
+        eligible = (
+            state[self._VALID_KEY]
+            & (state[self._CONF_KEY] >= self.tilt_min_confidence)
+            & (anchor_distance <= self.max_distance)
+            & (anisotropy >= self.tilt_min_anisotropy)
+        )
+        eligible_ids = torch.where(eligible)[0]
+        total = max(len(means), 1)
+        eligible_count = eligible.sum()
+        zero = means.new_zeros(())
+        stats = {
+            "tilt_eligible_count": eligible_count,
+            "tilt_eligible_ratio": eligible_count.to(means.dtype) / total,
+            "tilt_projected_count": eligible_count.new_zeros(()),
+            "tilt_projected_ratio": zero,
+            "tilt_projected_of_eligible": zero,
+            "tilt_pre_p90": zero,
+            "tilt_post_max": zero,
+        }
+        if eligible_ids.numel() == 0:
+            return stats
+
+        quats = F.normalize(
+            splats["quats"].detach()[eligible_ids], dim=-1, eps=1e-12
+        )
+        rotations = normalized_quat_to_rotmat(quats)
+        min_axes = sorted_axes[eligible_ids, 0]
+        gaussian_normal = torch.gather(
+            rotations,
+            dim=2,
+            index=min_axes[:, None, None].expand(-1, 3, 1),
+        ).squeeze(-1)
+        anchor_normal = F.normalize(
+            state[self._NORMAL_KEY][eligible_ids], dim=-1, eps=1e-12
+        )
+        signed_cosine = (gaussian_normal * anchor_normal).sum(dim=-1)
+        target_normal = torch.where(
+            (signed_cosine >= 0.0)[:, None], anchor_normal, -anchor_normal
+        )
+        normal_cosine = signed_cosine.abs().clamp(0.0, 1.0)
+        angle = torch.acos(normal_cosine)
+        bound_radians = math.radians(self.tilt_bound_deg)
+        outside = angle > bound_radians
+        outside_local_ids = torch.where(outside)[0]
+        outside_count = outside.sum()
+        stats["tilt_projected_count"] = outside_count
+        stats["tilt_projected_ratio"] = outside_count.to(means.dtype) / total
+        stats["tilt_projected_of_eligible"] = outside_count.to(means.dtype) / (
+            eligible_count.to(means.dtype).clamp_min(1.0)
+        )
+        if outside_local_ids.numel() == 0:
+            return stats
+
+        source = gaussian_normal[outside_local_ids]
+        target = target_normal[outside_local_ids]
+        rotation_axis = F.normalize(
+            torch.cross(source, target, dim=-1), dim=-1, eps=1e-12
+        )
+        correction_angle = angle[outside_local_ids] - bound_radians
+        half_angle = correction_angle * 0.5
+        correction_quat = torch.cat(
+            [
+                torch.cos(half_angle)[:, None],
+                rotation_axis * torch.sin(half_angle)[:, None],
+            ],
+            dim=-1,
+        )
+        projected_quats = F.normalize(
+            _multiply_wxyz_quaternions(
+                correction_quat, quats[outside_local_ids]
+            ),
+            dim=-1,
+            eps=1e-12,
+        )
+        projected_ids = eligible_ids[outside_local_ids]
+        splats["quats"][projected_ids] = projected_quats
+
+        if compute_stats:
+            pre_angles = torch.rad2deg(angle[outside_local_ids])
+            if pre_angles.numel() > 100_000:
+                stride = (pre_angles.numel() + 99_999) // 100_000
+                pre_angles = pre_angles[::stride][:100_000]
+            stats["tilt_pre_p90"] = torch.quantile(pre_angles, 0.90)
+
+            projected_rotations = normalized_quat_to_rotmat(projected_quats)
+            projected_normals = torch.gather(
+                projected_rotations,
+                dim=2,
+                index=min_axes[outside_local_ids, None, None].expand(-1, 3, 1),
+            ).squeeze(-1)
+            post_cosine = (projected_normals * target).sum(dim=-1).clamp(
+                -1.0, 1.0
+            )
+            stats["tilt_post_max"] = torch.rad2deg(
+                torch.acos(post_cosine)
+            ).max()
+        return stats
 
     @torch.no_grad()
     def update_prune_state(

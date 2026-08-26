@@ -43,7 +43,6 @@ from utils import (
     CameraOptModule,
     CameraRefinementSchedule,
     CameraRigPoseModule,
-    PhotometricOptModule,
     knn,
     rgb_to_sh,
     set_random_seed,
@@ -452,13 +451,6 @@ class Config:
     # Regularization for appearance optimization as weight decay
     app_opt_reg: float = 1e-6
 
-    # Enable low-cost per-image RGB gain optimization.
-    photometric_opt: bool = False
-    # Learning rate for per-image log2 RGB gains.
-    photometric_opt_lr: float = 1e-2
-    # L2 prior weight for centered log2 RGB gains.
-    photometric_opt_reg: float = 1e-4
-
     # Enable bilateral grid. (experimental)
     use_bilateral_grid: bool = False
     # Shape of the bilateral grid (X, Y, W)
@@ -498,8 +490,21 @@ class Config:
     # Normal loss ramps from zero to full weight across this anisotropy interval.
     surface_normal_anisotropy_min: float = 0.10
     surface_normal_anisotropy_max: float = 0.50
+    # Clamp reliable Gaussian centers to this distance from their anchor plane.
+    surface_offset_bound_enabled: bool = False
+    surface_offset_bound: float = 0.005
+    surface_offset_bound_min_confidence: float = 0.30
+    # Project reliable, flat Gaussian normals into this cone after geometry warmup.
+    surface_tilt_bound_enabled: bool = False
+    surface_tilt_bound_deg: float = 5.0
+    surface_tilt_min_confidence: float = 0.30
+    surface_tilt_min_anisotropy: float = 0.50
     # Maximum desired shortest/middle scale ratio.
     surface_thickness_ratio: float = 0.40
+    # Hard-project reliable surface Gaussians to a unique shortest scale axis.
+    surface_thickness_bound_enabled: bool = False
+    surface_thickness_bound_ratio: float = 0.40
+    surface_thickness_bound_min_confidence: float = 0.30
     # Conservatively prune opaque Gaussians persistently outside reliable surfaces.
     surface_prune_enabled: bool = True
     surface_prune_distance: float = 0.15
@@ -828,6 +833,42 @@ class Runner:
             raise ValueError("Surface loss weight and warmup must be non-negative")
         if cfg.surface_refresh_every < 1 or cfg.surface_query_chunk_size < 1:
             raise ValueError("Surface refresh intervals and chunks must be positive")
+        if cfg.surface_offset_bound_enabled and not cfg.surface_enabled:
+            raise ValueError("surface_offset_bound_enabled requires surface_enabled")
+        if not 0.0 < cfg.surface_offset_bound < cfg.surface_max_distance:
+            raise ValueError(
+                "surface_offset_bound must be positive and below surface_max_distance"
+            )
+        if not 0.0 <= cfg.surface_offset_bound_min_confidence <= 1.0:
+            raise ValueError(
+                "surface_offset_bound_min_confidence must be in [0, 1]"
+            )
+        if cfg.surface_tilt_bound_enabled and not cfg.surface_enabled:
+            raise ValueError("surface_tilt_bound_enabled requires surface_enabled")
+        if not 0.0 < cfg.surface_tilt_bound_deg < 90.0:
+            raise ValueError("surface_tilt_bound_deg must be in (0, 90)")
+        if not 0.0 <= cfg.surface_tilt_min_confidence <= 1.0:
+            raise ValueError("surface_tilt_min_confidence must be in [0, 1]")
+        if not 0.0 <= cfg.surface_tilt_min_anisotropy <= 1.0:
+            raise ValueError("surface_tilt_min_anisotropy must be in [0, 1]")
+        if cfg.surface_thickness_bound_enabled and not cfg.surface_enabled:
+            raise ValueError("surface_thickness_bound_enabled requires surface_enabled")
+        if not 0.0 < cfg.surface_thickness_bound_ratio < 1.0:
+            raise ValueError("surface_thickness_bound_ratio must be in (0, 1)")
+        if not 0.0 <= cfg.surface_thickness_bound_min_confidence <= 1.0:
+            raise ValueError(
+                "surface_thickness_bound_min_confidence must be in [0, 1]"
+            )
+        if (
+            cfg.surface_thickness_bound_enabled
+            and cfg.surface_tilt_bound_enabled
+            and 1.0 - cfg.surface_thickness_bound_ratio
+            < cfg.surface_tilt_min_anisotropy
+        ):
+            raise ValueError(
+                "surface_thickness_bound_ratio must produce enough anisotropy "
+                "for the configured tilt projection"
+            )
         if cfg.sky_alpha_lambda < 0.0:
             raise ValueError("sky_alpha_lambda must be non-negative")
         if cfg.calib_opt and not cfg.keep_distortion:
@@ -867,13 +908,9 @@ class Runner:
             raise ValueError("camera_freeze_step must be -1 or non-negative")
         if cfg.densification_start_step < -1:
             raise ValueError("densification_start_step must be -1 or non-negative")
-        if cfg.photometric_opt_lr <= 0.0:
-            raise ValueError("photometric_opt_lr must be positive")
-        if cfg.photometric_opt_reg < 0.0:
-            raise ValueError("photometric_opt_reg must be non-negative")
-        if sum((cfg.app_opt, cfg.photometric_opt, cfg.use_bilateral_grid)) > 1:
+        if cfg.app_opt and cfg.use_bilateral_grid:
             raise ValueError(
-                "app_opt, photometric_opt, and use_bilateral_grid are mutually exclusive"
+                "app_opt and use_bilateral_grid are mutually exclusive"
             )
         if cfg.calib_opt_high_order_start_step >= 0 and (
             cfg.calib_opt_high_order_start_step < cfg.calib_opt_radial_start_step
@@ -1069,6 +1106,17 @@ class Runner:
                 max_loss_gaussians=cfg.surface_loss_max_gaussians,
                 normal_anisotropy_min=cfg.surface_normal_anisotropy_min,
                 normal_anisotropy_max=cfg.surface_normal_anisotropy_max,
+                offset_bound=cfg.surface_offset_bound,
+                offset_bound_min_confidence=(
+                    cfg.surface_offset_bound_min_confidence
+                ),
+                tilt_bound_deg=cfg.surface_tilt_bound_deg,
+                tilt_min_confidence=cfg.surface_tilt_min_confidence,
+                tilt_min_anisotropy=cfg.surface_tilt_min_anisotropy,
+                thickness_bound_ratio=cfg.surface_thickness_bound_ratio,
+                thickness_bound_min_confidence=(
+                    cfg.surface_thickness_bound_min_confidence
+                ),
                 thickness_ratio=cfg.surface_thickness_ratio,
                 prune_enabled=cfg.surface_prune_enabled,
                 prune_distance=cfg.surface_prune_distance,
@@ -1231,20 +1279,6 @@ class Runner:
             if world_size > 1:
                 self.app_module = DDP(self.app_module)
 
-        self.photometric_optimizers = []
-        if cfg.photometric_opt:
-            self.photometric_adjust = PhotometricOptModule(len(self.trainset)).to(
-                self.device
-            )
-            self.photometric_optimizers = [
-                torch.optim.Adam(
-                    self.photometric_adjust.parameters(),
-                    lr=cfg.photometric_opt_lr * math.sqrt(cfg.batch_size),
-                )
-            ]
-            if world_size > 1:
-                self.photometric_adjust = DDP(self.photometric_adjust)
-
         self.bil_grid_optimizers = []
         if cfg.use_bilateral_grid:
             self.bil_grids = BilateralGrid(
@@ -1310,10 +1344,21 @@ class Runner:
             return self.pose_adjust.module
         return self.pose_adjust
 
-    def _photometric_module(self) -> PhotometricOptModule:
-        if self.world_size > 1:
-            return self.photometric_adjust.module
-        return self.photometric_adjust
+    def _apply_bilateral_grid(self, colors: Tensor, image_ids: Tensor) -> Tensor:
+        """Apply the learned per-image spatial color correction."""
+        height, width = colors.shape[1:3]
+        grid_y, grid_x = torch.meshgrid(
+            (torch.arange(height, device=colors.device) + 0.5) / height,
+            (torch.arange(width, device=colors.device) + 0.5) / width,
+            indexing="ij",
+        )
+        grid_xy = torch.stack([grid_x, grid_y], dim=-1).unsqueeze(0)
+        return slice(
+            self.bil_grids,
+            grid_xy.expand(colors.shape[0], -1, -1, -1),
+            colors,
+            image_ids.unsqueeze(-1),
+        )["rgb"]
 
     def _camera_stage(self, step: int):
         return self.camera_schedule.at(step, self.cfg.pose_opt, self.cfg.calib_opt)
@@ -1729,22 +1774,8 @@ class Runner:
             if valid_f is not None:
                 colors = colors * valid_f
 
-            if cfg.photometric_opt:
-                colors = self.photometric_adjust(colors, image_ids)
-
             if cfg.use_bilateral_grid:
-                grid_y, grid_x = torch.meshgrid(
-                    (torch.arange(height, device=self.device) + 0.5) / height,
-                    (torch.arange(width, device=self.device) + 0.5) / width,
-                    indexing="ij",
-                )
-                grid_xy = torch.stack([grid_x, grid_y], dim=-1).unsqueeze(0)
-                colors = slice(
-                    self.bil_grids,
-                    grid_xy.expand(colors.shape[0], -1, -1, -1),
-                    colors,
-                    image_ids.unsqueeze(-1),
-                )["rgb"]
+                colors = self._apply_bilateral_grid(colors, image_ids)
 
             if cfg.random_bkgd:
                 bkgd = torch.rand(1, 3, device=device)
@@ -1803,9 +1834,6 @@ class Runner:
             if cfg.use_bilateral_grid:
                 tvloss = 10 * total_variation_loss(self.bil_grids.grids)
                 loss += tvloss
-            if cfg.photometric_opt:
-                photometric_prior = self._photometric_module().prior_loss()
-                loss += cfg.photometric_opt_reg * photometric_prior
 
             # regularizations
             if cfg.opacity_reg > 0.0:
@@ -2014,14 +2042,6 @@ class Runner:
                         metrics[f"geometry/{name}"] = value
                 if cfg.use_bilateral_grid:
                     metrics["tv_loss"] = tvloss.item()
-                if cfg.photometric_opt:
-                    metrics["photometric_prior_loss"] = photometric_prior.item()
-                    metrics.update(
-                        {
-                            f"photometric/{name}": value
-                            for name, value in self._photometric_module().metrics().items()
-                        }
-                    )
                 self.train_logger.log("train", step=step, **metrics)
 
             # save checkpoint before updating the model
@@ -2057,10 +2077,8 @@ class Runner:
                         data["app_module"] = self.app_module.module.state_dict()
                     else:
                         data["app_module"] = self.app_module.state_dict()
-                if cfg.photometric_opt:
-                    data["photometric_adjust"] = (
-                        self._photometric_module().state_dict()
-                    )
+                if cfg.use_bilateral_grid:
+                    data["bilateral_grid"] = self.bil_grids.state_dict()
                 checkpoint_path = (
                     f"{self.ckpt_dir}/ckpt_{step}_rank{self.world_rank}.pt"
                 )
@@ -2093,8 +2111,8 @@ class Runner:
                     sh0 = rgb_to_sh(rgb)
                     shN = torch.empty([sh0.shape[0], 0, 3], device=sh0.device)
                 else:
-                    # Per-image photometric gains are zero-mean training adapters;
-                    # keep the exported PLY on the canonical SH color gauge.
+                    # Bilateral grids are training adapters; keep the exported PLY
+                    # on the canonical SH color gauge.
                     sh0 = self.splats["sh0"]
                     shN = _truncate_shN_for_ply(
                         self.splats["shN"], cfg.ply_sh_degree
@@ -2183,12 +2201,6 @@ class Runner:
                 if do_update:
                     optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
-            for optimizer in self.photometric_optimizers:
-                if do_update:
-                    optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
-            if do_update and cfg.photometric_opt:
-                self._photometric_module().project_parameters()
             for optimizer in self.bil_grid_optimizers:
                 if do_update:
                     optimizer.step()
@@ -2262,6 +2274,73 @@ class Runner:
                         step=step,
                         refreshed_anchors=refreshed,
                         prune_candidates=prune_candidates,
+                    )
+
+            if (
+                do_update
+                and self.surface_geometry is not None
+                and cfg.surface_offset_bound_enabled
+                and step + 1 >= cfg.surface_warmup_steps
+            ):
+                compute_offset_bound_stats = (
+                    world_rank == 0
+                    and cfg.log_every > 0
+                    and step % cfg.log_every == 0
+                )
+                offset_bound_stats = self.surface_geometry.project_bounded_offset(
+                    self.splats,
+                    self.strategy_state,
+                    compute_stats=compute_offset_bound_stats,
+                )
+                if compute_offset_bound_stats:
+                    self.train_logger.log(
+                        "surface_offset_projection",
+                        step=step,
+                        **offset_bound_stats,
+                    )
+
+            if (
+                do_update
+                and self.surface_geometry is not None
+                and cfg.surface_thickness_bound_enabled
+                and step + 1 >= cfg.surface_warmup_steps
+            ):
+                compute_thickness_bound_stats = (
+                    world_rank == 0
+                    and cfg.log_every > 0
+                    and step % cfg.log_every == 0
+                )
+                thickness_bound_stats = self.surface_geometry.project_bounded_thickness(
+                    self.splats,
+                    self.strategy_state,
+                    compute_stats=compute_thickness_bound_stats,
+                )
+                if compute_thickness_bound_stats:
+                    self.train_logger.log(
+                        "surface_thickness_projection",
+                        step=step,
+                        **thickness_bound_stats,
+                    )
+
+            if (
+                do_update
+                and self.surface_geometry is not None
+                and cfg.surface_tilt_bound_enabled
+                and step + 1 >= cfg.surface_warmup_steps
+            ):
+                compute_tilt_stats = (
+                    world_rank == 0
+                    and cfg.log_every > 0
+                    and step % cfg.log_every == 0
+                )
+                tilt_stats = self.surface_geometry.project_bounded_tilt(
+                    self.splats,
+                    self.strategy_state,
+                    compute_stats=compute_tilt_stats,
+                )
+                if compute_tilt_stats:
+                    self.train_logger.log(
+                        "surface_tilt_projection", step=step, **tilt_stats
                     )
 
             # Run post-backward steps after backward and optimizer
@@ -2407,15 +2486,15 @@ class Runner:
                 radial_coeffs=radial_coeffs,
                 tangential_coeffs=tangential_coeffs,
             )  # [1, H, W, 3]
-            if cfg.photometric_opt:
-                colors = self.photometric_adjust(
-                    colors,
-                    image_ids if apply_train_adjustment else None,
-                )
+            bilateral_colors = None
+            if cfg.use_bilateral_grid and apply_train_adjustment:
+                bilateral_colors = self._apply_bilateral_grid(colors, image_ids)
             torch.cuda.synchronize()
             ellipse_time += max(time.time() - tic, 1e-10)
 
             colors = torch.clamp(colors, 0.0, 1.0)
+            if bilateral_colors is not None:
+                bilateral_colors = torch.clamp(bilateral_colors, 0.0, 1.0)
             if world_rank == 0:
                 canvas = torch.cat([pixels, colors], dim=2).squeeze(0).cpu().numpy()
                 canvas = (canvas * 255).astype(np.uint8)
@@ -2423,8 +2502,28 @@ class Runner:
                     f"{self.render_dir}/{stage}_step{step}_{i:04d}.png",
                     canvas,
                 )
+                if bilateral_colors is not None:
+                    bilateral_canvas = (
+                        torch.cat([pixels, bilateral_colors], dim=2)
+                        .squeeze(0)
+                        .cpu()
+                        .numpy()
+                    )
+                    bilateral_canvas = (bilateral_canvas * 255).astype(np.uint8)
+                    imageio.imwrite(
+                        f"{self.render_dir}/{stage}_bilateral_step{step}_{i:04d}.png",
+                        bilateral_canvas,
+                    )
 
                 self._append_image_metrics(metrics, "", colors, pixels, masks)
+                if bilateral_colors is not None:
+                    self._append_image_metrics(
+                        metrics,
+                        "bilateral_",
+                        bilateral_colors,
+                        pixels,
+                        masks,
+                    )
                 no_sky_mask = None
                 if sky_masks is not None:
                     no_sky_mask = ~sky_masks
@@ -2433,6 +2532,14 @@ class Runner:
                     self._append_image_metrics(
                         metrics, "no_sky_", colors, pixels, no_sky_mask
                     )
+                    if bilateral_colors is not None:
+                        self._append_image_metrics(
+                            metrics,
+                            "bilateral_no_sky_",
+                            bilateral_colors,
+                            pixels,
+                            no_sky_mask,
+                        )
                 if cfg.use_bilateral_grid:
                     cc_colors = color_correct(colors, pixels).clamp(0.0, 1.0)
                     self._append_image_metrics(
@@ -2773,14 +2880,12 @@ def main(local_rank: int, world_rank, world_size: int, cfg: Config):
             runner._calibration_module().load_state_dict(
                 ckpts[0]["calibration_adjust"]
             )
-        if cfg.photometric_opt:
-            if "photometric_adjust" not in ckpts[0]:
+        if cfg.use_bilateral_grid:
+            if "bilateral_grid" not in ckpts[0]:
                 raise ValueError(
-                    "photometric_opt evaluation requires photometric_adjust in the checkpoint"
+                    "use_bilateral_grid evaluation requires bilateral_grid in the checkpoint"
                 )
-            runner._photometric_module().load_state_dict(
-                ckpts[0]["photometric_adjust"]
-            )
+            runner.bil_grids.load_state_dict(ckpts[0]["bilateral_grid"])
         step = ckpts[0]["step"]
         runner.eval(step=step)
         runner.render_traj(step=step)

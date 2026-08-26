@@ -7,12 +7,12 @@ data_factor: 4
 frame_id_min: 63
 frame_id_max: 187
 test_every: 8
-use_test_split: true
+use_test_split: false
 normalize_world_space: false
 log_every: 100
 log_loss_window: 100
 
-result_dir: results/0825/photometric-colorcorrect
+result_dir: results/0825/full-bilateral_grid15000
 disable_viewer: true
 disable_video: true
 
@@ -21,10 +21,10 @@ keep_distortion: true
 max_fisheye_fov: 160
 
 max_steps: 15000
-eval_steps: [3000, 7000, 15000, 30000]
-save_steps: [3000, 7000, 15000, 30000]
+eval_steps: [3000, 7000, 10000, 15000, 30000]
+save_steps: [3000, 7000, 10000, 15000, 30000]
 save_ply: true
-ply_steps: [3000, 7000, 15000, 30000]
+ply_steps: [3000, 7000, 10000, 15000, 30000]
 
 sh_degree: 0
 # Keep the full SH representation for training, but save only the DC term in PLY.
@@ -45,10 +45,10 @@ knn_pca_planarity_threshold: 0.30
 knn_pca_curvature_threshold: 0.10
 
 # Keep Gaussian geometry close to the LiDAR PLY surface manifold.
-surface_enabled: true
+surface_enabled: false
 surface_lambda: 0.10
-surface_normal_lambda: 0.02
-surface_thickness_lambda: 0.005
+surface_normal_lambda: 0.10
+surface_thickness_lambda: 0.02
 surface_warmup_steps: 1000
 surface_dead_zone: 0.03
 surface_distance_scale: 0.05
@@ -60,8 +60,18 @@ surface_query_chunk_size: 262144
 surface_loss_max_gaussians: 1000000
 surface_normal_anisotropy_min: 0.10
 surface_normal_anisotropy_max: 0.50
+surface_offset_bound_enabled: false
+surface_offset_bound: 0.005
+surface_offset_bound_min_confidence: 0.30
+surface_tilt_bound_enabled: false
+surface_tilt_bound_deg: 1.0
+surface_tilt_min_confidence: 0.30
+surface_tilt_min_anisotropy: 0.50
 surface_thickness_ratio: 0.40
-surface_prune_enabled: true
+surface_thickness_bound_enabled: false
+surface_thickness_bound_ratio: 0.40
+surface_thickness_bound_min_confidence: 0.30
+surface_prune_enabled: false
 surface_prune_distance: 0.15
 surface_prune_min_confidence: 0.25
 surface_prune_min_opacity: 0.05
@@ -81,14 +91,14 @@ scale_reg: 0.0
 
 strategy:
   absgrad: true
-  grow_grad2d: 1e-4
-  max_gaussians: 3000000
+  grow_grad2d: 2e-4
+  max_gaussians: 4000000
   max_grow_per_refine: 50000
-  refine_stop_iter: 30000
-  refine_scale2d_stop_iter: 30000
+  refine_stop_iter: 15000
+  refine_scale2d_stop_iter: 15000
 
 # Let the lightweight per-image color gains stabilize before adding Gaussians.
-densification_start_step: 1000
+densification_start_step: 500
 
 pose_opt: false
 pose_opt_start_step: 500
@@ -99,6 +109,5 @@ calib_opt_reg: 1e-6
 
 app_opt: false
 
-photometric_opt: true
-photometric_opt_lr: 1.0e-2
-photometric_opt_reg: 1.0e-4
+use_bilateral_grid: true
+bilateral_grid_shape: [16, 16, 8]

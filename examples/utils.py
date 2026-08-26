@@ -606,57 +606,6 @@ class CameraCalibrationOptModule(torch.nn.Module):
         return result
 
 
-class PhotometricOptModule(torch.nn.Module):
-    """Low-cost per-image RGB gain correction with a canonical zero-mean gauge."""
-
-    def __init__(self, n: int):
-        super().__init__()
-        if n <= 0:
-            raise ValueError("Photometric optimization requires at least one image")
-        self.log_rgb_gains = torch.nn.Embedding(n, 3)
-        torch.nn.init.zeros_(self.log_rgb_gains.weight)
-
-    def centered_log_rgb_gains(self) -> Tensor:
-        """Return log2 RGB gains whose per-channel dataset mean is exactly zero."""
-        gains = self.log_rgb_gains.weight
-        return gains - gains.mean(dim=0, keepdim=True)
-
-    def forward(self, colors: Tensor, image_ids: Tensor | None) -> Tensor:
-        """Apply per-image RGB gains, or identity for canonical/novel-view renders."""
-        if image_ids is None:
-            return colors
-        image_ids = image_ids.long().reshape(-1)
-        if colors.shape[0] != image_ids.numel():
-            raise ValueError("colors batch dimension must match image_ids")
-        log_gains = self.centered_log_rgb_gains()[image_ids]
-        while log_gains.ndim < colors.ndim:
-            log_gains = log_gains.unsqueeze(-2)
-        return colors * torch.exp2(log_gains)
-
-    def prior_loss(self) -> Tensor:
-        """Keep corrections small while preserving the exact zero-mean gauge."""
-        return self.centered_log_rgb_gains().square().mean()
-
-    @torch.no_grad()
-    def project_parameters(self) -> None:
-        """Remove optimizer drift along the unobservable global-gain direction."""
-        self.log_rgb_gains.weight.sub_(
-            self.log_rgb_gains.weight.mean(dim=0, keepdim=True)
-        )
-
-    @torch.no_grad()
-    def metrics(self) -> dict[str, Tensor]:
-        log_gains = self.centered_log_rgb_gains()
-        exposure = log_gains.mean(dim=-1)
-        white_balance = log_gains - exposure[:, None]
-        return {
-            "exposure_abs_mean_log2": exposure.abs().mean(),
-            "exposure_abs_max_log2": exposure.abs().max(),
-            "white_balance_abs_mean_log2": white_balance.abs().mean(),
-            "white_balance_abs_max_log2": white_balance.abs().max(),
-        }
-
-
 class AppearanceOptModule(torch.nn.Module):
     """Appearance optimization module."""
 
