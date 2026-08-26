@@ -456,6 +456,11 @@ class Config:
     # Shape of the bilateral grid (X, Y, W)
     bilateral_grid_shape: Tuple[int, int, int] = (16, 16, 8)
 
+    # Enable NVIDIA PPISP as the post-render photometric model. The first
+    # integration deliberately trains only PPISP's exposure/vignetting/color/CRF
+    # modules; the novel-view controller is left disabled.
+    use_ppisp: bool = False
+
     # Enable depth loss. (experimental)
     depth_loss: bool = False
     # Weight for depth loss
@@ -908,10 +913,21 @@ class Runner:
             raise ValueError("camera_freeze_step must be -1 or non-negative")
         if cfg.densification_start_step < -1:
             raise ValueError("densification_start_step must be -1 or non-negative")
-        if cfg.app_opt and cfg.use_bilateral_grid:
+        appearance_methods = sum(
+            (bool(cfg.app_opt), bool(cfg.use_bilateral_grid), bool(cfg.use_ppisp))
+        )
+        if appearance_methods > 1:
             raise ValueError(
-                "app_opt and use_bilateral_grid are mutually exclusive"
+                "app_opt, use_bilateral_grid, and use_ppisp are mutually exclusive"
             )
+        if cfg.use_ppisp and cfg.batch_size != 1:
+            raise ValueError("use_ppisp currently requires batch_size=1")
+        if cfg.use_ppisp and cfg.patch_size is not None:
+            raise ValueError(
+                "use_ppisp currently requires full images (patch_size must be unset)"
+            )
+        if cfg.use_ppisp and world_size != 1:
+            raise ValueError("use_ppisp currently supports single-GPU training only")
         if cfg.calib_opt_high_order_start_step >= 0 and (
             cfg.calib_opt_high_order_start_step < cfg.calib_opt_radial_start_step
         ):
@@ -1295,6 +1311,68 @@ class Runner:
                 ),
             ]
 
+        self.ppisp = None
+        self.ppisp_optimizers = []
+        self.ppisp_camera_ids: Tuple[int, ...] = ()
+        self.ppisp_camera_id_to_index: Dict[int, int] = {}
+        self.ppisp_frame_indices: Optional[Tensor] = None
+        self.ppisp_frames_per_camera: List[int] = []
+        self.ppisp_version: Optional[str] = None
+        if cfg.use_ppisp:
+            try:
+                import ppisp as ppisp_package
+                from ppisp import PPISP, PPISPConfig
+            except ImportError as error:
+                raise RuntimeError(
+                    "use_ppisp requires the PPISP package in the active Python environment"
+                ) from error
+
+            self.ppisp_version = ppisp_package.__version__
+            self.ppisp_camera_ids = tuple(
+                sorted({int(camera_id) for camera_id in self.parser.camera_ids})
+            )
+            self.ppisp_camera_id_to_index = {
+                camera_id: index
+                for index, camera_id in enumerate(self.ppisp_camera_ids)
+            }
+
+            # PPISP's per-frame parameters belong to individual camera images,
+            # not to the rig timestamp shared by the left/right cameras. Group
+            # the indices by camera so the official per-camera reports can slice
+            # the parameter arrays correctly.
+            train_camera_ids = [
+                int(self.parser.camera_ids[int(dataset_index)])
+                for dataset_index in self.trainset.indices
+            ]
+            frame_indices = np.empty(len(self.trainset), dtype=np.int64)
+            next_frame_index = 0
+            for camera_id in self.ppisp_camera_ids:
+                image_ids_for_camera = [
+                    image_id
+                    for image_id, train_camera_id in enumerate(train_camera_ids)
+                    if train_camera_id == camera_id
+                ]
+                self.ppisp_frames_per_camera.append(len(image_ids_for_camera))
+                for image_id in image_ids_for_camera:
+                    frame_indices[image_id] = next_frame_index
+                    next_frame_index += 1
+            if next_frame_index != len(self.trainset):
+                raise RuntimeError("Failed to index all PPISP training frames")
+            self.ppisp_frame_indices = torch.from_numpy(frame_indices).to(
+                device=self.device
+            )
+
+            ppisp_config = PPISPConfig(
+                use_controller=False,
+                scheduler_decay_max_steps=cfg.max_steps,
+            )
+            self.ppisp = PPISP(
+                num_cameras=len(self.ppisp_camera_ids),
+                num_frames=len(self.trainset),
+                config=ppisp_config,
+            ).to(self.device)
+            self.ppisp_optimizers = self.ppisp.create_optimizers()
+
         # Losses & Metrics.
         self.ssim = StructuralSimilarityIndexMeasure(data_range=1.0).to(self.device)
 
@@ -1359,6 +1437,39 @@ class Runner:
             colors,
             image_ids.unsqueeze(-1),
         )["rgb"]
+
+    def _apply_ppisp(
+        self,
+        colors: Tensor,
+        camera_ids: Tensor,
+        image_ids: Optional[Tensor],
+    ) -> Tensor:
+        """Apply PPISP using a training-frame or novel-view photometric state."""
+        if self.ppisp is None or self.ppisp_frame_indices is None:
+            raise RuntimeError("PPISP is not initialized")
+        if colors.shape[0] != 1 or camera_ids.numel() != 1:
+            raise ValueError("PPISP currently expects one full image per batch")
+
+        raw_camera_id = int(camera_ids.reshape(-1)[0].item())
+        try:
+            camera_index = self.ppisp_camera_id_to_index[raw_camera_id]
+        except KeyError as error:
+            raise ValueError(f"Unknown PPISP camera id: {raw_camera_id}") from error
+
+        frame_index = -1
+        if image_ids is not None:
+            if image_ids.numel() != 1:
+                raise ValueError("PPISP currently expects one image id per batch")
+            image_id = int(image_ids.reshape(-1)[0].item())
+            if not 0 <= image_id < len(self.ppisp_frame_indices):
+                raise ValueError(f"Unknown PPISP training image id: {image_id}")
+            frame_index = int(self.ppisp_frame_indices[image_id].item())
+
+        return self.ppisp(
+            colors.squeeze(0),
+            camera_idx=camera_index,
+            frame_idx=frame_index,
+        ).unsqueeze(0)
 
     def _camera_stage(self, step: int):
         return self.camera_schedule.at(step, self.cfg.pose_opt, self.cfg.calib_opt)
@@ -1597,6 +1708,9 @@ class Runner:
             max_steps=max_steps,
             world_size=world_size,
             config_path=Path(cfg.result_dir) / "cfg.yml",
+            ppisp_version=self.ppisp_version,
+            ppisp_camera_ids=self.ppisp_camera_ids,
+            ppisp_frames_per_camera=self.ppisp_frames_per_camera,
         )
 
         schedulers = [
@@ -1637,6 +1751,12 @@ class Runner:
                         ),
                     ]
                 )
+            )
+        ppisp_schedulers = []
+        if self.ppisp is not None:
+            ppisp_schedulers = self.ppisp.create_schedulers(
+                self.ppisp_optimizers,
+                max_steps,
             )
 
         trainloader = torch.utils.data.DataLoader(
@@ -1781,6 +1901,9 @@ class Runner:
                 bkgd = torch.rand(1, 3, device=device)
                 colors = colors + bkgd * (1.0 - alphas)
 
+            if cfg.use_ppisp:
+                colors = self._apply_ppisp(colors, camera_ids, image_ids)
+
             densification_active = step >= self.densification_start_step
             if densification_active:
                 self.cfg.strategy.step_pre_backward(
@@ -1812,6 +1935,10 @@ class Runner:
             else:
                 ssimloss = torch.zeros_like(l1loss)
                 loss = l1loss
+            ppisp_reg_loss = torch.zeros_like(l1loss)
+            if self.ppisp is not None:
+                ppisp_reg_loss = self.ppisp.get_regularization_loss()
+                loss += ppisp_reg_loss
             if cfg.depth_loss:
                 # query depths from depth map
                 points = torch.stack(
@@ -1953,6 +2080,8 @@ class Runner:
                     f"{surface_normal_loss.item():.4f}/"
                     f"{surface_thickness_loss.item():.4f}| "
                 )
+            if self.ppisp is not None:
+                desc += f"ppisp reg={ppisp_reg_loss.item():.4f}| "
             if cfg.pose_opt and cfg.pose_noise:
                 # monitor the pose error if we inject noise
                 pose_err = F.l1_loss(camtoworlds_gt, camtoworlds)
@@ -2042,6 +2171,21 @@ class Runner:
                         metrics[f"geometry/{name}"] = value
                 if cfg.use_bilateral_grid:
                     metrics["tv_loss"] = tvloss.item()
+                if self.ppisp is not None:
+                    metrics["ppisp_regularization_loss"] = ppisp_reg_loss.item()
+                    metrics["ppisp_lr"] = ppisp_schedulers[0].get_last_lr()[0]
+                    metrics["ppisp_exposure_mean"] = (
+                        self.ppisp.exposure_params.detach().mean()
+                    )
+                    metrics["ppisp_exposure_abs_max"] = (
+                        self.ppisp.exposure_params.detach().abs().max()
+                    )
+                    metrics["ppisp_color_abs_max"] = (
+                        self.ppisp.color_params.detach().abs().max()
+                    )
+                    metrics["ppisp_vignetting_alpha_abs_max"] = (
+                        self.ppisp.vignetting_params[..., 2:].detach().abs().max()
+                    )
                 self.train_logger.log("train", step=step, **metrics)
 
             # save checkpoint before updating the model
@@ -2079,6 +2223,12 @@ class Runner:
                         data["app_module"] = self.app_module.state_dict()
                 if cfg.use_bilateral_grid:
                     data["bilateral_grid"] = self.bil_grids.state_dict()
+                if self.ppisp is not None:
+                    data["ppisp"] = self.ppisp.state_dict()
+                    data["ppisp_camera_ids"] = self.ppisp_camera_ids
+                    data["ppisp_frame_indices"] = (
+                        self.ppisp_frame_indices.detach().cpu()
+                    )
                 checkpoint_path = (
                     f"{self.ckpt_dir}/ckpt_{step}_rank{self.world_rank}.pt"
                 )
@@ -2111,8 +2261,9 @@ class Runner:
                     sh0 = rgb_to_sh(rgb)
                     shN = torch.empty([sh0.shape[0], 0, 3], device=sh0.device)
                 else:
-                    # Bilateral grids are training adapters; keep the exported PLY
-                    # on the canonical SH color gauge.
+                    # Post-render appearance adapters (bilateral grid or PPISP)
+                    # are not representable in PLY. Keep the exported Gaussian
+                    # colors on the canonical pre-adapter SH gauge.
                     sh0 = self.splats["sh0"]
                     shN = _truncate_shN_for_ply(
                         self.splats["shN"], cfg.ply_sh_degree
@@ -2205,8 +2356,14 @@ class Runner:
                 if do_update:
                     optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
+            for optimizer in self.ppisp_optimizers:
+                if do_update:
+                    optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
             if do_update:
                 for scheduler in schedulers:
+                    scheduler.step()
+                for scheduler in ppisp_schedulers:
                     scheduler.step()
                 if pose_opt_active and pose_scheduler is not None:
                     pose_scheduler.step()
@@ -2489,12 +2646,21 @@ class Runner:
             bilateral_colors = None
             if cfg.use_bilateral_grid and apply_train_adjustment:
                 bilateral_colors = self._apply_bilateral_grid(colors, image_ids)
+            ppisp_colors = None
+            if cfg.use_ppisp:
+                ppisp_colors = self._apply_ppisp(
+                    colors,
+                    camera_ids,
+                    image_ids if apply_train_adjustment else None,
+                )
             torch.cuda.synchronize()
             ellipse_time += max(time.time() - tic, 1e-10)
 
             colors = torch.clamp(colors, 0.0, 1.0)
             if bilateral_colors is not None:
                 bilateral_colors = torch.clamp(bilateral_colors, 0.0, 1.0)
+            if ppisp_colors is not None:
+                ppisp_colors = torch.clamp(ppisp_colors, 0.0, 1.0)
             if world_rank == 0:
                 canvas = torch.cat([pixels, colors], dim=2).squeeze(0).cpu().numpy()
                 canvas = (canvas * 255).astype(np.uint8)
@@ -2514,6 +2680,18 @@ class Runner:
                         f"{self.render_dir}/{stage}_bilateral_step{step}_{i:04d}.png",
                         bilateral_canvas,
                     )
+                if ppisp_colors is not None:
+                    ppisp_canvas = (
+                        torch.cat([pixels, ppisp_colors], dim=2)
+                        .squeeze(0)
+                        .cpu()
+                        .numpy()
+                    )
+                    ppisp_canvas = (ppisp_canvas * 255).astype(np.uint8)
+                    imageio.imwrite(
+                        f"{self.render_dir}/{stage}_ppisp_step{step}_{i:04d}.png",
+                        ppisp_canvas,
+                    )
 
                 self._append_image_metrics(metrics, "", colors, pixels, masks)
                 if bilateral_colors is not None:
@@ -2521,6 +2699,14 @@ class Runner:
                         metrics,
                         "bilateral_",
                         bilateral_colors,
+                        pixels,
+                        masks,
+                    )
+                if ppisp_colors is not None:
+                    self._append_image_metrics(
+                        metrics,
+                        "ppisp_",
+                        ppisp_colors,
                         pixels,
                         masks,
                     )
@@ -2537,6 +2723,14 @@ class Runner:
                             metrics,
                             "bilateral_no_sky_",
                             bilateral_colors,
+                            pixels,
+                            no_sky_mask,
+                        )
+                    if ppisp_colors is not None:
+                        self._append_image_metrics(
+                            metrics,
+                            "ppisp_no_sky_",
+                            ppisp_colors,
                             pixels,
                             no_sky_mask,
                         )
@@ -2608,6 +2802,13 @@ class Runner:
                     f"Train time: {stats['train_ellipse_time']:.3f}s/image, "
                     f"Number of GS: {stats['num_GS']}"
                 )
+            elif not val_image_count and cfg.use_ppisp:
+                print(
+                    f"Train canonical PSNR: {stats['train_psnr']:.3f}, SSIM: {stats['train_ssim']:.4f}, LPIPS: {stats['train_lpips']:.3f}; "
+                    f"PPISP PSNR: {stats['train_ppisp_psnr']:.3f}, SSIM: {stats['train_ppisp_ssim']:.4f}, LPIPS: {stats['train_ppisp_lpips']:.3f}; "
+                    f"Train time: {stats['train_ellipse_time']:.3f}s/image, "
+                    f"Number of GS: {stats['num_GS']}"
+                )
             elif not val_image_count:
                 print(
                     f"Train full PSNR: {stats['train_psnr']:.3f}, SSIM: {stats['train_ssim']:.4f}, LPIPS: {stats['train_lpips']:.3f}; "
@@ -2620,6 +2821,16 @@ class Runner:
                     f"CC_PSNR: {stats['cc_psnr']:.3f}, CC_SSIM: {stats['cc_ssim']:.4f}, CC_LPIPS: {stats['cc_lpips']:.3f}; "
                     f"Train full PSNR: {stats['train_psnr']:.3f}, SSIM: {stats['train_ssim']:.4f}, LPIPS: {stats['train_lpips']:.3f}, "
                     f"CC_PSNR: {stats['train_cc_psnr']:.3f}, CC_SSIM: {stats['train_cc_ssim']:.4f}, CC_LPIPS: {stats['train_cc_lpips']:.3f}; "
+                    f"Val time: {stats['ellipse_time']:.3f}s/image, "
+                    f"Train time: {stats['train_ellipse_time']:.3f}s/image, "
+                    f"Number of GS: {stats['num_GS']}"
+                )
+            elif cfg.use_ppisp:
+                print(
+                    f"Val canonical PSNR: {stats['psnr']:.3f}, SSIM: {stats['ssim']:.4f}, LPIPS: {stats['lpips']:.3f}; "
+                    f"Val PPISP PSNR: {stats['ppisp_psnr']:.3f}, SSIM: {stats['ppisp_ssim']:.4f}, LPIPS: {stats['ppisp_lpips']:.3f}; "
+                    f"Train canonical PSNR: {stats['train_psnr']:.3f}, SSIM: {stats['train_ssim']:.4f}, LPIPS: {stats['train_lpips']:.3f}; "
+                    f"Train PPISP PSNR: {stats['train_ppisp_psnr']:.3f}, SSIM: {stats['train_ppisp_ssim']:.4f}, LPIPS: {stats['train_ppisp_lpips']:.3f}; "
                     f"Val time: {stats['ellipse_time']:.3f}s/image, "
                     f"Train time: {stats['train_ellipse_time']:.3f}s/image, "
                     f"Number of GS: {stats['num_GS']}"
@@ -2886,6 +3097,28 @@ def main(local_rank: int, world_rank, world_size: int, cfg: Config):
                     "use_bilateral_grid evaluation requires bilateral_grid in the checkpoint"
                 )
             runner.bil_grids.load_state_dict(ckpts[0]["bilateral_grid"])
+        if cfg.use_ppisp:
+            if "ppisp" not in ckpts[0]:
+                raise ValueError(
+                    "use_ppisp evaluation requires PPISP state in the checkpoint"
+                )
+            saved_camera_ids = tuple(
+                int(camera_id)
+                for camera_id in ckpts[0].get("ppisp_camera_ids", ())
+            )
+            if saved_camera_ids != runner.ppisp_camera_ids:
+                raise ValueError(
+                    "Checkpoint PPISP camera ids do not match the current dataset"
+                )
+            saved_frame_indices = ckpts[0].get("ppisp_frame_indices")
+            if saved_frame_indices is None or not torch.equal(
+                saved_frame_indices.cpu(),
+                runner.ppisp_frame_indices.cpu(),
+            ):
+                raise ValueError(
+                    "Checkpoint PPISP frame indices do not match the current train split"
+                )
+            runner.ppisp.load_state_dict(ckpts[0]["ppisp"])
         step = ckpts[0]["step"]
         runner.eval(step=step)
         runner.render_traj(step=step)
