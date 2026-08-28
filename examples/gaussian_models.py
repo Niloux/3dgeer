@@ -1,6 +1,6 @@
 import math
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple
+from typing import Dict, Tuple
 
 import cv2
 import numpy as np
@@ -26,7 +26,6 @@ class SurfacePriorData:
     radius: Tensor
     accepted_count: int
     points_cpu: np.ndarray
-    neighbors_model: Optional[NearestNeighbors]
 
 
 def rotation_matrix_to_quaternion(rotation: Tensor) -> Tensor:
@@ -127,7 +126,6 @@ def build_surface_priors_knn_pca(
             radius=radius,
             accepted_count=0,
             points_cpu=points_cpu,
-            neighbors_model=None,
         )
 
     k_eff = min(k, num_points)
@@ -227,7 +225,6 @@ def build_surface_priors_knn_pca(
         radius=radius,
         accepted_count=accepted_count,
         points_cpu=points_cpu,
-        neighbors_model=neighbors_model,
     )
 
 

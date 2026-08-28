@@ -12,7 +12,7 @@ normalize_world_space: false
 log_every: 100
 log_loss_window: 100
 
-result_dir: results/0828/1529
+result_dir: results/0828/geometry
 disable_viewer: true
 disable_video: true
 
@@ -20,7 +20,7 @@ camera_model: fisheye
 keep_distortion: true
 max_fisheye_fov: 160
 
-max_steps: 30000
+max_steps: 15000
 eval_steps: [3000, 7000, 10000, 15000, 30000]
 save_steps: [3000, 7000, 10000, 15000, 30000]
 save_ply: true
@@ -44,38 +44,9 @@ knn_pca_normal_scale_factor: 0.25
 knn_pca_planarity_threshold: 0.30
 knn_pca_curvature_threshold: 0.10
 
-# Keep Gaussian geometry close to the LiDAR PLY surface manifold.
-surface_enabled: false
-surface_lambda: 0.10
-surface_normal_lambda: 0.10
-surface_thickness_lambda: 0.02
-surface_warmup_steps: 1000
-surface_dead_zone: 0.03
-surface_distance_scale: 0.05
-surface_max_distance: 0.20
-surface_min_confidence: 0.05
-surface_refresh_distance: 0.10
-surface_refresh_every: 500
-surface_query_chunk_size: 262144
-surface_loss_max_gaussians: 1000000
-surface_normal_anisotropy_min: 0.10
-surface_normal_anisotropy_max: 0.50
-surface_offset_bound_enabled: false
-surface_offset_bound: 0.005
-surface_offset_bound_min_confidence: 0.30
-surface_tilt_bound_enabled: false
-surface_tilt_bound_deg: 1.0
-surface_tilt_min_confidence: 0.30
-surface_tilt_min_anisotropy: 0.50
-surface_thickness_ratio: 0.40
-surface_thickness_bound_enabled: false
-surface_thickness_bound_ratio: 0.40
-surface_thickness_bound_min_confidence: 0.30
-surface_prune_enabled: false
-surface_prune_distance: 0.15
-surface_prune_min_confidence: 0.25
-surface_prune_min_opacity: 0.05
-surface_prune_patience: 3
+# Penalize the expected Gaussian distance to nearby LiDAR surface planes.
+geometry_enabled: false
+geometry_lambda: 0.10
 
 sky_enabled: true
 sky_mask_dir: semantic_masks/sky
@@ -93,13 +64,13 @@ strategy:
   absgrad: true
   grow_grad2d: 1e-4
   grow_scale2d: 0.03
-  max_gaussians: 9000000
+  max_gaussians: 5000000
   max_grow_per_refine: 100000
   refine_stop_iter: 27000
   refine_scale2d_stop_iter: 27000
 
 # Let the lightweight per-image color gains stabilize before adding Gaussians.
-densification_start_step: 3001
+densification_start_step: 500
 
 pose_opt: true
 pose_opt_start_step: 500

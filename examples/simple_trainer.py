@@ -31,7 +31,7 @@ from gaussian_models import (
     composite_sky,
     create_sky_splats_with_optimizers,
 )
-from lidar_geometry import LidarSurfaceGeometry
+from lidar_geometry import LidarSurfelField
 from torch import Tensor
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torchmetrics.image import StructuralSimilarityIndexMeasure
@@ -466,56 +466,9 @@ class Config:
     # Weight for depth loss
     depth_lambda: float = 1e-2
 
-    # Keep trained Gaussian centers on the LiDAR/PLY surface manifold.
-    surface_enabled: bool = False
-    # Final point-to-plane loss weight after warmup.
-    surface_lambda: float = 0.05
-    # Align each surface-like Gaussian's shortest principal axis to the PLY normal.
-    surface_normal_lambda: float = 0.01
-    # Keep the shortest Gaussian scale thin relative to its middle scale.
-    surface_thickness_lambda: float = 0.005
-    # Linear ramp duration for the surface loss. 0 disables the ramp.
-    surface_warmup_steps: int = 1000
-    # Metric free band around the reference surface.
-    surface_dead_zone: float = 0.03
-    # Distance used to normalize the point-to-plane residual.
-    surface_distance_scale: float = 0.05
-    # Reject an anchor when its Gaussian is farther away than this distance.
-    surface_max_distance: float = 0.20
-    # Minimum PCA surface confidence used by the geometry loss.
-    surface_min_confidence: float = 0.05
-    # Requery an inherited anchor after this much total displacement.
-    surface_refresh_distance: float = 0.10
-    # Refresh displaced anchors every this many training steps.
-    surface_refresh_every: int = 500
-    # Maximum CPU nearest-neighbor query batch during anchor refresh.
-    surface_query_chunk_size: int = 262_144
-    # Deterministic rotating sample size used by geometry losses each step.
-    surface_loss_max_gaussians: int = 500_000
-    # Normal loss ramps from zero to full weight across this anisotropy interval.
-    surface_normal_anisotropy_min: float = 0.10
-    surface_normal_anisotropy_max: float = 0.50
-    # Clamp reliable Gaussian centers to this distance from their anchor plane.
-    surface_offset_bound_enabled: bool = False
-    surface_offset_bound: float = 0.005
-    surface_offset_bound_min_confidence: float = 0.30
-    # Project reliable, flat Gaussian normals into this cone after geometry warmup.
-    surface_tilt_bound_enabled: bool = False
-    surface_tilt_bound_deg: float = 5.0
-    surface_tilt_min_confidence: float = 0.30
-    surface_tilt_min_anisotropy: float = 0.50
-    # Maximum desired shortest/middle scale ratio.
-    surface_thickness_ratio: float = 0.40
-    # Hard-project reliable surface Gaussians to a unique shortest scale axis.
-    surface_thickness_bound_enabled: bool = False
-    surface_thickness_bound_ratio: float = 0.40
-    surface_thickness_bound_min_confidence: float = 0.30
-    # Conservatively prune opaque Gaussians persistently outside reliable surfaces.
-    surface_prune_enabled: bool = True
-    surface_prune_distance: float = 0.15
-    surface_prune_min_confidence: float = 0.25
-    surface_prune_min_opacity: float = 0.05
-    surface_prune_patience: int = 3
+    # Penalize expected Gaussian distance to nearby LiDAR surface planes.
+    geometry_enabled: bool = False
+    geometry_lambda: float = 0.10
 
     # Append training metrics to <result_dir>/train.log every this many steps.
     # Set to 0 to disable periodic training metric records.
@@ -826,54 +779,12 @@ class Runner:
             raise ValueError("sky_enabled and random_bkgd cannot be used together")
         if cfg.init_use_knn_pca and cfg.init_type != "lidar":
             raise ValueError("KNN-PCA initialization currently requires init_type=lidar")
-        if cfg.surface_enabled and not cfg.init_use_knn_pca:
-            raise ValueError("surface_enabled requires init_use_knn_pca")
-        if cfg.surface_enabled and cfg.init_type != "lidar":
-            raise ValueError("surface_enabled requires init_type=lidar")
-        if min(
-            cfg.surface_lambda,
-            cfg.surface_normal_lambda,
-            cfg.surface_thickness_lambda,
-        ) < 0.0 or cfg.surface_warmup_steps < 0:
-            raise ValueError("Surface loss weight and warmup must be non-negative")
-        if cfg.surface_refresh_every < 1 or cfg.surface_query_chunk_size < 1:
-            raise ValueError("Surface refresh intervals and chunks must be positive")
-        if cfg.surface_offset_bound_enabled and not cfg.surface_enabled:
-            raise ValueError("surface_offset_bound_enabled requires surface_enabled")
-        if not 0.0 < cfg.surface_offset_bound < cfg.surface_max_distance:
-            raise ValueError(
-                "surface_offset_bound must be positive and below surface_max_distance"
-            )
-        if not 0.0 <= cfg.surface_offset_bound_min_confidence <= 1.0:
-            raise ValueError(
-                "surface_offset_bound_min_confidence must be in [0, 1]"
-            )
-        if cfg.surface_tilt_bound_enabled and not cfg.surface_enabled:
-            raise ValueError("surface_tilt_bound_enabled requires surface_enabled")
-        if not 0.0 < cfg.surface_tilt_bound_deg < 90.0:
-            raise ValueError("surface_tilt_bound_deg must be in (0, 90)")
-        if not 0.0 <= cfg.surface_tilt_min_confidence <= 1.0:
-            raise ValueError("surface_tilt_min_confidence must be in [0, 1]")
-        if not 0.0 <= cfg.surface_tilt_min_anisotropy <= 1.0:
-            raise ValueError("surface_tilt_min_anisotropy must be in [0, 1]")
-        if cfg.surface_thickness_bound_enabled and not cfg.surface_enabled:
-            raise ValueError("surface_thickness_bound_enabled requires surface_enabled")
-        if not 0.0 < cfg.surface_thickness_bound_ratio < 1.0:
-            raise ValueError("surface_thickness_bound_ratio must be in (0, 1)")
-        if not 0.0 <= cfg.surface_thickness_bound_min_confidence <= 1.0:
-            raise ValueError(
-                "surface_thickness_bound_min_confidence must be in [0, 1]"
-            )
-        if (
-            cfg.surface_thickness_bound_enabled
-            and cfg.surface_tilt_bound_enabled
-            and 1.0 - cfg.surface_thickness_bound_ratio
-            < cfg.surface_tilt_min_anisotropy
-        ):
-            raise ValueError(
-                "surface_thickness_bound_ratio must produce enough anisotropy "
-                "for the configured tilt projection"
-            )
+        if cfg.geometry_enabled and not cfg.init_use_knn_pca:
+            raise ValueError("geometry_enabled requires init_use_knn_pca")
+        if cfg.geometry_enabled and cfg.init_type != "lidar":
+            raise ValueError("geometry_enabled requires init_type=lidar")
+        if cfg.geometry_lambda < 0.0:
+            raise ValueError("geometry_lambda must be non-negative")
         if cfg.sky_alpha_lambda < 0.0:
             raise ValueError("sky_alpha_lambda must be non-negative")
         if cfg.calib_opt and not cfg.keep_distortion:
@@ -1104,55 +1015,18 @@ class Runner:
         else:
             assert_never(self.cfg.strategy)
 
-        self.surface_geometry = None
-        if cfg.surface_enabled:
-            if not isinstance(self.cfg.strategy, DefaultStrategy):
-                raise ValueError(
-                    "surface_enabled currently requires the default densification strategy"
-                )
+        self.lidar_surface = None
+        if cfg.geometry_enabled:
             if surface_priors is None:
                 raise RuntimeError("Surface priors were not created during initialization")
-            self.surface_geometry = LidarSurfaceGeometry(
-                surface_priors,
-                distance_scale=cfg.surface_distance_scale,
-                dead_zone=cfg.surface_dead_zone,
-                max_distance=cfg.surface_max_distance,
-                min_confidence=cfg.surface_min_confidence,
-                refresh_distance=cfg.surface_refresh_distance,
-                max_loss_gaussians=cfg.surface_loss_max_gaussians,
-                normal_anisotropy_min=cfg.surface_normal_anisotropy_min,
-                normal_anisotropy_max=cfg.surface_normal_anisotropy_max,
-                offset_bound=cfg.surface_offset_bound,
-                offset_bound_min_confidence=(
-                    cfg.surface_offset_bound_min_confidence
-                ),
-                tilt_bound_deg=cfg.surface_tilt_bound_deg,
-                tilt_min_confidence=cfg.surface_tilt_min_confidence,
-                tilt_min_anisotropy=cfg.surface_tilt_min_anisotropy,
-                thickness_bound_ratio=cfg.surface_thickness_bound_ratio,
-                thickness_bound_min_confidence=(
-                    cfg.surface_thickness_bound_min_confidence
-                ),
-                thickness_ratio=cfg.surface_thickness_ratio,
-                prune_enabled=cfg.surface_prune_enabled,
-                prune_distance=cfg.surface_prune_distance,
-                prune_min_confidence=cfg.surface_prune_min_confidence,
-                prune_min_opacity=cfg.surface_prune_min_opacity,
-                prune_patience=cfg.surface_prune_patience,
-                query_chunk_size=cfg.surface_query_chunk_size,
-            )
-            self.surface_geometry.attach_to_strategy_state(
-                self.strategy_state,
-                self.splats["means"],
-                world_rank=world_rank,
-                world_size=world_size,
-            )
-            valid_count = int(
-                self.strategy_state["surface_anchor_valid"].sum().item()
+            self.lidar_surface = LidarSurfelField(
+                surface_priors, device=torch.device(self.device)
             )
             print(
-                "LiDAR surface geometry initialized. Valid anchors: "
-                f"{valid_count}/{len(self.splats['means'])}"
+                "LiDAR surfel geometry initialized: "
+                f"{self.lidar_surface.num_surfels} surfels from "
+                f"{self.lidar_surface.num_reliable_points} reliable points; "
+                f"voxel={self.lidar_surface.voxel_size:.4f}"
             )
 
         # Compression Strategy
@@ -1967,41 +1841,28 @@ class Runner:
                 loss += cfg.opacity_reg * torch.sigmoid(self.splats["opacities"]).mean()
             if cfg.scale_reg > 0.0:
                 loss += cfg.scale_reg * torch.exp(self.splats["scales"]).mean()
-            surface_loss = torch.zeros_like(l1loss)
-            surface_normal_loss = torch.zeros_like(l1loss)
-            surface_thickness_loss = torch.zeros_like(l1loss)
-            surface_stats: Dict[str, Tensor] = {}
-            surface_weight = 0.0
-            surface_normal_weight = 0.0
-            surface_thickness_weight = 0.0
-            if self.surface_geometry is not None:
-                compute_surface_stats = (
+            geometry_loss = torch.zeros_like(l1loss)
+            geometry_stats: Dict[str, Tensor] = {}
+            if self.lidar_surface is not None:
+                if cfg.packed:
+                    geometry_visible = torch.zeros(
+                        len(self.splats["means"]), dtype=torch.bool, device=device
+                    )
+                    geometry_visible[info["gaussian_ids"]] = True
+                else:
+                    geometry_visible = (info["radii"] > 0).all(-1).any(0)
+                compute_geometry_stats = (
                     world_rank == 0
                     and cfg.log_every > 0
                     and step % cfg.log_every == 0
                 )
-                geometry_losses, surface_stats = self.surface_geometry.compute_loss(
+                geometry_loss, geometry_stats = self.lidar_surface.compute_loss(
                     self.splats,
-                    self.strategy_state,
+                    geometry_visible,
                     step=step,
-                    compute_stats=compute_surface_stats,
+                    compute_stats=compute_geometry_stats,
                 )
-                surface_loss = geometry_losses["surface"]
-                surface_normal_loss = geometry_losses["normal"]
-                surface_thickness_loss = geometry_losses["thickness"]
-                warmup = (
-                    1.0
-                    if cfg.surface_warmup_steps == 0
-                    else min(1.0, float(step + 1) / cfg.surface_warmup_steps)
-                )
-                surface_weight = cfg.surface_lambda * warmup
-                surface_normal_weight = cfg.surface_normal_lambda * warmup
-                surface_thickness_weight = cfg.surface_thickness_lambda * warmup
-                loss += (
-                    surface_weight * surface_loss
-                    + surface_normal_weight * surface_normal_loss
-                    + surface_thickness_weight * surface_thickness_loss
-                )
+                loss += cfg.geometry_lambda * geometry_loss
             sky_alpha_loss = torch.zeros_like(l1loss)
             if (
                 self.sky_splats is not None
@@ -2074,12 +1935,8 @@ class Runner:
                 desc += f"sky alpha={sky_alpha_loss.item():.4f}| "
             if cfg.depth_loss:
                 desc += f"depth loss={depthloss.item():.6f}| "
-            if self.surface_geometry is not None:
-                desc += (
-                    f"geo={surface_loss.item():.4f}/"
-                    f"{surface_normal_loss.item():.4f}/"
-                    f"{surface_thickness_loss.item():.4f}| "
-                )
+            if self.lidar_surface is not None:
+                desc += f"geometry={geometry_loss.item():.4f}| "
             if self.ppisp is not None:
                 desc += f"ppisp reg={ppisp_reg_loss.item():.4f}| "
             if cfg.pose_opt and cfg.pose_noise:
@@ -2158,16 +2015,10 @@ class Runner:
                     metrics["num_sky_gaussians"] = len(self.sky_splats["means"])
                 if cfg.depth_loss:
                     metrics["depth_loss"] = depthloss.item()
-                if self.surface_geometry is not None:
-                    metrics["surface_loss"] = surface_loss.item()
-                    metrics["surface_weight"] = surface_weight
-                    metrics["surface_normal_loss"] = surface_normal_loss.item()
-                    metrics["surface_normal_weight"] = surface_normal_weight
-                    metrics["surface_thickness_loss"] = (
-                        surface_thickness_loss.item()
-                    )
-                    metrics["surface_thickness_weight"] = surface_thickness_weight
-                    for name, value in surface_stats.items():
+                if self.lidar_surface is not None:
+                    metrics["geometry_loss"] = geometry_loss.item()
+                    metrics["geometry_weight"] = cfg.geometry_lambda
+                    for name, value in geometry_stats.items():
                         metrics[f"geometry/{name}"] = value
                 if cfg.use_bilateral_grid:
                     metrics["tv_loss"] = tvloss.item()
@@ -2406,99 +2257,6 @@ class Runner:
                     calibration.project_parameters()
                 if cfg.pose_opt:
                     self._pose_module()._zero_reference()
-
-            periodic_surface_refresh = (
-                step > 0 and step % cfg.surface_refresh_every == 0
-            )
-            if (
-                do_update
-                and self.surface_geometry is not None
-                and periodic_surface_refresh
-            ):
-                refreshed = self.surface_geometry.refresh_anchors(
-                    self.splats["means"], self.strategy_state
-                )
-                prune_candidates = self.surface_geometry.update_prune_state(
-                    self.splats, self.strategy_state
-                )
-                if world_rank == 0 and (refreshed > 0 or prune_candidates > 0):
-                    print(
-                        f"Step {step}: refreshed {refreshed} surface anchors; "
-                        f"{prune_candidates} persistent off-surface prune candidates."
-                    )
-                    self.train_logger.log(
-                        "surface_refresh",
-                        step=step,
-                        refreshed_anchors=refreshed,
-                        prune_candidates=prune_candidates,
-                    )
-
-            if (
-                do_update
-                and self.surface_geometry is not None
-                and cfg.surface_offset_bound_enabled
-                and step + 1 >= cfg.surface_warmup_steps
-            ):
-                compute_offset_bound_stats = (
-                    world_rank == 0
-                    and cfg.log_every > 0
-                    and step % cfg.log_every == 0
-                )
-                offset_bound_stats = self.surface_geometry.project_bounded_offset(
-                    self.splats,
-                    self.strategy_state,
-                    compute_stats=compute_offset_bound_stats,
-                )
-                if compute_offset_bound_stats:
-                    self.train_logger.log(
-                        "surface_offset_projection",
-                        step=step,
-                        **offset_bound_stats,
-                    )
-
-            if (
-                do_update
-                and self.surface_geometry is not None
-                and cfg.surface_thickness_bound_enabled
-                and step + 1 >= cfg.surface_warmup_steps
-            ):
-                compute_thickness_bound_stats = (
-                    world_rank == 0
-                    and cfg.log_every > 0
-                    and step % cfg.log_every == 0
-                )
-                thickness_bound_stats = self.surface_geometry.project_bounded_thickness(
-                    self.splats,
-                    self.strategy_state,
-                    compute_stats=compute_thickness_bound_stats,
-                )
-                if compute_thickness_bound_stats:
-                    self.train_logger.log(
-                        "surface_thickness_projection",
-                        step=step,
-                        **thickness_bound_stats,
-                    )
-
-            if (
-                do_update
-                and self.surface_geometry is not None
-                and cfg.surface_tilt_bound_enabled
-                and step + 1 >= cfg.surface_warmup_steps
-            ):
-                compute_tilt_stats = (
-                    world_rank == 0
-                    and cfg.log_every > 0
-                    and step % cfg.log_every == 0
-                )
-                tilt_stats = self.surface_geometry.project_bounded_tilt(
-                    self.splats,
-                    self.strategy_state,
-                    compute_stats=compute_tilt_stats,
-                )
-                if compute_tilt_stats:
-                    self.train_logger.log(
-                        "surface_tilt_projection", step=step, **tilt_stats
-                    )
 
             # Run post-backward steps after backward and optimizer
             if do_update and densification_active:
