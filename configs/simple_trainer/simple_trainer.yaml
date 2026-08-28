@@ -1,7 +1,7 @@
 preset: default
 
 # Generated for examples/simple_trainer.py.
-data_dir: "/home/wuyou/remote/colmap/output/park_colmap_lidar"
+data_dir: "/home/wuyou/3dgeer/data/park"
 # data_dir: "/home/wuyou/3dgeer/data/park_colmap"
 data_factor: 4
 frame_id_min: 63
@@ -12,7 +12,7 @@ normalize_world_space: false
 log_every: 100
 log_loss_window: 100
 
-result_dir: results/0825/full-bilateral_grid15000
+result_dir: results/0828/1529
 disable_viewer: true
 disable_video: true
 
@@ -20,13 +20,13 @@ camera_model: fisheye
 keep_distortion: true
 max_fisheye_fov: 160
 
-max_steps: 15000
+max_steps: 30000
 eval_steps: [3000, 7000, 10000, 15000, 30000]
 save_steps: [3000, 7000, 10000, 15000, 30000]
 save_ply: true
 ply_steps: [3000, 7000, 10000, 15000, 30000]
 
-sh_degree: 0
+sh_degree: 2
 # Keep the full SH representation for training, but save only the DC term in PLY.
 ply_sh_degree: 0
 ssim_lambda: 0.2
@@ -35,7 +35,7 @@ with_ut: false
 with_eval3d: true
 
 init_type: lidar
-init_lidar_path: "/home/wuyou/remote/colmap/output/park_colmap_lidar/lidar.ply"
+init_lidar_path: "/home/wuyou/3dgeer/data/park/lidar.ply"
 init_opa: 0.1
 init_scale: 1.0
 init_use_knn_pca: true
@@ -91,20 +91,21 @@ scale_reg: 0.0
 
 strategy:
   absgrad: true
-  grow_grad2d: 2e-4
-  max_gaussians: 4000000
-  max_grow_per_refine: 50000
-  refine_stop_iter: 15000
-  refine_scale2d_stop_iter: 15000
+  grow_grad2d: 1e-4
+  grow_scale2d: 0.03
+  max_gaussians: 9000000
+  max_grow_per_refine: 100000
+  refine_stop_iter: 27000
+  refine_scale2d_stop_iter: 27000
 
 # Let the lightweight per-image color gains stabilize before adding Gaussians.
-densification_start_step: 500
+densification_start_step: 3001
 
-pose_opt: false
+pose_opt: true
 pose_opt_start_step: 500
 pose_opt_lr: 1.0e-4
 
-calib_opt: false
+calib_opt: true
 calib_opt_reg: 1e-6
 
 app_opt: false
