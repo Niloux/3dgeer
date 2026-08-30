@@ -30,13 +30,13 @@ def _get_rel_paths(path_dir: str) -> List[str]:
     return paths
 
 
-def _resolve_semantic_mask_path(mask_dir: str, image_name: str) -> str:
-    """Resolve nested COLMAP names against flat or nested PNG mask folders."""
+def _resolve_sky_mask_path(mask_dir: str, image_name: str) -> str:
+    """Resolve nested COLMAP names against flat or nested PNG sky-mask folders."""
     stem = os.path.splitext(image_name)[0]
     candidates = [
+        os.path.join(mask_dir, image_name + ".png"),
         os.path.join(mask_dir, stem + ".png"),
         os.path.join(mask_dir, os.path.basename(stem) + ".png"),
-        os.path.join(mask_dir, image_name + ".png"),
     ]
     for path in dict.fromkeys(candidates):
         if os.path.isfile(path):
@@ -54,18 +54,15 @@ def _frame_key(image_name: str):
 
 def _combine_supervision_masks(
     camera_mask: Optional[np.ndarray],
-    training_mask: Optional[np.ndarray],
+    dataset_mask: Optional[np.ndarray],
     sky_mask: Optional[np.ndarray],
 ):
-    """Restore explicit sky supervision without re-enabling invalid camera pixels."""
+    """Restore sky supervision without re-enabling invalid camera pixels."""
     valid = None if camera_mask is None else camera_mask.astype(bool, copy=False)
-    training = (
-        None if training_mask is None else training_mask.astype(bool, copy=False)
-    )
+    dataset = None if dataset_mask is None else dataset_mask.astype(bool, copy=False)
     sky = None if sky_mask is None else sky_mask.astype(bool, copy=False)
-
-    if training is not None:
-        supervised = training if sky is None else training | sky
+    if dataset is not None:
+        supervised = dataset if sky is None else dataset | sky
         valid = supervised if valid is None else valid & supervised
     if sky is not None and valid is not None:
         sky = sky & valid
@@ -288,8 +285,8 @@ class Parser:
             image_dir_suffix = ""
         colmap_image_dir = os.path.join(data_dir, "images")
         image_dir = os.path.join(data_dir, "images" + image_dir_suffix)
-        training_mask_dir = os.path.join(data_dir, "training_masks")
-        has_training_masks = os.path.isdir(training_mask_dir)
+        mask_dir = os.path.join(data_dir, "masks")
+        has_masks = os.path.isdir(mask_dir)
         if not os.path.exists(colmap_image_dir):
             raise ValueError(f"Image folder {colmap_image_dir} does not exist.")
         colmap_files = sorted(_get_rel_paths(colmap_image_dir))
@@ -326,8 +323,8 @@ class Parser:
                 continue
             kept_image_names.append(name)
             kept_image_paths.append(os.path.join(image_dir, rel_path))
-            if has_training_masks:
-                mask_path = os.path.join(training_mask_dir, name + ".png")
+            if has_masks:
+                mask_path = os.path.join(mask_dir, name + ".png")
                 if not os.path.isfile(mask_path):
                     raise FileNotFoundError(mask_path)
                 kept_mask_paths.append(mask_path)
@@ -335,7 +332,7 @@ class Parser:
                 kept_mask_paths.append(None)
             if self.sky_mask_dir is not None:
                 kept_sky_mask_paths.append(
-                    _resolve_semantic_mask_path(self.sky_mask_dir, name)
+                    _resolve_sky_mask_path(self.sky_mask_dir, name)
                 )
             else:
                 kept_sky_mask_paths.append(None)
@@ -572,18 +569,18 @@ class Dataset:
         mask = self.parser.mask_dict[camera_id]
         mask_path = self.parser.mask_paths[index]
         sky_mask_path = self.parser.sky_mask_paths[index]
-        training_mask = None
+        dataset_mask = None
         if mask_path is not None:
-            training_mask = imageio.imread(mask_path)
-            if training_mask.ndim == 3:
-                training_mask = training_mask[..., 0]
-            if training_mask.shape != image.shape[:2]:
-                training_mask = cv2.resize(
-                    training_mask,
+            dataset_mask = imageio.imread(mask_path)
+            if dataset_mask.ndim == 3:
+                dataset_mask = dataset_mask[..., 0]
+            if dataset_mask.shape != image.shape[:2]:
+                dataset_mask = cv2.resize(
+                    dataset_mask,
                     (image.shape[1], image.shape[0]),
                     interpolation=cv2.INTER_NEAREST,
                 )
-            training_mask = training_mask > 127
+            dataset_mask = dataset_mask > 127
         sky_mask = None
         if sky_mask_path is not None:
             sky_mask = imageio.imread(sky_mask_path)
@@ -604,9 +601,9 @@ class Dataset:
                 self.parser.mapy_dict[camera_id],
             )
             image = cv2.remap(image, mapx, mapy, cv2.INTER_LINEAR)
-            if training_mask is not None:
-                training_mask = cv2.remap(
-                    training_mask.astype(np.uint8),
+            if dataset_mask is not None:
+                dataset_mask = cv2.remap(
+                    dataset_mask.astype(np.uint8),
                     mapx,
                     mapy,
                     cv2.INTER_NEAREST,
@@ -620,12 +617,12 @@ class Dataset:
                 ).astype(bool)
             x, y, w, h = self.parser.roi_dict[camera_id]
             image = image[y : y + h, x : x + w]
-            if training_mask is not None:
-                training_mask = training_mask[y : y + h, x : x + w]
+            if dataset_mask is not None:
+                dataset_mask = dataset_mask[y : y + h, x : x + w]
             if sky_mask is not None:
                 sky_mask = sky_mask[y : y + h, x : x + w]
 
-        mask, sky_mask = _combine_supervision_masks(mask, training_mask, sky_mask)
+        mask, sky_mask = _combine_supervision_masks(mask, dataset_mask, sky_mask)
 
         if self.patch_size is not None:
             # Random crop.

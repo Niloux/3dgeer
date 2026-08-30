@@ -12,7 +12,7 @@ normalize_world_space: false
 log_every: 100
 log_loss_window: 100
 
-result_dir: results/0828/geometry
+result_dir: results/0830/2258
 disable_viewer: true
 disable_video: true
 
@@ -26,7 +26,7 @@ save_steps: [3000, 7000, 10000, 15000, 30000]
 save_ply: true
 ply_steps: [3000, 7000, 10000, 15000, 30000]
 
-sh_degree: 2
+sh_degree: 0
 # Keep the full SH representation for training, but save only the DC term in PLY.
 ply_sh_degree: 0
 ssim_lambda: 0.2
@@ -45,11 +45,11 @@ knn_pca_planarity_threshold: 0.30
 knn_pca_curvature_threshold: 0.10
 
 # Penalize the expected Gaussian distance to nearby LiDAR surface planes.
-geometry_enabled: false
+geometry_enabled: true
 geometry_lambda: 0.10
 
 sky_enabled: true
-sky_mask_dir: semantic_masks/sky
+sky_mask_dir: sky_masks
 sky_num_points: 100000
 sky_radius: 10000.0
 sky_initial_opacity: 0.7
@@ -62,7 +62,7 @@ scale_reg: 0.0
 
 strategy:
   absgrad: true
-  grow_grad2d: 1e-4
+  grow_grad2d: 2e-4
   grow_scale2d: 0.03
   max_gaussians: 5000000
   max_grow_per_refine: 100000

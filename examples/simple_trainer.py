@@ -23,7 +23,7 @@ from datasets.traj import (
     generate_spiral_path,
 )
 from evaluation import masked_lpips, masked_psnr, masked_ssim
-from fused_ssim import fused_ssim
+from fused_ssim import FusedSSIMMap, fused_ssim
 from gaussian_models import (
     SurfacePriorData,
     build_surface_priors_knn_pca,
@@ -90,6 +90,35 @@ def _json_log_value(value):
     if isinstance(value, (list, tuple)):
         return [_json_log_value(item) for item in value]
     return value
+
+
+def _masked_fused_ssim_loss(
+    prediction: Tensor, target: Tensor, mask: Optional[Tensor]
+) -> Tensor:
+    """Compute SSIM loss from windows containing only valid pixels."""
+    prediction = prediction.permute(0, 3, 1, 2).contiguous()
+    target = target.permute(0, 3, 1, 2).contiguous()
+    if mask is None:
+        return 1.0 - fused_ssim(prediction, target, padding="valid")
+
+    ssim_map = FusedSSIMMap.apply(
+        0.01**2,
+        0.03**2,
+        prediction,
+        target,
+        "valid",
+        True,
+    )
+    valid_windows = F.avg_pool2d(
+        mask.unsqueeze(1).to(dtype=ssim_map.dtype),
+        kernel_size=11,
+        stride=1,
+    )
+    valid_windows = (valid_windows >= 1.0 - 1e-6).to(dtype=ssim_map.dtype)
+    valid_windows = valid_windows.expand_as(ssim_map)
+    return ((1.0 - ssim_map) * valid_windows).sum() / valid_windows.sum().clamp_min(
+        1.0
+    )
 
 
 class JsonlLogger:
@@ -305,7 +334,7 @@ class Config:
 
     # Train a separate Gaussian sky behind the strategy-managed foreground.
     sky_enabled: bool = False
-    # PNG semantic sky masks. Relative paths are resolved under data_dir.
+    # PNG sky masks. Relative paths are resolved under data_dir.
     sky_mask_dir: Optional[str] = None
     # Fixed Gaussian sky geometry and trainable SH settings.
     sky_num_points: int = 100_000
@@ -313,7 +342,7 @@ class Config:
     sky_initial_opacity: float = 0.7
     sky_sh0_lr: float = 2.5e-3
     sky_shN_lr: float = 2.5e-3 / 20
-    # Penalize foreground opacity over semantic sky pixels.
+    # Penalize foreground opacity over conservative sky pixels.
     sky_alpha_lambda: float = 0.1
 
     # Near plane clipping distance
@@ -1800,10 +1829,8 @@ class Runner:
                     (colors_for_loss - pixels).abs().masked_select(valid).mean()
                 )
             if cfg.ssim_lambda:
-                ssimloss = 1.0 - fused_ssim(
-                    colors_for_loss.permute(0, 3, 1, 2),
-                    pixels.permute(0, 3, 1, 2),
-                    padding="valid",
+                ssimloss = _masked_fused_ssim_loss(
+                    colors_for_loss, pixels, masks
                 )
                 loss = l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda
             else:
@@ -1874,7 +1901,6 @@ class Runner:
                     1.0
                 )
                 loss += cfg.sky_alpha_lambda * sky_alpha_loss
-
             loss += self._camera_regularization(stage, radial_coeffs)
 
             do_update = True
