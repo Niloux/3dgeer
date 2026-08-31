@@ -266,6 +266,9 @@ void launch_rasterize_to_pixels_from_world_3dgs_bwd_kernel(
     // gradients of outputs
     const at::Tensor v_render_colors, // [..., C, image_height, image_width, 3]
     const at::Tensor v_render_alphas, // [..., C, image_height, image_width, 1]
+    // optional MRNF attribution buffers
+    const at::optional<at::Tensor> densification_error_map, // [..., C, H, W]
+    const at::optional<at::Tensor> densification_info,      // [..., 2, N]
     const bool viewmats_requires_grad,
     const bool Ks_requires_grad,
     const bool radial_coeffs_requires_grad,

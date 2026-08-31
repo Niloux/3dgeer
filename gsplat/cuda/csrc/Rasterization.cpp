@@ -861,6 +861,9 @@ rasterize_to_pixels_from_world_3dgs_bwd(
     // gradients of outputs
     const at::Tensor v_render_colors, // [..., C, image_height, image_width, 3]
     const at::Tensor v_render_alphas, // [..., C, image_height, image_width, 1]
+    // optional MRNF attribution buffers
+    const at::optional<at::Tensor> densification_error_map, // [..., C, H, W]
+    const at::optional<at::Tensor> densification_info,      // [..., 2, N]
     const bool viewmats_requires_grad,
     const bool Ks_requires_grad,
     const bool radial_coeffs_requires_grad
@@ -882,6 +885,40 @@ rasterize_to_pixels_from_world_3dgs_bwd(
     }
     if (masks.has_value()) {
         CHECK_INPUT(masks.value());
+    }
+    TORCH_CHECK(
+        densification_error_map.has_value() == densification_info.has_value(),
+        "densification_error_map and densification_info must be provided together"
+    );
+    if (densification_error_map.has_value()) {
+        const at::Tensor &error_map = densification_error_map.value();
+        const at::Tensor &info = densification_info.value();
+        CHECK_INPUT(error_map);
+        CHECK_INPUT(info);
+        const int64_t N = means.size(-2);
+        const int64_t B = means.numel() / (N * 3);
+        const int64_t C = viewmats0.size(-3);
+        TORCH_CHECK(
+            error_map.scalar_type() == at::kFloat &&
+                info.scalar_type() == at::kFloat,
+            "MRNF attribution buffers must be float32"
+        );
+        TORCH_CHECK(
+            error_map.device() == means.device() && info.device() == means.device(),
+            "MRNF attribution buffers must be on the same device as means"
+        );
+        TORCH_CHECK(
+            error_map.dim() >= 3 && error_map.size(-3) == C &&
+                error_map.size(-2) == image_height &&
+                error_map.size(-1) == image_width &&
+                error_map.numel() == B * C * image_height * image_width,
+            "densification_error_map must have shape [..., C, H, W]"
+        );
+        TORCH_CHECK(
+            info.dim() >= 2 && info.size(-2) == 2 && info.size(-1) == N &&
+                info.numel() == B * 2 * N,
+            "densification_info must have shape [..., 2, N]"
+        );
     }
 
     uint32_t channels = colors.size(-1);
@@ -926,6 +963,8 @@ rasterize_to_pixels_from_world_3dgs_bwd(
             last_ids,                                                          \
             v_render_colors,                                                   \
             v_render_alphas,                                                   \
+            densification_error_map,                                           \
+            densification_info,                                                \
             viewmats_requires_grad,                                            \
             Ks_requires_grad,                                                  \
             radial_coeffs_requires_grad,                                       \

@@ -12,11 +12,18 @@ Here are the instructions on how to use this feature.
 
 #### Training
 
-Simplly passing in `--with_ut --with_eval3d` to the `simple_trainer.py` arg list will enable training with 3DGUT! And note in gsplat we only support MCMC densification strategy for 3DGUT:
+Passing `--with_ut --with_eval3d` to `simple_trainer.py` enables 3DGUT. The
+Eval3D path supports MCMC and the distortion-aware MRNF error-attribution
+strategy:
 
 ```
 python examples/simple_trainer.py mcmc --with_ut --with_eval3d ... <OTHER ARGS>
+python examples/simple_trainer.py mrnf --with_ut --with_eval3d ... <OTHER ARGS>
 ```
+
+MRNF currently supports non-packed, single-process training. Its Phase 1 port
+uses RGB error attribution through the actual Eval3D compositing path; edge
+guidance and far-field seeding are intentionally disabled.
 
 For benchmarking on MipNeRF360 Dataset, please checkout `examples/benchmarks/3dgut/mcmc.sh`
 

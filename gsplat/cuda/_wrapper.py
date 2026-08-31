@@ -861,12 +861,16 @@ def rasterize_to_pixels_eval3d(
     # rolling shutter
     rolling_shutter: RollingShutterType = RollingShutterType.GLOBAL,
     viewmats_rs: Optional[Tensor] = None,  # [..., C, 4, 4]
+    densification_error_map: Optional[Tensor] = None,  # [..., C, H, W]
+    densification_info: Optional[Tensor] = None,  # [..., 2, N]
 ) -> Tuple[Tensor, Tensor]:
     """Rasterizes Gaussians to pixels.
 
     Similar to `rasterize_to_pixels()`, but compute the Gaussian responses in the
     3D world space instead of the 2D image space. Supports rolling shutter and
-    camera distortion.
+    camera distortion. When both densification buffers are supplied, backward
+    accumulates ``alpha * transmittance`` and its pixel-error-weighted value for
+    each Gaussian.
 
     Returns:
         A tuple:
@@ -922,6 +926,26 @@ def rasterize_to_pixels_eval3d(
     if viewmats_rs is not None:
         assert viewmats_rs.shape == batch_dims + (C, 4, 4), viewmats_rs.shape
         viewmats_rs = viewmats_rs.contiguous()
+
+    assert (densification_error_map is None) == (densification_info is None), (
+        "densification_error_map and densification_info must be provided together"
+    )
+    if densification_error_map is not None:
+        assert densification_info is not None
+        assert densification_error_map.shape == batch_dims + (
+            C,
+            image_height,
+            image_width,
+        ), densification_error_map.shape
+        assert densification_info.shape == batch_dims + (2, N), (
+            densification_info.shape
+        )
+        assert densification_error_map.device == device
+        assert densification_info.device == device
+        assert densification_error_map.dtype == torch.float32
+        assert densification_info.dtype == torch.float32
+        assert densification_error_map.is_contiguous()
+        assert densification_info.is_contiguous()
 
     # Pad the channels to the nearest supported number if necessary
     channels = colors.shape[-1]
@@ -1003,6 +1027,8 @@ def rasterize_to_pixels_eval3d(
         # rolling shutter
         rolling_shutter,
         viewmats_rs.contiguous() if viewmats_rs is not None else None,
+        densification_error_map,
+        densification_info,
     )
 
     if padded_channels > 0:
@@ -1727,6 +1753,8 @@ class _RasterizeToPixelsEval3D(torch.autograd.Function):
         # rolling shutter
         rolling_shutter: RollingShutterType = RollingShutterType.GLOBAL,
         viewmats_rs: Optional[Tensor] = None,  # [..., C, 4, 4]
+        densification_error_map: Optional[Tensor] = None,  # [..., C, H, W]
+        densification_info: Optional[Tensor] = None,  # [..., 2, N]
     ) -> Tuple[Tensor, Tensor]:
         ctx.rolling_shutter = rolling_shutter
         ctx.camera_model = camera_model
@@ -1794,6 +1822,11 @@ class _RasterizeToPixelsEval3D(torch.autograd.Function):
         ctx.camera_model_type = camera_model_type
         ctx.tile_size = tile_size
         ctx.ftheta_coeffs = ftheta_coeffs
+        # These buffers are filled after forward and consumed as side outputs during
+        # backward. Keep ordinary references so updating the error map before
+        # loss.backward() does not trip saved-tensor version checks.
+        ctx.densification_error_map = densification_error_map
+        ctx.densification_info = densification_info
 
         return render_colors, render_alphas
 
@@ -1896,6 +1929,8 @@ class _RasterizeToPixelsEval3D(torch.autograd.Function):
             last_ids,
             v_render_colors.contiguous(),
             v_render_alphas.contiguous(),
+            ctx.densification_error_map,
+            ctx.densification_info,
             viewmats_requires_grad,
             Ks_requires_grad,
             radial_coeffs_requires_grad,
@@ -1938,6 +1973,8 @@ class _RasterizeToPixelsEval3D(torch.autograd.Function):
             None,  # ftheta_coeffs
             None,  # rolling_shutter
             None,  # viewmats_rs
+            None,  # densification_error_map
+            None,  # densification_info
         )
 
 

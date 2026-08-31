@@ -1,4 +1,4 @@
-preset: default
+preset: mrnf
 
 # Generated for examples/simple_trainer.py.
 data_dir: "/home/wuyou/3dgeer/data/park"
@@ -61,13 +61,16 @@ opacity_reg: 0.0
 scale_reg: 0.0
 
 strategy:
-  absgrad: true
-  grow_grad2d: 2e-4
-  grow_scale2d: 0.03
+  grow_error_threshold: 0.003
+  grow_fraction: 0.07
+  grow_scale3d: 0.01
+  refine_start_iter: 0
+  refine_every: 200
   max_gaussians: 5000000
-  max_grow_per_refine: 100000
-  refine_stop_iter: 27000
-  refine_scale2d_stop_iter: 27000
+  # max_grow_per_refine: 100000
+  refine_stop_iter: 15000
+  use_visibility_ratio: true
+  visibility_power: 0.75
 
 # Let the lightweight per-image color gains stabilize before adding Gaussians.
 densification_start_step: 500

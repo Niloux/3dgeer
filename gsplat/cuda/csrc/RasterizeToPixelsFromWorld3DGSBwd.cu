@@ -1,3 +1,10 @@
+/*
+ * MRNF attribution additions are adapted from LichtFeld Studio commit
+ * de972c89ec6bcd27406f892b966f180a7054f2cc (GPL-3.0-or-later).
+ * SPDX-FileCopyrightText: 2025 LichtFeld Studio Authors
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ */
+
 #include <ATen/Dispatch.h>
 #include <ATen/core/Tensor.h>
 #include <ATen/cuda/Atomic.cuh>
@@ -122,6 +129,9 @@ __global__ void rasterize_to_pixels_from_world_3dgs_bwd_kernel(
                                                   // image_width, CDIM]
     const scalar_t
         *__restrict__ v_render_alphas, // [B, C, image_height, image_width, 1]
+    const scalar_t
+        *__restrict__ densification_error_map, // [B, C, image_height, image_width]
+    scalar_t *__restrict__ densification_info, // [B, 2, N]
     // grad inputs
     vec3 *__restrict__ v_means,        // [B, N, 3]
     vec4 *__restrict__ v_quats,        // [B, N, 4]
@@ -144,6 +154,9 @@ __global__ void rasterize_to_pixels_from_world_3dgs_bwd_kernel(
     last_ids += iid * image_height * image_width;
     v_render_colors += iid * image_height * image_width * CDIM;
     v_render_alphas += iid * image_height * image_width;
+    if (densification_error_map != nullptr) {
+        densification_error_map += iid * image_height * image_width;
+    }
     if (backgrounds != nullptr) {
         backgrounds += iid * CDIM;
     }
@@ -162,6 +175,10 @@ __global__ void rasterize_to_pixels_from_world_3dgs_bwd_kernel(
     // clamp this value to the last pixel
     const int32_t pix_id =
         min(i * image_width + j, image_width * image_height - 1);
+    const bool do_densification =
+        densification_error_map != nullptr && densification_info != nullptr;
+    const float pixel_error =
+        do_densification ? densification_error_map[pix_id] : 0.f;
 
     // Create rolling shutter parameter
     auto rs_params = RollingShutterParameters(
@@ -372,6 +389,8 @@ __global__ void rasterize_to_pixels_from_world_3dgs_bwd_kernel(
             vec3 v_scale_local = {0.f, 0.f, 0.f};
             vec4 v_quat_local = {0.f, 0.f, 0.f, 0.f};
             float v_opacity_local = 0.f;
+            float densification_weight_local = 0.f;
+            float densification_error_weighted_local = 0.f;
             // initialize everything to 0, only set if the lane is valid
             if (valid) {
                 // compute the current T for this gaussian
@@ -379,6 +398,10 @@ __global__ void rasterize_to_pixels_from_world_3dgs_bwd_kernel(
                 T *= ra;
                 // update v_rgb for this gaussian
                 const float fac = alpha * T;
+                if (do_densification) {
+                    densification_weight_local = fac;
+                    densification_error_weighted_local = fac * pixel_error;
+                }
 #pragma unroll
                 for (uint32_t k = 0; k < CDIM; ++k) {
                     v_rgb_local[k] = fac * v_render_c[k];
@@ -432,6 +455,8 @@ __global__ void rasterize_to_pixels_from_world_3dgs_bwd_kernel(
             warpSum(v_scale_local, warp);
             warpSum(v_quat_local, warp);
             warpSum(v_opacity_local, warp);
+            warpSum(densification_weight_local, warp);
+            warpSum(densification_error_weighted_local, warp);
             if (warp.thread_rank() == 0) {
                 int32_t isect_id = id_batch[t]; // flatten index in [B * C * N] or [nnz]
                 int32_t isect_bid = isect_id / (C * N);   // intersection batch index
@@ -460,6 +485,18 @@ __global__ void rasterize_to_pixels_from_world_3dgs_bwd_kernel(
                 gpuAtomicAdd(v_quat_ptr + 3, v_quat_local.w);
 
                 gpuAtomicAdd(v_opacities + isect_id, v_opacity_local);
+                if (do_densification) {
+                    scalar_t *densification_ptr =
+                        densification_info + isect_bid * 2 * N;
+                    gpuAtomicAdd(
+                        densification_ptr + isect_gid,
+                        densification_weight_local
+                    );
+                    gpuAtomicAdd(
+                        densification_ptr + N + isect_gid,
+                        densification_error_weighted_local
+                    );
+                }
             }
         }
     }
@@ -580,6 +617,9 @@ void launch_rasterize_to_pixels_from_world_3dgs_bwd_kernel(
     // gradients of outputs
     const at::Tensor v_render_colors, // [..., C, image_height, image_width, 3]
     const at::Tensor v_render_alphas, // [..., C, image_height, image_width, 1]
+    // optional MRNF attribution buffers
+    const at::optional<at::Tensor> densification_error_map, // [..., C, H, W]
+    const at::optional<at::Tensor> densification_info,      // [..., 2, N]
     const bool viewmats_requires_grad,
     const bool Ks_requires_grad,
     const bool radial_coeffs_requires_grad,
@@ -678,6 +718,12 @@ void launch_rasterize_to_pixels_from_world_3dgs_bwd_kernel(
             last_ids.data_ptr<int32_t>(),
             v_render_colors.data_ptr<float>(),
             v_render_alphas.data_ptr<float>(),
+            densification_error_map.has_value()
+                ? densification_error_map.value().data_ptr<float>()
+                : nullptr,
+            densification_info.has_value()
+                ? densification_info.value().data_ptr<float>()
+                : nullptr,
             // outputs
             reinterpret_cast<vec3 *>(v_means.data_ptr<float>()),
             reinterpret_cast<vec4 *>(v_quats.data_ptr<float>()),
@@ -723,6 +769,8 @@ void launch_rasterize_to_pixels_from_world_3dgs_bwd_kernel(
         const at::Tensor last_ids,                                             \
         const at::Tensor v_render_colors,                                      \
         const at::Tensor v_render_alphas,                                      \
+        const at::optional<at::Tensor> densification_error_map,                \
+        const at::optional<at::Tensor> densification_info,                     \
         const bool viewmats_requires_grad,                                     \
         const bool Ks_requires_grad,                                           \
         const bool radial_coeffs_requires_grad,                                \

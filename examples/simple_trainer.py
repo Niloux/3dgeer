@@ -54,7 +54,7 @@ from gsplat.cuda._wrapper import compute_raymap
 from gsplat.distributed import cli
 from gsplat.optimizers import SelectiveAdam
 from gsplat.rendering import rasterization
-from gsplat.strategy import DefaultStrategy, MCMCStrategy
+from gsplat.strategy import DefaultStrategy, MCMCStrategy, MRNFStrategy
 from gsplat_viewer import GsplatViewer, GsplatRenderTabState
 from nerfview import CameraState, RenderTabState, apply_float_colormap
 
@@ -351,7 +351,7 @@ class Config:
     far_plane: float = 1e10
 
     # Strategy for GS densification
-    strategy: Union[DefaultStrategy, MCMCStrategy] = field(
+    strategy: Union[DefaultStrategy, MCMCStrategy, MRNFStrategy] = field(
         default_factory=DefaultStrategy
     )
     # Use packed mode for rasterization, this leads to less memory usage but slightly slower.
@@ -544,6 +544,10 @@ class Config:
             strategy.refine_start_iter = int(strategy.refine_start_iter * factor)
             strategy.refine_stop_iter = int(strategy.refine_stop_iter * factor)
             strategy.refine_every = int(strategy.refine_every * factor)
+        elif isinstance(strategy, MRNFStrategy):
+            strategy.refine_start_iter = int(strategy.refine_start_iter * factor)
+            strategy.refine_stop_iter = int(strategy.refine_stop_iter * factor)
+            strategy.refine_every = int(strategy.refine_every * factor)
         else:
             assert_never(strategy)
 
@@ -622,6 +626,14 @@ def parse_config(args: Optional[Sequence[str]] = None) -> Config:
                 opacity_reg=0.01,
                 scale_reg=0.01,
                 strategy=MCMCStrategy(verbose=True),
+            ),
+        ),
+        "mrnf": (
+            "Error-attribution densification for Eval3D and distorted cameras.",
+            Config(
+                with_eval3d=True,
+                packed=False,
+                strategy=MRNFStrategy(verbose=True),
             ),
         ),
     }
@@ -1035,7 +1047,7 @@ class Runner:
         # Densification Strategy
         self.cfg.strategy.check_sanity(self.splats, self.optimizers)
 
-        if isinstance(self.cfg.strategy, DefaultStrategy):
+        if isinstance(self.cfg.strategy, (DefaultStrategy, MRNFStrategy)):
             self.strategy_state = self.cfg.strategy.initialize_state(
                 scene_scale=self.scene_scale
             )
@@ -1043,6 +1055,14 @@ class Runner:
             self.strategy_state = self.cfg.strategy.initialize_state()
         else:
             assert_never(self.cfg.strategy)
+
+        if isinstance(self.cfg.strategy, MRNFStrategy):
+            if not cfg.with_eval3d:
+                raise ValueError("MRNFStrategy requires with_eval3d=True")
+            if cfg.packed:
+                raise ValueError("MRNFStrategy does not support packed rasterization")
+            if world_size > 1:
+                raise ValueError("MRNFStrategy does not support distributed rasterization")
 
         self.lidar_surface = None
         if cfg.geometry_enabled:
@@ -1483,6 +1503,9 @@ class Runner:
         **kwargs,
     ) -> Tuple[Tensor, Tensor, Dict]:
         is_foreground = splats is None
+        calc_densification_info = bool(
+            kwargs.pop("calc_densification_info", False)
+        ) and is_foreground
         splats = self.splats if splats is None else splats
         means = splats["means"]  # [N, 3]
         # quats = F.normalize(self.splats["quats"], dim=-1)  # [N, 4]
@@ -1531,6 +1554,7 @@ class Runner:
             with_ut=self.cfg.with_ut,
             with_geer=self.cfg.with_geer,
             with_eval3d=self.cfg.with_eval3d,
+            calc_densification_info=calc_densification_info,
             **kwargs,
         )
         if masks is not None:
@@ -1598,7 +1622,12 @@ class Runner:
         # Dump cfg.
         if world_rank == 0:
             with open(f"{cfg.result_dir}/cfg.yml", "w") as f:
-                preset = "mcmc" if isinstance(cfg.strategy, MCMCStrategy) else "default"
+                if isinstance(cfg.strategy, MRNFStrategy):
+                    preset = "mrnf"
+                elif isinstance(cfg.strategy, MCMCStrategy):
+                    preset = "mcmc"
+                else:
+                    preset = "default"
                 values = asdict(cfg)
                 values["steps_scaler"] = 1.0
                 yaml.safe_dump({"preset": preset, **values}, f, sort_keys=False)
@@ -1772,6 +1801,12 @@ class Runner:
 
             # sh schedule
             sh_degree_to_use = min(step // cfg.sh_degree_interval, cfg.sh_degree)
+            densification_active = step >= self.densification_start_step
+            collect_mrnf_info = (
+                isinstance(cfg.strategy, MRNFStrategy)
+                and densification_active
+                and cfg.strategy.should_collect(step)
+            )
 
             # forward
             renders, alphas, info = self.render_scene(
@@ -1788,6 +1823,7 @@ class Runner:
                 camera_model="fisheye" if cfg.keep_distortion and data["camera_model"] == 5 else "pinhole",
                 radial_coeffs=radial_coeffs,
                 tangential_coeffs=tangential_coeffs,
+                calc_densification_info=collect_mrnf_info,
             )
             if renders.shape[-1] == 4:
                 colors, depths = renders[..., 0:3], renders[..., 3:4]
@@ -1807,20 +1843,30 @@ class Runner:
             if cfg.use_ppisp:
                 colors = self._apply_ppisp(colors, camera_ids, image_ids)
 
-            densification_active = step >= self.densification_start_step
-            if densification_active:
-                self.cfg.strategy.step_pre_backward(
-                    params=self.splats,
-                    optimizers=self.optimizers,
-                    state=self.strategy_state,
-                    step=step,
-                    info=info,
-                )
-
             # loss
             colors_for_loss = (
                 colors.clamp(0.0, 1.0) if cfg.clamp_colors_for_loss else colors
             )
+            if densification_active:
+                if isinstance(cfg.strategy, MRNFStrategy):
+                    cfg.strategy.step_pre_backward(
+                        params=self.splats,
+                        optimizers=self.optimizers,
+                        state=self.strategy_state,
+                        step=step,
+                        info=info,
+                        rendered=colors_for_loss,
+                        target=pixels,
+                        mask=masks,
+                    )
+                else:
+                    cfg.strategy.step_pre_backward(
+                        params=self.splats,
+                        optimizers=self.optimizers,
+                        state=self.strategy_state,
+                        step=step,
+                        info=info,
+                    )
             if masks is None:
                 l1loss = F.l1_loss(colors_for_loss, pixels)
             else:
@@ -2303,6 +2349,14 @@ class Runner:
                         step=step,
                         info=info,
                         lr=schedulers[0].get_last_lr()[0],
+                    )
+                elif isinstance(self.cfg.strategy, MRNFStrategy):
+                    self.cfg.strategy.step_post_backward(
+                        params=self.splats,
+                        optimizers=self.optimizers,
+                        state=self.strategy_state,
+                        step=step,
+                        info=info,
                     )
                 else:
                     assert_never(self.cfg.strategy)

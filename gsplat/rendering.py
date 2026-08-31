@@ -149,6 +149,7 @@ def rasterization(
     # rolling shutter
     rolling_shutter: RollingShutterType = RollingShutterType.GLOBAL,
     viewmats_rs: Optional[Tensor] = None,  # [..., C, 4, 4]
+    calc_densification_info: bool = False,
 ) -> Tuple[Tensor, Tensor, Dict]:
     """Rasterize a set of 3D Gaussians (N) to a batch of image planes (C).
 
@@ -171,6 +172,12 @@ def rasterization(
     .. note::
         **Batch Rasterization**: This function allows for rasterizing a set of 3D Gaussians
         to a batch of images in one go, by simplly providing the batched `viewmats` and `Ks`.
+
+    .. note::
+        **MRNF Attribution**: With Eval3D, ``calc_densification_info=True`` exposes
+        a writable pixel error map and a two-row per-Gaussian attribution buffer in
+        the returned metadata. The backward pass accumulates compositing visibility
+        and visibility-weighted error into that buffer.
 
     .. note::
         **Support N-D Features**: If `sh_degree` is None,
@@ -373,6 +380,10 @@ def rasterization(
     assert render_mode in ["RGB", "D", "ED", "RGB+D", "RGB+ED"], render_mode
     assert not (with_ut and with_geer), "cannot render with ut and geer"
     assert not (with_geer and not with_eval3d), "cannot render geer without eval 3d"
+    if calc_densification_info:
+        assert with_eval3d, "MRNF densification info requires eval 3D"
+        assert not packed, "MRNF densification info does not support packed mode"
+        assert not distributed, "MRNF densification info does not support distributed mode"
 
     def reshape_view(C: int, world_view: torch.Tensor, N_world: list) -> torch.Tensor:
         view_list = list(
@@ -581,6 +592,18 @@ def rasterization(
             "opacities": opacities,
         }
     )
+
+    densification_error_map = None
+    densification_info = None
+    if calc_densification_info:
+        densification_error_map = torch.zeros(
+            batch_dims + (C, height, width), device=device, dtype=torch.float32
+        )
+        densification_info = torch.zeros(
+            batch_dims + (2, N), device=device, dtype=torch.float32
+        )
+        meta["densification_error_map"] = densification_error_map
+        meta["densification_info"] = densification_info
     # Some modes (e.g. UT / eval3d) may not produce a differentiable `meta["means2d"]`
     # tensor, but downstream components (e.g. strategies) can still use camera params
     # for gradient proxies or logging.
@@ -880,6 +903,10 @@ def rasterization(
                     ftheta_coeffs=ftheta_coeffs,
                     rolling_shutter=rolling_shutter,
                     viewmats_rs=viewmats_rs,
+                    densification_error_map=(
+                        densification_error_map if i == 0 else None
+                    ),
+                    densification_info=densification_info if i == 0 else None,
                 )
             else:
                 render_colors_, render_alphas_ = rasterize_to_pixels(
@@ -923,6 +950,8 @@ def rasterization(
                 ftheta_coeffs=ftheta_coeffs,
                 rolling_shutter=rolling_shutter,
                 viewmats_rs=viewmats_rs,
+                densification_error_map=densification_error_map,
+                densification_info=densification_info,
             )
         else:
             render_colors, render_alphas = rasterize_to_pixels(
