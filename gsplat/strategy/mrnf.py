@@ -95,8 +95,9 @@ class MRNFStrategy(Strategy):
     This ports the distortion-aware core of LichtFeld Studio's MRNF strategy:
     each pixel's reconstruction error is attributed to Gaussians using their
     actual ``alpha * transmittance`` contribution in the world-space backward
-    pass, and selected Gaussians use its in-place long-axis split rule. Edge
-    guidance, far-field seeding, decay, and noise remain outside this port.
+    pass, and selected Gaussians use its in-place long-axis split rule. Opacity
+    and scale decay follow LichtFeld's activated-space schedule. Edge guidance,
+    far-field seeding, and noise remain outside this port.
     """
 
     prune_opa: float = 1.0 / 255.0
@@ -110,6 +111,9 @@ class MRNFStrategy(Strategy):
     visibility_power: float = 0.75
     min_visibility: float = 0.05
     max_gaussians: int = 1_000_000
+    bounds_percentile: float = 0.8
+    opacity_decay: float = 0.004
+    scale_decay: float = 0.002
     error_epsilon: float = 1e-6
     verbose: bool = False
 
@@ -138,6 +142,9 @@ class MRNFStrategy(Strategy):
         assert self.visibility_power >= 0.0
         assert self.min_visibility >= 0.0
         assert self.max_gaussians >= 0
+        assert 0.0 <= self.bounds_percentile <= 1.0
+        assert self.opacity_decay >= 0.0
+        assert 0.0 <= self.scale_decay < 1.0
         assert self.error_epsilon > 0.0
 
     def should_collect(self, step: int) -> bool:
@@ -211,6 +218,7 @@ class MRNFStrategy(Strategy):
         state: Dict[str, Any],
         step: int,
         info: Dict[str, Any],
+        max_steps: int,
     ) -> None:
         """Fold renderer attribution into the current refinement window."""
         if not self.should_collect(step):
@@ -254,6 +262,7 @@ class MRNFStrategy(Strategy):
                 pruned_count=n_prune,
                 allow_growth=step < self.grow_until_iter,
             )
+            self._apply_decay(params, step=step, max_steps=max_steps)
             for key in ("visibility_sum", "error_max", "error_ratio_max"):
                 state[key].zero_()
             if self.verbose:
@@ -262,6 +271,30 @@ class MRNFStrategy(Strategy):
                     f"{n_split} GSs. "
                     f"Now having {len(params['means'])} GSs."
                 )
+
+    @torch.no_grad()
+    def _apply_decay(
+        self,
+        params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
+        step: int,
+        max_steps: int,
+    ) -> None:
+        """Apply LichtFeld's linearly annealed opacity and scale decay."""
+        assert max_steps > 0
+        if self.opacity_decay == 0.0 and self.scale_decay == 0.0:
+            return
+
+        train_t = min(max(float(step) / float(max_steps), 0.0), 1.0)
+        shrink_t = 1.0 - train_t
+        if self.opacity_decay > 0.0:
+            opacity = torch.sigmoid(params["opacities"])
+            opacity.sub_(self.opacity_decay * shrink_t)
+            opacity.clamp_(1e-12, 1.0 - 1e-12)
+            params["opacities"].copy_(torch.logit(opacity))
+        if self.scale_decay > 0.0:
+            decay_factor = 1.0 - self.scale_decay * shrink_t
+            params["scales"].add_(math.log(decay_factor))
+            params["scales"].clamp_min_(math.log(1e-12))
 
     @torch.no_grad()
     def _prune_gaussians(

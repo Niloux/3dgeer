@@ -1,7 +1,7 @@
 preset: mrnf
 
 # Generated for examples/simple_trainer.py.
-data_dir: "/home/wuyou/3dgeer/data/park"
+data_dir: "/home/wuyou/remote/preprocess/output/park"
 data_factor: 4
 test_every: 8
 use_test_split: false
@@ -9,7 +9,7 @@ normalize_world_space: false
 log_every: 100
 log_loss_window: 100
 
-result_dir: results/0831/park_mrnf
+result_dir: results/0901/park_mrnf_lfs_means_opacity_scale_decay_nodepth
 disable_viewer: true
 disable_video: true
 
@@ -32,8 +32,8 @@ with_ut: false
 with_eval3d: true
 
 init_type: lidar
-init_lidar_path: "/home/wuyou/3dgeer/data/park/lidar.ply"
-init_opa: 0.1
+init_lidar_path: "/home/wuyou/remote/preprocess/output/park/lidar.ply"
+init_opa: 0.5
 init_scale: 1.0
 init_use_knn_pca: true
 knn_pca_k: 24
@@ -41,7 +41,7 @@ knn_pca_normal_scale_factor: 0.25
 knn_pca_planarity_threshold: 0.30
 knn_pca_curvature_threshold: 0.10
 
-sky_enabled: false
+sky_enabled: true
 sky_mask_dir: sky_masks
 sky_num_points: 100000
 sky_radius: 10000.0
@@ -50,8 +50,11 @@ sky_sh0_lr: 0.0025
 sky_shN_lr: 0.000125
 sky_alpha_lambda: 0.1
 
-opacity_reg: 0.0
+opacities_lr: 0.012
+opacity_reg: 0.003
 scale_reg: 0.0
+means_lr: 2.0e-5
+means_lr_end: 2.0e-7
 
 strategy:
   grow_error_threshold: 0.003
@@ -61,12 +64,18 @@ strategy:
   refine_every: 200
   max_gaussians: 5000000
   refine_stop_iter: 28500
+  bounds_percentile: 0.8
+  opacity_decay: 0.004
+  scale_decay: 0.002
   # LichtFeld's baseline profile ranks growth by raw attributed error.
   use_visibility_ratio: false
   visibility_power: 0.75
 
-# Let the lightweight per-image color gains stabilize before adding Gaussians.
 densification_start_step: 500
+
+depth_loss: false
+depth_dir: depth
+depth_lambda: 0.01
 
 pose_opt: true
 pose_opt_start_step: 500

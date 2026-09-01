@@ -69,6 +69,8 @@ _PLY_VERTEX_DTYPE = np.dtype(
     ]
 )
 
+_MRNF_BOUNDS_REFRESH_EVERY = 5
+
 
 def _json_log_value(value):
     """Convert training metrics to strict JSON-compatible values."""
@@ -118,6 +120,46 @@ def _masked_fused_ssim_loss(
     return ((1.0 - ssim_map) * valid_windows).sum() / valid_windows.sum().clamp_min(
         1.0
     )
+
+
+@torch.no_grad()
+def _mrnf_bounds_median_size(means: Tensor, percentile: float) -> float:
+    """Match LichtFeld's percentile-bounds scale for the MRNF means LR."""
+    if means.ndim != 2 or means.shape[1] != 3 or len(means) == 0:
+        raise ValueError(
+            f"MRNF means must have shape (N, 3), got {tuple(means.shape)}"
+        )
+    if not math.isfinite(percentile) or not 0.0 <= percentile <= 1.0:
+        raise ValueError("MRNF bounds percentile must be finite and in [0, 1]")
+
+    # LichtFeld uses float32 arithmetic and integer order-statistic indices.
+    percentile_f32 = np.float32(percentile)
+    low_fraction = np.float32(
+        (np.float32(1.0) - percentile_f32) / np.float32(2.0)
+    )
+    high_fraction = np.float32(np.float32(1.0) - low_fraction)
+    last_index_f32 = np.float32(len(means) - 1)
+    low_index = int(np.float32(low_fraction * last_index_f32))
+    high_index = int(np.float32(high_fraction * last_index_f32))
+
+    spans = []
+    for axis in range(3):
+        values = means[:, axis]
+        low = torch.kthvalue(values, low_index + 1).values.item()
+        high = torch.kthvalue(values, high_index + 1).values.item()
+        spans.append(high - low)
+
+    if not all(math.isfinite(span) and span >= 0.0 for span in spans):
+        raise ValueError(f"MRNF percentile bounds are invalid: {spans}")
+    median_size = sorted(spans)[1]
+    if median_size > 0.0:
+        return median_size
+
+    # LichtFeld falls back to the full largest-axis span for line-like scenes.
+    max_size = max(spans)
+    if max_size > 0.0:
+        return max_size
+    raise ValueError("MRNF percentile bounds are degenerate")
 
 
 class JsonlLogger:
@@ -360,7 +402,7 @@ class Config:
     # Use visible adam from Taming 3DGS. (experimental)
     visible_adam: bool = False
     # Anti-aliasing in rasterization. Might slightly hurt quantitative metrics.
-    antialiased: bool = False
+    antialiased: bool = True
 
     # ---- Stability knobs ----
     # Clamp rendered colors to [0, 1] for the loss computation (helps avoid NaNs in SSIM).
@@ -381,8 +423,11 @@ class Config:
     # Use random background for training to discourage transparency
     random_bkgd: bool = False
 
-    # LR for 3D point positions
+    # Base LR for 3D point positions. MRNF scales this by its percentile bounds;
+    # other strategies retain the trainer's scene-scale convention.
     means_lr: float = 1.6e-4
+    # Target position LR before spatial scaling. None keeps the legacy 1% target.
+    means_lr_end: Optional[float] = None
     # LR for Gaussian scale factors
     scales_lr: float = 5e-3
     # LR for alpha blending weights
@@ -634,6 +679,10 @@ def parse_config(args: Optional[Sequence[str]] = None) -> Config:
             Config(
                 with_eval3d=True,
                 packed=False,
+                means_lr=2e-5,
+                means_lr_end=2e-7,
+                opacities_lr=0.012,
+                opacity_reg=0.003,
                 strategy=MRNFStrategy(verbose=True),
             ),
         ),
@@ -809,6 +858,14 @@ class Runner:
             raise ValueError("KNN-PCA initialization currently requires init_type=lidar")
         if cfg.depth_lambda < 0.0:
             raise ValueError("depth_lambda must be non-negative")
+        if cfg.means_lr < 0.0:
+            raise ValueError("means_lr must be non-negative")
+        if cfg.means_lr_end is not None and (
+            cfg.means_lr <= 0.0 or cfg.means_lr_end <= 0.0
+        ):
+            raise ValueError(
+                "means_lr and means_lr_end must be positive when means_lr_end is set"
+            )
         if cfg.depth_loss and cfg.depth_dir is not None and not cfg.keep_distortion:
             raise ValueError(
                 "depth_dir sidecars require keep_distortion=True because they are "
@@ -1018,6 +1075,11 @@ class Runner:
             world_size=world_size,
         )
         print("Model initialized. Number of GS:", len(self.splats["means"]))
+
+        self._means_lr_scale = self.scene_scale
+        self._mrnf_refine_windows_since_bounds = 0
+        if isinstance(cfg.strategy, MRNFStrategy):
+            self._refresh_mrnf_means_lr_scale()
 
         self.sky_splats = None
         self.sky_optimizers: Dict[str, torch.optim.Optimizer] = {}
@@ -1301,6 +1363,52 @@ class Runner:
                 output_dir=Path(cfg.result_dir),
                 mode="training",
             )
+
+    def _refresh_mrnf_means_lr_scale(self, step: Optional[int] = None) -> bool:
+        """Rescale the current means LR using LichtFeld's MRNF scene bounds."""
+        strategy = self.cfg.strategy
+        assert isinstance(strategy, MRNFStrategy)
+        try:
+            new_scale = _mrnf_bounds_median_size(
+                self.splats["means"].detach(), strategy.bounds_percentile
+            )
+        except ValueError as error:
+            self.train_logger.log(
+                "mrnf_means_lr_scale_skipped",
+                step=step,
+                reason=str(error),
+            )
+            if step is None:
+                print(f"MRNF means LR bounds unavailable; using scene scale: {error}")
+            return False
+        if not math.isfinite(self._means_lr_scale) or self._means_lr_scale <= 0.0:
+            raise ValueError(f"Invalid previous means LR scale: {self._means_lr_scale}")
+
+        scale_ratio = new_scale / self._means_lr_scale
+        optimizer = self.optimizers["means"]
+        for group in optimizer.param_groups:
+            group["lr"] *= scale_ratio
+        self._means_lr_scale = new_scale
+
+        effective_lr = optimizer.param_groups[0]["lr"]
+        self.train_logger.log(
+            "mrnf_means_lr_scale",
+            step=step,
+            bounds_percentile=strategy.bounds_percentile,
+            bounds_median_size=new_scale,
+            effective_means_lr=effective_lr,
+        )
+        if step is None:
+            means_lr_end = self.cfg.means_lr_end or self.cfg.means_lr * 0.01
+            batch_scale = math.sqrt(self.cfg.batch_size * self.world_size)
+            print(
+                "MRNF means LR: "
+                f"{effective_lr:.6g} -> "
+                f"{means_lr_end * new_scale * batch_scale:.6g} "
+                f"(central {100.0 * strategy.bounds_percentile:.0f}% "
+                f"median span {new_scale:.6g})"
+            )
+        return True
 
     def _apply_calibration_adjustment(
         self, Ks: Tensor, radial_coeffs: Tensor, camera_ids: Tensor
@@ -1626,10 +1734,15 @@ class Runner:
             ppisp_frames_per_camera=self.ppisp_frames_per_camera,
         )
 
+        means_lr_end = cfg.means_lr_end or cfg.means_lr * 0.01
+        means_lr_gamma = (
+            (means_lr_end / cfg.means_lr) ** (1.0 / max_steps)
+            if cfg.means_lr > 0.0
+            else 1.0
+        )
         schedulers = [
-            # means has a learning rate schedule, that end at 0.01 of the initial value
             torch.optim.lr_scheduler.ExponentialLR(
-                self.optimizers["means"], gamma=0.01 ** (1.0 / max_steps)
+                self.optimizers["means"], gamma=means_lr_gamma
             ),
         ]
         pose_scheduler = None
@@ -2052,7 +2165,7 @@ class Runner:
                     "gpu_memory_gib": mem,
                     "camera_stage": stage.name,
                     "sh_degree": sh_degree_to_use,
-                    "means_lr": schedulers[0].get_last_lr()[0],
+                    "means_lr": self.optimizers["means"].param_groups[0]["lr"],
                     "update_applied": do_update,
                 }
                 for name, value in self._camera_metrics().items():
@@ -2314,6 +2427,24 @@ class Runner:
                 if cfg.pose_opt:
                     self._pose_module()._zero_reference()
 
+            # LichtFeld refreshes the MRNF spatial LR scale every five
+            # refinement windows, before the next prune/grow mutation.
+            if (
+                do_update
+                and densification_active
+                and isinstance(cfg.strategy, MRNFStrategy)
+                and cfg.strategy.should_collect(step)
+                and step > cfg.strategy.refine_start_iter
+                and step % cfg.strategy.refine_every == 0
+            ):
+                self._mrnf_refine_windows_since_bounds += 1
+                if (
+                    self._mrnf_refine_windows_since_bounds
+                    >= _MRNF_BOUNDS_REFRESH_EVERY
+                ):
+                    if self._refresh_mrnf_means_lr_scale(step=step):
+                        self._mrnf_refine_windows_since_bounds = 0
+
             # Run post-backward steps after backward and optimizer
             if do_update and densification_active:
                 if isinstance(self.cfg.strategy, DefaultStrategy):
@@ -2341,6 +2472,7 @@ class Runner:
                         state=self.strategy_state,
                         step=step,
                         info=info,
+                        max_steps=cfg.max_steps,
                     )
                 else:
                     assert_never(self.cfg.strategy)
