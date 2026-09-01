@@ -5,15 +5,77 @@
 
 import math
 from dataclasses import dataclass
-from typing import Any, Dict, Union
+from typing import Any, Dict, Tuple, Union
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor
 
 from gsplat.utils import normalized_quat_to_rotmat
 
 from .base import Strategy
 from .ops import _multinomial_sample, _update_param_with_optimizer, remove
+
+
+_LFS_SSIM_GAUSSIAN_11 = (
+    0.001028380123898387,
+    0.0075987582094967365,
+    0.036000773310661316,
+    0.10936068743467331,
+    0.21300552785396576,
+    0.26601171493530273,
+    0.21300552785396576,
+    0.10936068743467331,
+    0.036000773310661316,
+    0.0075987582094967365,
+    0.001028380123898387,
+)
+
+
+@torch.no_grad()
+def _ssim_cs_error_map(rendered: Tensor, target: Tensor) -> Tensor:
+    """Compute LichtFeld's per-pixel SSIM contrast-structure error."""
+    rendered_chw = rendered.permute(0, 3, 1, 2).contiguous()
+    target_chw = target.permute(0, 3, 1, 2).contiguous()
+    moments = torch.cat(
+        (
+            rendered_chw,
+            target_chw,
+            rendered_chw.square(),
+            target_chw.square(),
+            rendered_chw * target_chw,
+        ),
+        dim=1,
+    )
+    channels = moments.shape[1]
+    gaussian = moments.new_tensor(_LFS_SSIM_GAUSSIAN_11)
+    horizontal = gaussian.view(1, 1, 1, 11).repeat(channels, 1, 1, 1)
+    vertical = gaussian.view(1, 1, 11, 1).repeat(channels, 1, 1, 1)
+    moments = F.conv2d(moments, horizontal, padding=(0, 5), groups=channels)
+    moments = F.conv2d(moments, vertical, padding=(5, 0), groups=channels)
+    mu_rendered, mu_target, mean_rendered_sq, mean_target_sq, mean_product = (
+        moments.chunk(5, dim=1)
+    )
+
+    variance_rendered = mean_rendered_sq - mu_rendered.square()
+    variance_target = mean_target_sq - mu_target.square()
+    covariance = mean_product - mu_rendered * mu_target
+    c2 = 0.03**2
+    cs = (2.0 * covariance + c2) / (
+        variance_rendered + variance_target + c2
+    )
+    return (1.0 - cs.mean(dim=1)).clamp_min_(0.0)
+
+
+def _full_ssim_window_mask(mask: Tensor) -> Tensor:
+    """Keep SSIM centers whose complete 11x11 window is valid."""
+    valid_fraction = F.avg_pool2d(
+        mask.unsqueeze(1).to(dtype=torch.float32),
+        kernel_size=11,
+        stride=1,
+        padding=5,
+    )
+    return valid_fraction.squeeze(1) >= 1.0 - 1e-6
 
 
 @torch.no_grad()
@@ -96,8 +158,10 @@ class MRNFStrategy(Strategy):
     each pixel's reconstruction error is attributed to Gaussians using their
     actual ``alpha * transmittance`` contribution in the world-space backward
     pass, and selected Gaussians use its in-place long-axis split rule. Opacity
-    and scale decay follow LichtFeld's activated-space schedule. Edge guidance,
-    far-field seeding, and noise remain outside this port.
+    and scale decay follow LichtFeld's activated-space schedule. Its angular
+    screen-share cap and oversized-split quota keep large Gaussians from
+    dominating the image. Edge guidance, far-field seeding, noise, and the
+    optimizer-side screen-share penalty remain outside this port.
     """
 
     prune_opa: float = 1.0 / 255.0
@@ -114,6 +178,8 @@ class MRNFStrategy(Strategy):
     bounds_percentile: float = 0.8
     opacity_decay: float = 0.004
     scale_decay: float = 0.002
+    max_screen_share: float = 0.3
+    oversize_split_fraction: float = 0.15
     error_epsilon: float = 1e-6
     verbose: bool = False
 
@@ -124,6 +190,7 @@ class MRNFStrategy(Strategy):
             "visibility_sum": None,
             "error_max": None,
             "error_ratio_max": None,
+            "max_screen_share": None,
         }
 
     def check_sanity(
@@ -145,6 +212,8 @@ class MRNFStrategy(Strategy):
         assert 0.0 <= self.bounds_percentile <= 1.0
         assert self.opacity_decay >= 0.0
         assert 0.0 <= self.scale_decay < 1.0
+        assert math.isfinite(self.max_screen_share)
+        assert 0.0 <= self.oversize_split_fraction <= 1.0
         assert self.error_epsilon > 0.0
 
     def should_collect(self, step: int) -> bool:
@@ -158,7 +227,12 @@ class MRNFStrategy(Strategy):
     ) -> None:
         means = params["means"]
         n_gaussians = len(means)
-        for key in ("visibility_sum", "error_max", "error_ratio_max"):
+        for key in (
+            "visibility_sum",
+            "error_max",
+            "error_ratio_max",
+            "max_screen_share",
+        ):
             value = state.get(key)
             if (
                 not isinstance(value, Tensor)
@@ -168,6 +242,70 @@ class MRNFStrategy(Strategy):
                 state[key] = torch.zeros(
                     n_gaussians, device=means.device, dtype=torch.float32
                 )
+
+    def _screen_share_cap_active(self) -> bool:
+        return 0.0 < self.max_screen_share < 1.0
+
+    @torch.no_grad()
+    def _accumulate_max_screen_share(
+        self,
+        params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
+        state: Dict[str, Any],
+        info: Dict[str, Any],
+    ) -> None:
+        """Accumulate LichtFeld's angular radius for visible Gaussians."""
+        if not self._screen_share_cap_active():
+            return
+        assert "radii" in info and "viewmats" in info, (
+            "MRNF screen-share limiting requires rasterization radii and viewmats."
+        )
+
+        means = params["means"]
+        n_gaussians = len(means)
+        radii = info["radii"]
+        assert radii.shape[-2] == n_gaussians, radii.shape
+        visibility = (radii > 0).all(dim=-1).reshape(-1, n_gaussians)
+        viewmats = info["viewmats"].reshape(-1, 4, 4)
+        assert len(visibility) == len(viewmats), (
+            visibility.shape,
+            viewmats.shape,
+        )
+
+        max_share = state["max_screen_share"]
+
+        for camera_visibility, viewmat in zip(visibility, viewmats):
+            visible_ids = torch.nonzero(
+                camera_visibility, as_tuple=False
+            ).flatten()
+            if len(visible_ids) == 0:
+                continue
+
+            rotation = viewmat[:3, :3]
+            translation = viewmat[:3, 3]
+            camera_center = -(rotation.transpose(0, 1) @ translation)
+            distance = torch.linalg.vector_norm(
+                means[visible_ids] - camera_center, dim=-1
+            )
+            opacity = torch.sigmoid(params["opacities"][visible_ids].flatten())
+            extend = torch.sqrt(
+                2.0 * torch.log((255.0 * opacity).clamp_min(1.0))
+            )
+            radius = params["scales"][visible_ids].amax(dim=-1).exp() * extend
+            denominator = torch.maximum(distance, radius) + torch.sqrt(
+                (distance.square() - radius.square()).clamp_min(0.0)
+            )
+            valid_share = (denominator > 0.0) & (radius > 0.0)
+            safe_denominator = torch.where(
+                denominator > 0.0, denominator, torch.ones_like(denominator)
+            )
+            share = torch.where(
+                valid_share,
+                radius / safe_denominator,
+                torch.zeros_like(radius),
+            ).clamp_(0.0, 1.0)
+            max_share[visible_ids] = torch.maximum(
+                max_share[visible_ids], share.to(dtype=max_share.dtype)
+            )
 
     @torch.no_grad()
     def step_pre_backward(
@@ -181,10 +319,12 @@ class MRNFStrategy(Strategy):
         target: Tensor,
         mask: Union[Tensor, None] = None,
     ) -> None:
-        """Write a detached, valid-pixel-normalized RGB error map for backward."""
-        del params, optimizers, state
+        """Write a valid-window-normalized SSIM-CS error map for backward."""
+        del optimizers
         if not self.should_collect(step):
             return
+        self._ensure_running_stats(params, state)
+        self._accumulate_max_screen_share(params, state, info)
         assert "densification_error_map" in info, (
             "MRNFStrategy requires rasterization(..., "
             "calc_densification_info=True)."
@@ -193,7 +333,7 @@ class MRNFStrategy(Strategy):
         assert rendered.shape == target.shape, (rendered.shape, target.shape)
         assert rendered.shape[-1] >= 3, rendered.shape
 
-        error = (rendered[..., :3] - target[..., :3]).abs().mean(dim=-1).detach()
+        error = _ssim_cs_error_map(rendered[..., :3], target[..., :3])
         assert error.shape == error_map.shape, (error.shape, error_map.shape)
 
         if mask is None:
@@ -201,6 +341,7 @@ class MRNFStrategy(Strategy):
         else:
             valid = mask.to(device=error.device, dtype=torch.bool)
             assert valid.shape == error.shape, (valid.shape, error.shape)
+        valid = _full_ssim_window_mask(valid)
         valid_f = valid.to(dtype=error.dtype)
         valid_mean = (error * valid_f).sum() / valid_f.sum().clamp_min(1.0)
         normalized = torch.where(
@@ -254,8 +395,9 @@ class MRNFStrategy(Strategy):
         densification_info.zero_()
 
         if step > self.refine_start_iter and step % self.refine_every == 0:
+            n_screen_clipped = self._clip_oversized_gaussians(params, state)
             n_prune = self._prune_gaussians(params, optimizers, state)
-            n_split = self._grow_gaussians(
+            n_split, n_oversize = self._grow_gaussians(
                 params,
                 optimizers,
                 state,
@@ -263,14 +405,46 @@ class MRNFStrategy(Strategy):
                 allow_growth=step < self.grow_until_iter,
             )
             self._apply_decay(params, step=step, max_steps=max_steps)
-            for key in ("visibility_sum", "error_max", "error_ratio_max"):
+            for key in (
+                "visibility_sum",
+                "error_max",
+                "error_ratio_max",
+                "max_screen_share",
+            ):
                 state[key].zero_()
             if self.verbose:
                 print(
-                    f"Step {step}: MRNF pruned {n_prune} and split "
-                    f"{n_split} GSs. "
+                    f"Step {step}: MRNF screen-clipped {n_screen_clipped}, "
+                    f"pruned {n_prune}, and split {n_split} GSs "
+                    f"({n_oversize} oversized). "
                     f"Now having {len(params['means'])} GSs."
                 )
+
+    @torch.no_grad()
+    def _clip_oversized_gaussians(
+        self,
+        params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
+        state: Dict[str, Any],
+    ) -> int:
+        """Shrink each oversized Gaussian's longest axis by at most 1.5x."""
+        if not self._screen_share_cap_active():
+            return 0
+        share = state["max_screen_share"]
+        selected_ids = torch.nonzero(
+            share > self.max_screen_share, as_tuple=False
+        ).flatten()
+        if len(selected_ids) == 0:
+            return 0
+
+        selected_scales = params["scales"][selected_ids]
+        longest_axes = selected_scales.argmax(dim=-1)
+        delta = torch.log(share[selected_ids] / self.max_screen_share).clamp_max_(
+            math.log(1.5)
+        )
+        params["scales"][selected_ids, longest_axes] -= delta.to(
+            dtype=params["scales"].dtype
+        )
+        return len(selected_ids)
 
     @torch.no_grad()
     def _apply_decay(
@@ -317,7 +491,7 @@ class MRNFStrategy(Strategy):
         state: Dict[str, Any],
         pruned_count: int,
         allow_growth: bool,
-    ) -> int:
+    ) -> Tuple[int, int]:
         error_max = state["error_max"]
         candidates = (error_max > self.grow_error_threshold) & (
             state["visibility_sum"] > 0.0
@@ -330,7 +504,7 @@ class MRNFStrategy(Strategy):
                 max(0, self.max_gaussians - len(params["means"])),
             )
         if budget <= 0:
-            return 0
+            return 0, 0
 
         replacement_weights = torch.where(
             state["visibility_sum"] > 0.0,
@@ -361,14 +535,41 @@ class MRNFStrategy(Strategy):
                 max(0, budget - n_replace),
             )
 
-        if n_grow > 0:
-            rank = (
-                state["error_ratio_max"]
-                if self.use_visibility_ratio
-                else error_max
+        rank = (
+            state["error_ratio_max"] if self.use_visibility_ratio else error_max
+        )
+        oversize_ids = replacement_ids.new_empty(0)
+        if n_grow > 0 and self._screen_share_cap_active():
+            max_share = state["max_screen_share"]
+            oversize_candidates = (max_share > self.max_screen_share) & (
+                rank > 0.0
             )
+            oversize_weights = torch.where(
+                oversize_candidates,
+                rank.clamp_min(0.0).sqrt()
+                * (max_share / self.max_screen_share),
+                torch.zeros_like(rank),
+            )
+            oversize_weights[replacement_ids] = 0
+            oversize_weights = torch.nan_to_num(
+                oversize_weights, nan=0.0, posinf=1e10, neginf=0.0
+            )
+            n_oversize = min(
+                int(n_grow * self.oversize_split_fraction + 0.5),
+                int((oversize_weights > 0.0).sum().item()),
+            )
+            if n_oversize > 0:
+                oversize_ids = _multinomial_sample(
+                    oversize_weights,
+                    n_oversize,
+                    replacement=False,
+                )
+
+        n_regular = n_grow - len(oversize_ids)
+        if n_regular > 0:
             growth_weights = torch.where(candidates, rank, torch.zeros_like(rank))
             growth_weights[replacement_ids] = 0
+            growth_weights[oversize_ids] = 0
             growth_weights = torch.nan_to_num(
                 growth_weights, nan=0.0, posinf=1e10, neginf=0.0
             )
@@ -377,12 +578,13 @@ class MRNFStrategy(Strategy):
                     candidates, error_max, torch.zeros_like(error_max)
                 )
                 growth_weights[replacement_ids] = 0
+                growth_weights[oversize_ids] = 0
             selectable_growth = int((growth_weights > 0.0).sum().item())
-            n_grow = min(n_grow, selectable_growth)
-            if n_grow > 0:
+            n_regular = min(n_regular, selectable_growth)
+            if n_regular > 0:
                 growth_ids = _multinomial_sample(
                     growth_weights,
-                    n_grow,
+                    n_regular,
                     replacement=False,
                 )
             else:
@@ -390,14 +592,14 @@ class MRNFStrategy(Strategy):
         else:
             growth_ids = replacement_ids.new_empty(0)
 
-        selected_ids = torch.cat((replacement_ids, growth_ids))
+        selected_ids = torch.cat((replacement_ids, oversize_ids, growth_ids))
         n_split = len(selected_ids)
         if n_split == 0:
-            return 0
+            return 0, 0
         _long_axis_split_gaussians(
             params=params,
             optimizers=optimizers,
             state=state,
             selected_ids=selected_ids,
         )
-        return n_split
+        return n_split, len(oversize_ids)

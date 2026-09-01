@@ -402,7 +402,7 @@ class Config:
     # Use visible adam from Taming 3DGS. (experimental)
     visible_adam: bool = False
     # Anti-aliasing in rasterization. Might slightly hurt quantitative metrics.
-    antialiased: bool = True
+    antialiased: bool = False
 
     # ---- Stability knobs ----
     # Clamp rendered colors to [0, 1] for the loss computation (helps avoid NaNs in SSIM).

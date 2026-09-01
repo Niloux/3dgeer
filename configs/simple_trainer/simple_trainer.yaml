@@ -9,7 +9,7 @@ normalize_world_space: false
 log_every: 100
 log_loss_window: 100
 
-result_dir: results/0901/park_mrnf_lfs_means_opacity_scale_decay_nodepth
+result_dir: results/0901/park_无抗锯齿
 disable_viewer: true
 disable_video: true
 
@@ -67,6 +67,8 @@ strategy:
   bounds_percentile: 0.8
   opacity_decay: 0.004
   scale_decay: 0.002
+  max_screen_share: 0.3
+  oversize_split_fraction: 0.15
   # LichtFeld's baseline profile ranks growth by raw attributed error.
   use_visibility_ratio: false
   visibility_power: 0.75
