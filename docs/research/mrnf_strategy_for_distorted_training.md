@@ -69,8 +69,10 @@ error_g      += w_pg * error_map[p]
 `densification_info` 的两行。见
 [`RasterizeToPixelsFromWorld3DGSBwd.cu`](https://github.com/MrNeRF/LichtFeld-Studio/blob/de972c89ec6bcd27406f892b966f180a7054f2cc/src/training/rasterization/gsplat/RasterizeToPixelsFromWorld3DGSBwd.cu#L717-L801)。
 
-策略随后累积 visibility，并保存窗口内的最大 error score；当前默认还维护
-`error / visibility^0.75` 的最大值用于排序。见
+策略随后累积 visibility，并保存窗口内的最大 error score。上游虽然在 MRNF
+preset 中设置了 `growth_ratio_rank=true`，但该功能受
+`background_improvements` 开关控制，而 baseline profile 默认关闭后者，因此实际
+仍按 raw attributed error 排序；本移植保留 visibility-ratio 作为显式可选项。见
 [`MRNF::post_backward`](https://github.com/MrNeRF/LichtFeld-Studio/blob/de972c89ec6bcd27406f892b966f180a7054f2cc/src/training/strategies/mrnf.cpp#L1114-L1191)
 和
 [`fold_densification_and_zero_kernel`](https://github.com/MrNeRF/LichtFeld-Studio/blob/de972c89ec6bcd27406f892b966f180a7054f2cc/src/training/kernels/mrnf_kernels.cu#L203-L246)。
@@ -88,9 +90,11 @@ MRNF 不会像经典 ADC/default 那样把所有过阈值对象都直接 duplica
 round(candidate_count * grow_fraction)
 ```
 
-默认 `grow_fraction=0.07`，随后按 error score（默认使用 visibility-normalized
-ratio rank）加权、通过 Gumbel top-k 无放回采样，且受到 population cap、fill
-pacing、replacement 和 oversize-split budget 约束。候选条件见
+默认 `grow_fraction=0.07`，随后按 error score 加权、通过 Gumbel top-k 无放回
+采样，且受到 population cap、fill pacing、replacement 和 oversize-split budget
+约束。被裁剪数量对应的 replacement 父节点单独按可见 Gaussian 的 opacity
+采样；replacement 与净增长父节点最后统一执行 IGS+ 的确定性长轴分裂，不存在
+经典 ADC 的 small-Gaussian duplicate 分支。候选条件见
 [`compute_refine_candidates`](https://github.com/MrNeRF/LichtFeld-Studio/blob/de972c89ec6bcd27406f892b966f180a7054f2cc/src/training/strategies/mrnf.cpp#L2343-L2348)，
 预算计算见
 [`grow_and_split`](https://github.com/MrNeRF/LichtFeld-Studio/blob/de972c89ec6bcd27406f892b966f180a7054f2cc/src/training/strategies/mrnf.cpp#L1958-L1990)。
@@ -236,11 +240,12 @@ MCMC 的优点是简单、与相机投影解耦；缺点是新 Gaussian 主要�
    再按**有效像素均值**归一化。稳定后再切换/增加 SSIM-CS error map。
 5. 每个 refine window：
    - 用 raw error threshold 选候选；
-   - 用 `error / visibility^p` 排序或采样；
+   - baseline 用 raw error 排序或采样，并把 `error / visibility^p` 保留为可选项；
    - 目标数为候选数乘 `grow_fraction`；
    - 用 `torch.multinomial(replacement=False)` 或 Gumbel top-k；
-   - 按 3D scale 决定 duplicate/split，并执行 opacity pruning；
-   - 同时应用 `max_gaussians` 与 `max_grow_per_refine`。
+   - replacement 按可见 Gaussian 的 opacity 独立采样；
+   - 所有选中对象都执行确定性 long-axis split，并执行 opacity pruning；
+   - 应用 `max_gaussians` 上限。
 6. 首版固定：
    - `use_edge_map=false`；
    - `background_improvements=false`；

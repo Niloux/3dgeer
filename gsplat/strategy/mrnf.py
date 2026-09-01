@@ -3,14 +3,89 @@
 # SPDX-FileCopyrightText: 2025 LichtFeld Studio Authors
 # SPDX-License-Identifier: GPL-3.0-or-later
 
+import math
 from dataclasses import dataclass
-from typing import Any, Dict, Tuple, Union
+from typing import Any, Dict, Union
 
 import torch
 from torch import Tensor
 
+from gsplat.utils import normalized_quat_to_rotmat
+
 from .base import Strategy
-from .ops import _multinomial_sample, duplicate, remove, split
+from .ops import _multinomial_sample, _update_param_with_optimizer, remove
+
+
+@torch.no_grad()
+def _long_axis_split_gaussians(
+    params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
+    optimizers: Dict[str, torch.optim.Optimizer],
+    state: Dict[str, Any],
+    selected_ids: Tensor,
+) -> None:
+    """Split selected Gaussians with LichtFeld's in-place long-axis rule."""
+    selected_ids = selected_ids.to(dtype=torch.long)
+    selected_means = params["means"][selected_ids]
+    selected_log_scales = params["scales"][selected_ids]
+    selected_quats = params["quats"][selected_ids]
+
+    longest_axes = selected_log_scales.argmax(dim=-1)
+    rotmats = normalized_quat_to_rotmat(selected_quats)
+    world_axes = torch.gather(
+        rotmats,
+        dim=2,
+        index=longest_axes[:, None, None].expand(-1, 3, 1),
+    ).squeeze(2)
+    longest_scales = torch.gather(
+        selected_log_scales, dim=1, index=longest_axes[:, None]
+    ).exp()
+    offsets = world_axes * (0.5 * longest_scales)
+
+    child_means = selected_means - offsets
+    parent_means = selected_means + offsets
+    split_log_scales = selected_log_scales + math.log(0.85)
+    split_log_scales.scatter_(
+        1,
+        longest_axes[:, None],
+        torch.gather(
+            selected_log_scales, dim=1, index=longest_axes[:, None]
+        )
+        + math.log(0.5),
+    )
+    split_opacities = torch.logit(
+        torch.sigmoid(params["opacities"][selected_ids]) * 0.6,
+        eps=1e-7,
+    )
+
+    def param_fn(name: str, parameter: Tensor) -> Tensor:
+        if name == "means":
+            parameter[selected_ids] = parent_means
+            children = child_means
+        elif name == "scales":
+            parameter[selected_ids] = split_log_scales
+            children = split_log_scales
+        elif name == "opacities":
+            parameter[selected_ids] = split_opacities
+            children = split_opacities
+        else:
+            children = parameter[selected_ids]
+        return torch.nn.Parameter(
+            torch.cat((parameter, children), dim=0),
+            requires_grad=parameter.requires_grad,
+        )
+
+    def optimizer_fn(key: str, value: Tensor) -> Tensor:
+        del key
+        value[selected_ids] = 0
+        return torch.cat((value, torch.zeros_like(value[selected_ids])), dim=0)
+
+    _update_param_with_optimizer(param_fn, optimizer_fn, params, optimizers)
+    for key, value in state.items():
+        if isinstance(value, Tensor):
+            value[selected_ids] = 0
+            state[key] = torch.cat(
+                (value, torch.zeros_like(value[selected_ids])), dim=0
+            )
 
 
 @dataclass
@@ -20,33 +95,31 @@ class MRNFStrategy(Strategy):
     This ports the distortion-aware core of LichtFeld Studio's MRNF strategy:
     each pixel's reconstruction error is attributed to Gaussians using their
     actual ``alpha * transmittance`` contribution in the world-space backward
-    pass. Edge guidance, far-field seeding, decay, and noise are intentionally
-    outside this first implementation.
+    pass, and selected Gaussians use its in-place long-axis split rule. Edge
+    guidance, far-field seeding, decay, and noise remain outside this port.
     """
 
     prune_opa: float = 1.0 / 255.0
     grow_error_threshold: float = 0.003
     grow_fraction: float = 0.07
-    grow_scale3d: float = 0.01
     refine_start_iter: int = 0
-    refine_stop_iter: int = 15_000
+    grow_until_iter: int = 15_000
+    refine_stop_iter: int = 28_500
     refine_every: int = 200
-    use_visibility_ratio: bool = True
+    use_visibility_ratio: bool = False
     visibility_power: float = 0.75
     min_visibility: float = 0.05
-    revised_opacity: bool = False
     max_gaussians: int = 1_000_000
-    max_grow_per_refine: int = 0
     error_epsilon: float = 1e-6
     verbose: bool = False
 
     def initialize_state(self, scene_scale: float = 1.0) -> Dict[str, Any]:
         """Initialize lazily allocated per-Gaussian running statistics."""
+        del scene_scale
         return {
             "visibility_sum": None,
             "error_max": None,
             "error_ratio_max": None,
-            "scene_scale": float(scene_scale),
         }
 
     def check_sanity(
@@ -59,13 +132,12 @@ class MRNFStrategy(Strategy):
             assert key in params, f"{key} is required in params but missing."
         assert 0.0 <= self.grow_fraction <= 1.0
         assert self.grow_error_threshold >= 0.0
-        assert self.grow_scale3d >= 0.0
         assert self.refine_every > 0
-        assert self.refine_start_iter <= self.refine_stop_iter
+        assert self.refine_start_iter <= self.grow_until_iter
+        assert self.grow_until_iter <= self.refine_stop_iter
         assert self.visibility_power >= 0.0
         assert self.min_visibility >= 0.0
         assert self.max_gaussians >= 0
-        assert self.max_grow_per_refine >= 0
         assert self.error_epsilon > 0.0
 
     def should_collect(self, step: int) -> bool:
@@ -175,13 +247,19 @@ class MRNFStrategy(Strategy):
 
         if step > self.refine_start_iter and step % self.refine_every == 0:
             n_prune = self._prune_gaussians(params, optimizers, state)
-            n_duplicate, n_split = self._grow_gaussians(params, optimizers, state)
+            n_split = self._grow_gaussians(
+                params,
+                optimizers,
+                state,
+                pruned_count=n_prune,
+                allow_growth=step < self.grow_until_iter,
+            )
             for key in ("visibility_sum", "error_max", "error_ratio_max"):
                 state[key].zero_()
             if self.verbose:
                 print(
-                    f"Step {step}: MRNF pruned {n_prune}, duplicated "
-                    f"{n_duplicate}, and split {n_split} GSs. "
+                    f"Step {step}: MRNF pruned {n_prune} and split "
+                    f"{n_split} GSs. "
                     f"Now having {len(params['means'])} GSs."
                 )
 
@@ -204,72 +282,89 @@ class MRNFStrategy(Strategy):
         params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
         optimizers: Dict[str, torch.optim.Optimizer],
         state: Dict[str, Any],
-    ) -> Tuple[int, int]:
+        pruned_count: int,
+        allow_growth: bool,
+    ) -> int:
         error_max = state["error_max"]
         candidates = (error_max > self.grow_error_threshold) & (
             state["visibility_sum"] > 0.0
         )
         candidate_count = int(candidates.sum().item())
-        n_grow = int(candidate_count * self.grow_fraction + 0.5)
-
-        max_new = n_grow
+        budget = candidate_count + pruned_count
         if self.max_gaussians > 0:
-            max_new = min(
-                max_new,
+            budget = min(
+                budget,
                 max(0, self.max_gaussians - len(params["means"])),
             )
-        if self.max_grow_per_refine > 0:
-            max_new = min(max_new, self.max_grow_per_refine)
-        n_grow = min(max_new, candidate_count)
-        if n_grow <= 0:
-            return 0, 0
+        if budget <= 0:
+            return 0
 
-        rank = (
-            state["error_ratio_max"]
-            if self.use_visibility_ratio
-            else error_max
+        replacement_weights = torch.where(
+            state["visibility_sum"] > 0.0,
+            torch.sigmoid(params["opacities"].flatten()),
+            torch.zeros_like(error_max),
         )
-        weights = torch.where(candidates, rank, torch.zeros_like(rank))
-        weights = torch.nan_to_num(weights, nan=0.0, posinf=1e10, neginf=0.0)
-        if not bool((weights.sum() > 0.0).item()):
-            weights = torch.where(candidates, error_max, torch.zeros_like(error_max))
-
-        selected_ids = _multinomial_sample(weights, n_grow, replacement=False)
-        selected = torch.zeros_like(candidates)
-        selected[selected_ids] = True
-
-        is_small = (
-            torch.exp(params["scales"]).amax(dim=-1)
-            <= self.grow_scale3d * state["scene_scale"]
+        replacement_weights = torch.nan_to_num(
+            replacement_weights, nan=0.0, posinf=1.0, neginf=0.0
         )
-        duplicate_mask = selected & is_small
-        split_mask = selected & ~is_small
-        n_duplicate = int(duplicate_mask.sum().item())
-        n_split = int(split_mask.sum().item())
-
-        if n_duplicate > 0:
-            duplicate(
-                params=params,
-                optimizers=optimizers,
-                state=state,
-                mask=duplicate_mask,
+        selectable_replacements = int((replacement_weights > 0.0).sum().item())
+        n_replace = min(pruned_count, budget, selectable_replacements)
+        if n_replace > 0:
+            replacement_ids = _multinomial_sample(
+                replacement_weights,
+                n_replace,
+                replacement=False,
             )
-        split_mask = torch.cat(
-            [
-                split_mask,
-                torch.zeros(
-                    n_duplicate,
-                    device=split_mask.device,
-                    dtype=torch.bool,
-                ),
-            ]
-        )
-        if n_split > 0:
-            split(
-                params=params,
-                optimizers=optimizers,
-                state=state,
-                mask=split_mask,
-                revised_opacity=self.revised_opacity,
+        else:
+            replacement_ids = torch.empty(
+                0, device=error_max.device, dtype=torch.long
             )
-        return n_duplicate, n_split
+
+        n_grow = 0
+        if allow_growth:
+            desired_total = int(candidate_count * self.grow_fraction + 0.5)
+            n_grow = min(
+                max(0, desired_total - n_replace),
+                max(0, budget - n_replace),
+            )
+
+        if n_grow > 0:
+            rank = (
+                state["error_ratio_max"]
+                if self.use_visibility_ratio
+                else error_max
+            )
+            growth_weights = torch.where(candidates, rank, torch.zeros_like(rank))
+            growth_weights[replacement_ids] = 0
+            growth_weights = torch.nan_to_num(
+                growth_weights, nan=0.0, posinf=1e10, neginf=0.0
+            )
+            if not bool((growth_weights.sum() > 0.0).item()):
+                growth_weights = torch.where(
+                    candidates, error_max, torch.zeros_like(error_max)
+                )
+                growth_weights[replacement_ids] = 0
+            selectable_growth = int((growth_weights > 0.0).sum().item())
+            n_grow = min(n_grow, selectable_growth)
+            if n_grow > 0:
+                growth_ids = _multinomial_sample(
+                    growth_weights,
+                    n_grow,
+                    replacement=False,
+                )
+            else:
+                growth_ids = replacement_ids.new_empty(0)
+        else:
+            growth_ids = replacement_ids.new_empty(0)
+
+        selected_ids = torch.cat((replacement_ids, growth_ids))
+        n_split = len(selected_ids)
+        if n_split == 0:
+            return 0
+        _long_axis_split_gaussians(
+            params=params,
+            optimizers=optimizers,
+            state=state,
+            selected_ids=selected_ids,
+        )
+        return n_split

@@ -789,6 +789,7 @@ class Dataset:
             "camtoworld": torch.from_numpy(camtoworlds).float(),
             "image": torch.from_numpy(image).float(),
             "image_id": item,  # the index of the image in the dataset
+            "source_index": int(index),  # stable index in parser.image_names
             "frame_id": int(self.parser.frame_ids[index]),
         }
         if mask is not None:

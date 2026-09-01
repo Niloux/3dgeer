@@ -22,6 +22,7 @@ from datasets.traj import (
     generate_interpolated_path,
     generate_spiral_path,
 )
+from eval_artifacts import EvalArtifact, EvalArtifactWriter
 from evaluation import masked_lpips, masked_psnr, masked_ssim
 from fused_ssim import FusedSSIMMap, fused_ssim
 from gaussian_models import (
@@ -545,6 +546,7 @@ class Config:
             strategy.refine_every = int(strategy.refine_every * factor)
         elif isinstance(strategy, MRNFStrategy):
             strategy.refine_start_iter = int(strategy.refine_start_iter * factor)
+            strategy.grow_until_iter = int(strategy.grow_until_iter * factor)
             strategy.refine_stop_iter = int(strategy.refine_stop_iter * factor)
             strategy.refine_every = int(strategy.refine_every * factor)
         else:
@@ -929,7 +931,13 @@ class Runner:
             depth_dir=cfg.depth_dir,
             depth_max=cfg.depth_max,
         )
-        self.valset = dataset_cls(self.parser, split="val")
+        self.valset = dataset_cls(
+            self.parser,
+            split="val",
+            load_depths=cfg.depth_loss and cfg.depth_dir is not None,
+            depth_dir=cfg.depth_dir,
+            depth_max=cfg.depth_max,
+        )
         if cfg.rig_opt:
             _, frame_counts = np.unique(self.parser.frame_ids, return_counts=True)
             if (int(frame_counts.max()) if frame_counts.size else 0) < 2:
@@ -2376,22 +2384,23 @@ class Runner:
         prediction: Tensor,
         target: Tensor,
         mask: Optional[Tensor],
-    ) -> None:
-        metrics[f"{prefix}psnr"].append(masked_psnr(prediction, target, mask))
-        metrics[f"{prefix}ssim"].append(
-            masked_ssim(self.ssim, prediction, target, mask)
-        )
-        metrics[f"{prefix}lpips"].append(
-            masked_lpips(self.lpips, prediction, target, mask)
-        )
+    ) -> Dict[str, Tensor]:
+        values = {
+            f"{prefix}psnr": masked_psnr(prediction, target, mask),
+            f"{prefix}ssim": masked_ssim(self.ssim, prediction, target, mask),
+            f"{prefix}lpips": masked_lpips(self.lpips, prediction, target, mask),
+        }
+        for key, value in values.items():
+            metrics[key].append(value)
+        return values
 
     @torch.no_grad()
     def _eval_dataset(
         self,
         dataset,
-        step: int,
-        stage: str,
+        split: str,
         apply_train_adjustment: bool,
+        artifact_writer: Optional[EvalArtifactWriter],
     ) -> Dict[str, float]:
         """Render and score one dataset split."""
         cfg = self.cfg
@@ -2403,10 +2412,13 @@ class Runner:
         ellipse_time = 0.0
         metrics = defaultdict(list)
 
-        for i, data in enumerate(dataloader):
+        for data in dataloader:
             camtoworlds = data["camtoworld"].to(device)
             Ks = data["K"].to(device)
             pixels = data["image"].to(device) / 255.0
+            depth_map_gt = (
+                data["depth"].to(device) if "depth" in data else None
+            )
             masks = data["mask"].to(device) if "mask" in data else None
             sky_masks = (
                 data["sky_mask"].to(device) if "sky_mask" in data else None
@@ -2443,7 +2455,7 @@ class Runner:
 
             torch.cuda.synchronize()
             tic = time.time()
-            colors, _, _ = self.render_scene(
+            renders, alphas, _ = self.render_scene(
                 camtoworlds=camtoworlds,
                 Ks=Ks,
                 width=width,
@@ -2453,10 +2465,13 @@ class Runner:
                 far_plane=cfg.far_plane,
                 image_ids=image_ids if apply_train_adjustment else None,
                 masks=masks,
+                render_mode="RGB+ED",
                 camera_model="fisheye" if cfg.keep_distortion and data["camera_model"] == 5 else "pinhole",
                 radial_coeffs=radial_coeffs,
                 tangential_coeffs=tangential_coeffs,
-            )  # [1, H, W, 3]
+            )  # [1, H, W, 4]
+            colors = renders[..., :3]
+            depths = renders[..., 3:4]
             bilateral_colors = None
             if cfg.use_bilateral_grid and apply_train_adjustment:
                 bilateral_colors = self._apply_bilateral_grid(colors, image_ids)
@@ -2476,91 +2491,169 @@ class Runner:
             if ppisp_colors is not None:
                 ppisp_colors = torch.clamp(ppisp_colors, 0.0, 1.0)
             if world_rank == 0:
-                canvas = torch.cat([pixels, colors], dim=2).squeeze(0).cpu().numpy()
-                canvas = (canvas * 255).astype(np.uint8)
-                imageio.imwrite(
-                    f"{self.render_dir}/{stage}_step{step}_{i:04d}.png",
-                    canvas,
+                image_metrics = self._append_image_metrics(
+                    metrics, "", colors, pixels, masks
                 )
                 if bilateral_colors is not None:
-                    bilateral_canvas = (
-                        torch.cat([pixels, bilateral_colors], dim=2)
-                        .squeeze(0)
-                        .cpu()
-                        .numpy()
-                    )
-                    bilateral_canvas = (bilateral_canvas * 255).astype(np.uint8)
-                    imageio.imwrite(
-                        f"{self.render_dir}/{stage}_bilateral_step{step}_{i:04d}.png",
-                        bilateral_canvas,
+                    image_metrics.update(
+                        self._append_image_metrics(
+                            metrics,
+                            "bilateral_",
+                            bilateral_colors,
+                            pixels,
+                            masks,
+                        )
                     )
                 if ppisp_colors is not None:
-                    ppisp_canvas = (
-                        torch.cat([pixels, ppisp_colors], dim=2)
-                        .squeeze(0)
-                        .cpu()
-                        .numpy()
-                    )
-                    ppisp_canvas = (ppisp_canvas * 255).astype(np.uint8)
-                    imageio.imwrite(
-                        f"{self.render_dir}/{stage}_ppisp_step{step}_{i:04d}.png",
-                        ppisp_canvas,
-                    )
-
-                self._append_image_metrics(metrics, "", colors, pixels, masks)
-                if bilateral_colors is not None:
-                    self._append_image_metrics(
-                        metrics,
-                        "bilateral_",
-                        bilateral_colors,
-                        pixels,
-                        masks,
-                    )
-                if ppisp_colors is not None:
-                    self._append_image_metrics(
-                        metrics,
-                        "ppisp_",
-                        ppisp_colors,
-                        pixels,
-                        masks,
+                    image_metrics.update(
+                        self._append_image_metrics(
+                            metrics,
+                            "ppisp_",
+                            ppisp_colors,
+                            pixels,
+                            masks,
+                        )
                     )
                 no_sky_mask = None
                 if sky_masks is not None:
                     no_sky_mask = ~sky_masks
                     if masks is not None:
                         no_sky_mask = no_sky_mask & masks
-                    self._append_image_metrics(
-                        metrics, "no_sky_", colors, pixels, no_sky_mask
+                    image_metrics.update(
+                        self._append_image_metrics(
+                            metrics, "no_sky_", colors, pixels, no_sky_mask
+                        )
                     )
                     if bilateral_colors is not None:
-                        self._append_image_metrics(
-                            metrics,
-                            "bilateral_no_sky_",
-                            bilateral_colors,
-                            pixels,
-                            no_sky_mask,
+                        image_metrics.update(
+                            self._append_image_metrics(
+                                metrics,
+                                "bilateral_no_sky_",
+                                bilateral_colors,
+                                pixels,
+                                no_sky_mask,
+                            )
                         )
                     if ppisp_colors is not None:
-                        self._append_image_metrics(
-                            metrics,
-                            "ppisp_no_sky_",
-                            ppisp_colors,
-                            pixels,
-                            no_sky_mask,
+                        image_metrics.update(
+                            self._append_image_metrics(
+                                metrics,
+                                "ppisp_no_sky_",
+                                ppisp_colors,
+                                pixels,
+                                no_sky_mask,
+                            )
                         )
                 if cfg.use_bilateral_grid:
                     cc_colors = color_correct(colors, pixels).clamp(0.0, 1.0)
-                    self._append_image_metrics(
-                        metrics, "cc_", cc_colors, pixels, masks
+                    image_metrics.update(
+                        self._append_image_metrics(
+                            metrics, "cc_", cc_colors, pixels, masks
+                        )
                     )
                     if no_sky_mask is not None:
-                        self._append_image_metrics(
-                            metrics,
-                            "no_sky_cc_",
-                            cc_colors,
-                            pixels,
-                            no_sky_mask,
+                        image_metrics.update(
+                            self._append_image_metrics(
+                                metrics,
+                                "no_sky_cc_",
+                                cc_colors,
+                                pixels,
+                                no_sky_mask,
+                            )
                         )
+
+                if depth_map_gt is not None:
+                    rendered_depth = depths.squeeze(-1)
+                    depth_valid = depth_map_gt > 0.0
+                    if masks is not None:
+                        depth_valid &= masks
+                    rendered_disp = torch.where(
+                        rendered_depth > 0.0,
+                        rendered_depth.clamp_min(1e-8).reciprocal(),
+                        torch.zeros_like(rendered_depth),
+                    )
+                    target_disp = torch.where(
+                        depth_valid,
+                        depth_map_gt.clamp_min(1e-8).reciprocal(),
+                        torch.zeros_like(depth_map_gt),
+                    )
+                    depth_weight = depth_valid.to(rendered_depth.dtype)
+                    depth_inv_l1 = (
+                        ((rendered_disp - target_disp).abs() * depth_weight).sum()
+                        / depth_weight.sum().clamp_min(1.0)
+                        * self.scene_scale
+                    )
+                    depth_valid_pixels = depth_weight.sum()
+                    depth_valid_ratio = depth_weight.mean()
+                    for key, value in (
+                        ("depth_inv_l1", depth_inv_l1),
+                        ("depth_valid_pixels", depth_valid_pixels),
+                        ("depth_valid_ratio", depth_valid_ratio),
+                    ):
+                        metrics[key].append(value)
+                        image_metrics[key] = value
+
+                if artifact_writer is not None:
+                    source_index = int(data["source_index"].item())
+                    final_colors = None
+                    final_label = None
+                    if bilateral_colors is not None:
+                        final_colors = bilateral_colors
+                        final_label = "Bilateral"
+                    elif ppisp_colors is not None:
+                        final_colors = ppisp_colors
+                        final_label = "PPISP"
+                    artifact_writer.write(
+                        EvalArtifact(
+                            split=split,
+                            image_name=self.parser.image_names[source_index],
+                            image_path=self.parser.image_paths[source_index],
+                            source_index=source_index,
+                            split_image_id=int(image_ids.item()),
+                            camera_id=int(camera_ids.item()),
+                            camera_model=int(data["camera_model"].item()),
+                            rig_frame_index=int(frame_ids.item()),
+                            target_rgb=pixels[0].cpu().numpy(),
+                            canonical_rgb=colors[0].cpu().numpy(),
+                            final_rgb=(
+                                final_colors[0].cpu().numpy()
+                                if final_colors is not None
+                                else None
+                            ),
+                            final_label=final_label,
+                            rendered_depth=depths[0, ..., 0].cpu().numpy(),
+                            target_depth=(
+                                depth_map_gt[0].cpu().numpy()
+                                if depth_map_gt is not None
+                                else None
+                            ),
+                            foreground_alpha=alphas[0, ..., 0].cpu().numpy(),
+                            valid_mask=(
+                                masks[0].cpu().numpy() if masks is not None else None
+                            ),
+                            sky_mask=(
+                                sky_masks[0].cpu().numpy()
+                                if sky_masks is not None
+                                else None
+                            ),
+                            metrics={
+                                key: float(value.item())
+                                for key, value in image_metrics.items()
+                            },
+                            intrinsics=Ks[0].cpu().numpy(),
+                            camtoworld=camtoworlds[0].cpu().numpy(),
+                            radial_coeffs=(
+                                radial_coeffs[0].cpu().numpy()
+                                if radial_coeffs is not None
+                                else None
+                            ),
+                            tangential_coeffs=(
+                                tangential_coeffs[0].cpu().numpy()
+                                if tangential_coeffs is not None
+                                else None
+                            ),
+                        )
+                    )
 
         if world_rank != 0:
             return {}
@@ -2578,19 +2671,37 @@ class Runner:
         print("Running evaluation...")
         cfg = self.cfg
         world_rank = self.world_rank
+        artifact_variant = "model" if stage == "val" else stage
+        depth_max = self.trainset.depth_max
+        if depth_max is not None:
+            depth_max *= self.trainset.depth_world_scale
+        else:
+            depth_max = max(self.scene_scale * 4.0, 1.0)
+        artifact_writer = (
+            EvalArtifactWriter(
+                render_dir=Path(self.render_dir),
+                iteration=step,
+                completed_step=step + 1,
+                variant=artifact_variant,
+                depth_max=depth_max,
+                scene_scale=self.scene_scale,
+            )
+            if world_rank == 0
+            else None
+        )
         val_stats = {}
         if len(self.valset) > 0:
             val_stats = self._eval_dataset(
                 self.valset,
-                step,
-                stage,
+                "val",
                 apply_train_adjustment=False,
+                artifact_writer=artifact_writer,
             )
         train_stats = self._eval_dataset(
             self.train_evalset,
-            step,
             "train",
             apply_train_adjustment=True,
+            artifact_writer=artifact_writer,
         )
 
         if world_rank == 0:
@@ -2674,6 +2785,9 @@ class Runner:
                 )
             with open(f"{self.stats_dir}/{stage}_step{step:04d}.json", "w") as f:
                 json.dump(stats, f)
+            if artifact_writer is not None:
+                manifest_path = artifact_writer.finalize(stats)
+                print(f"Evaluation artifacts saved to {manifest_path}")
             self.train_logger.log("evaluation", step=step, stage=stage, **stats)
 
     @torch.no_grad()
