@@ -25,13 +25,11 @@ from datasets.traj import (
 from evaluation import masked_lpips, masked_psnr, masked_ssim
 from fused_ssim import FusedSSIMMap, fused_ssim
 from gaussian_models import (
-    SurfacePriorData,
-    build_surface_priors_knn_pca,
     clamp_sky_sh_colors,
     composite_sky,
     create_sky_splats_with_optimizers,
+    initialize_surface_priors_knn_pca,
 )
-from lidar_geometry import LidarSurfelField
 from torch import Tensor
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torchmetrics.image import StructuralSimilarityIndexMeasure
@@ -492,12 +490,13 @@ class Config:
 
     # Enable depth loss. (experimental)
     depth_loss: bool = False
+    # Optional same-layout directory of LFS uint16 camera-Z depth PNGs. When
+    # unset, depth_loss retains the legacy sparse COLMAP-track supervision.
+    depth_dir: Optional[str] = None
+    # Camera-Z value represented by uint16 65535. None reads data_dir/report.json.
+    depth_max: Optional[float] = None
     # Weight for depth loss
     depth_lambda: float = 1e-2
-
-    # Penalize expected Gaussian distance to nearby LiDAR surface planes.
-    geometry_enabled: bool = False
-    geometry_lambda: float = 0.10
 
     # Append training metrics to <result_dir>/train.log every this many steps.
     # Set to 0 to disable periodic training metric records.
@@ -678,15 +677,7 @@ def create_splats_with_optimizers(
     device: str = "cuda",
     world_rank: int = 0,
     world_size: int = 1,
-    return_surface_priors: bool = False,
-) -> Union[
-    Tuple[torch.nn.ParameterDict, Dict[str, torch.optim.Optimizer]],
-    Tuple[
-        torch.nn.ParameterDict,
-        Dict[str, torch.optim.Optimizer],
-        Optional[SurfacePriorData],
-    ],
-]:
+) -> Tuple[torch.nn.ParameterDict, Dict[str, torch.optim.Optimizer]]:
     if init_scale <= 0.0:
         raise ValueError("init_scale must be positive")
     if not 0.0 < init_opacity < 1.0:
@@ -712,11 +703,10 @@ def create_splats_with_optimizers(
     else:
         raise ValueError("Please specify a correct init_type: sfm, random, or lidar")
 
-    surface_priors = None
     if init_use_knn_pca:
         if init_type != "lidar":
             raise ValueError("KNN-PCA initialization currently requires init_type=lidar")
-        surface_priors = build_surface_priors_knn_pca(
+        quats, actual_scales, accepted_count = initialize_surface_priors_knn_pca(
             points,
             k=knn_pca_k,
             local_scale_factor=init_scale,
@@ -724,9 +714,6 @@ def create_splats_with_optimizers(
             planarity_threshold=knn_pca_planarity_threshold,
             curvature_threshold=knn_pca_curvature_threshold,
         )
-        quats = surface_priors.rotations
-        actual_scales = surface_priors.scales
-        accepted_count = surface_priors.accepted_count
         scales = torch.log(actual_scales)
         print(
             f"KNN-PCA surface initialization: {accepted_count}/{len(points)} "
@@ -796,8 +783,6 @@ def create_splats_with_optimizers(
         )
         for name, _, lr in params
     }
-    if return_surface_priors:
-        return splats, optimizers, surface_priors
     return splats, optimizers
 
 
@@ -820,12 +805,13 @@ class Runner:
             raise ValueError("sky_enabled and random_bkgd cannot be used together")
         if cfg.init_use_knn_pca and cfg.init_type != "lidar":
             raise ValueError("KNN-PCA initialization currently requires init_type=lidar")
-        if cfg.geometry_enabled and not cfg.init_use_knn_pca:
-            raise ValueError("geometry_enabled requires init_use_knn_pca")
-        if cfg.geometry_enabled and cfg.init_type != "lidar":
-            raise ValueError("geometry_enabled requires init_type=lidar")
-        if cfg.geometry_lambda < 0.0:
-            raise ValueError("geometry_lambda must be non-negative")
+        if cfg.depth_lambda < 0.0:
+            raise ValueError("depth_lambda must be non-negative")
+        if cfg.depth_loss and cfg.depth_dir is not None and not cfg.keep_distortion:
+            raise ValueError(
+                "depth_dir sidecars require keep_distortion=True because they are "
+                "aligned to the original image domain"
+            )
         if cfg.sky_alpha_lambda < 0.0:
             raise ValueError("sky_alpha_lambda must be non-negative")
         if cfg.calib_opt and not cfg.keep_distortion:
@@ -940,6 +926,8 @@ class Runner:
             split="train",
             patch_size=cfg.patch_size,
             load_depths=cfg.depth_loss,
+            depth_dir=cfg.depth_dir,
+            depth_max=cfg.depth_max,
         )
         self.valset = dataset_cls(self.parser, split="val")
         if cfg.rig_opt:
@@ -992,7 +980,7 @@ class Runner:
 
         # Model
         feature_dim = 32 if cfg.app_opt else None
-        self.splats, self.optimizers, surface_priors = create_splats_with_optimizers(
+        self.splats, self.optimizers = create_splats_with_optimizers(
             self.parser,
             init_type=cfg.init_type,
             init_num_pts=cfg.init_num_pts,
@@ -1020,7 +1008,6 @@ class Runner:
             device=self.device,
             world_rank=world_rank,
             world_size=world_size,
-            return_surface_priors=True,
         )
         print("Model initialized. Number of GS:", len(self.splats["means"]))
 
@@ -1063,20 +1050,6 @@ class Runner:
                 raise ValueError("MRNFStrategy does not support packed rasterization")
             if world_size > 1:
                 raise ValueError("MRNFStrategy does not support distributed rasterization")
-
-        self.lidar_surface = None
-        if cfg.geometry_enabled:
-            if surface_priors is None:
-                raise RuntimeError("Surface priors were not created during initialization")
-            self.lidar_surface = LidarSurfelField(
-                surface_priors, device=torch.device(self.device)
-            )
-            print(
-                "LiDAR surfel geometry initialized: "
-                f"{self.lidar_surface.num_surfels} surfels from "
-                f"{self.lidar_surface.num_reliable_points} reliable points; "
-                f"voxel={self.lidar_surface.voxel_size:.4f}"
-            )
 
         # Compression Strategy
         self.compression_method = None
@@ -1748,8 +1721,13 @@ class Runner:
                 else None
             )
             if cfg.depth_loss:
-                points = data["points"].to(device)  # [1, M, 2]
-                depths_gt = data["depths"].to(device)  # [1, M]
+                if "depth" in data:
+                    depth_map_gt = data["depth"].to(device)  # [1, H, W]
+                    points = depths_gt = None
+                else:
+                    depth_map_gt = None
+                    points = data["points"].to(device)  # [1, M, 2]
+                    depths_gt = data["depths"].to(device)  # [1, M]
 
             height, width = pixels.shape[1:3]
             stage = self._camera_stage(step)
@@ -1887,23 +1865,50 @@ class Runner:
                 ppisp_reg_loss = self.ppisp.get_regularization_loss()
                 loss += ppisp_reg_loss
             if cfg.depth_loss:
-                # query depths from depth map
-                points = torch.stack(
-                    [
-                        points[:, :, 0] / (width - 1) * 2 - 1,
-                        points[:, :, 1] / (height - 1) * 2 - 1,
-                    ],
-                    dim=-1,
-                )  # normalize to [-1, 1]
-                grid = points.unsqueeze(2)  # [1, M, 1, 2]
-                depths = F.grid_sample(
-                    depths.permute(0, 3, 1, 2), grid, align_corners=True
-                )  # [1, 1, M, 1]
-                depths = depths.squeeze(3).squeeze(1)  # [1, M]
-                # calculate loss in disparity space
-                disp = torch.where(depths > 0.0, 1.0 / depths, torch.zeros_like(depths))
-                disp_gt = 1.0 / depths_gt  # [1, M]
-                depthloss = F.l1_loss(disp, disp_gt) * self.scene_scale
+                if depth_map_gt is not None:
+                    rendered_depth = depths.squeeze(-1)
+                    depth_valid = depth_map_gt > 0.0
+                    if masks is not None:
+                        depth_valid &= masks
+                    rendered_disp = torch.where(
+                        rendered_depth > 0.0,
+                        rendered_depth.clamp_min(1e-8).reciprocal(),
+                        torch.zeros_like(rendered_depth),
+                    )
+                    target_disp = torch.where(
+                        depth_valid,
+                        depth_map_gt.clamp_min(1e-8).reciprocal(),
+                        torch.zeros_like(depth_map_gt),
+                    )
+                    depth_weight = depth_valid.to(rendered_depth.dtype)
+                    depthloss = (
+                        ((rendered_disp - target_disp).abs() * depth_weight).sum()
+                        / depth_weight.sum().clamp_min(1.0)
+                        * self.scene_scale
+                    )
+                else:
+                    assert points is not None and depths_gt is not None
+                    # Query rendered depths at projected COLMAP tracks.
+                    points = torch.stack(
+                        [
+                            points[:, :, 0] / (width - 1) * 2 - 1,
+                            points[:, :, 1] / (height - 1) * 2 - 1,
+                        ],
+                        dim=-1,
+                    )  # normalize to [-1, 1]
+                    grid = points.unsqueeze(2)  # [1, M, 1, 2]
+                    sampled_depths = F.grid_sample(
+                        depths.permute(0, 3, 1, 2), grid, align_corners=True
+                    )  # [1, 1, M, 1]
+                    sampled_depths = sampled_depths.squeeze(3).squeeze(1)  # [1, M]
+                    # Calculate loss in disparity space.
+                    disp = torch.where(
+                        sampled_depths > 0.0,
+                        sampled_depths.clamp_min(1e-8).reciprocal(),
+                        torch.zeros_like(sampled_depths),
+                    )
+                    disp_gt = depths_gt.clamp_min(1e-8).reciprocal()  # [1, M]
+                    depthloss = F.l1_loss(disp, disp_gt) * self.scene_scale
                 loss += depthloss * cfg.depth_lambda
             if cfg.use_bilateral_grid:
                 tvloss = 10 * total_variation_loss(self.bil_grids.grids)
@@ -1914,28 +1919,6 @@ class Runner:
                 loss += cfg.opacity_reg * torch.sigmoid(self.splats["opacities"]).mean()
             if cfg.scale_reg > 0.0:
                 loss += cfg.scale_reg * torch.exp(self.splats["scales"]).mean()
-            geometry_loss = torch.zeros_like(l1loss)
-            geometry_stats: Dict[str, Tensor] = {}
-            if self.lidar_surface is not None:
-                if cfg.packed:
-                    geometry_visible = torch.zeros(
-                        len(self.splats["means"]), dtype=torch.bool, device=device
-                    )
-                    geometry_visible[info["gaussian_ids"]] = True
-                else:
-                    geometry_visible = (info["radii"] > 0).all(-1).any(0)
-                compute_geometry_stats = (
-                    world_rank == 0
-                    and cfg.log_every > 0
-                    and step % cfg.log_every == 0
-                )
-                geometry_loss, geometry_stats = self.lidar_surface.compute_loss(
-                    self.splats,
-                    geometry_visible,
-                    step=step,
-                    compute_stats=compute_geometry_stats,
-                )
-                loss += cfg.geometry_lambda * geometry_loss
             sky_alpha_loss = torch.zeros_like(l1loss)
             if (
                 self.sky_splats is not None
@@ -2007,8 +1990,6 @@ class Runner:
                 desc += f"sky alpha={sky_alpha_loss.item():.4f}| "
             if cfg.depth_loss:
                 desc += f"depth loss={depthloss.item():.6f}| "
-            if self.lidar_surface is not None:
-                desc += f"geometry={geometry_loss.item():.4f}| "
             if self.ppisp is not None:
                 desc += f"ppisp reg={ppisp_reg_loss.item():.4f}| "
             if cfg.pose_opt and cfg.pose_noise:
@@ -2087,11 +2068,6 @@ class Runner:
                     metrics["num_sky_gaussians"] = len(self.sky_splats["means"])
                 if cfg.depth_loss:
                     metrics["depth_loss"] = depthloss.item()
-                if self.lidar_surface is not None:
-                    metrics["geometry_loss"] = geometry_loss.item()
-                    metrics["geometry_weight"] = cfg.geometry_lambda
-                    for name, value in geometry_stats.items():
-                        metrics[f"geometry/{name}"] = value
                 if cfg.use_bilateral_grid:
                     metrics["tv_loss"] = tvloss.item()
                 if self.ppisp is not None:

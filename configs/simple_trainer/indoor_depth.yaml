@@ -1,7 +1,7 @@
 preset: mrnf
 
-# Generated for examples/simple_trainer.py.
-data_dir: "/home/wuyou/3dgeer/data/park"
+# Indoor fisheye training with LiDAR Z-depth sidecar supervision.
+data_dir: "/home/wuyou/remote/preprocess/output/indoor"
 data_factor: 4
 test_every: 8
 use_test_split: false
@@ -9,7 +9,7 @@ normalize_world_space: false
 log_every: 100
 log_loss_window: 100
 
-result_dir: results/0831/park_mrnf
+result_dir: results/0831/indoor_depth
 disable_viewer: true
 disable_video: true
 
@@ -32,7 +32,7 @@ with_ut: false
 with_eval3d: true
 
 init_type: lidar
-init_lidar_path: "/home/wuyou/3dgeer/data/park/lidar.ply"
+init_lidar_path: "/home/wuyou/remote/preprocess/output/indoor/lidar.ply"
 init_opa: 0.1
 init_scale: 1.0
 init_use_knn_pca: true
@@ -40,6 +40,11 @@ knn_pca_k: 24
 knn_pca_normal_scale_factor: 0.25
 knn_pca_planarity_threshold: 0.30
 knn_pca_curvature_threshold: 0.10
+
+# Supervise rendered camera-space Z from the LiDAR depth sidecars.
+depth_loss: true
+depth_dir: depth
+depth_lambda: 0.01
 
 sky_enabled: false
 sky_mask_dir: sky_masks

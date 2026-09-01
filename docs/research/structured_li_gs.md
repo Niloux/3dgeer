@@ -2,6 +2,10 @@
 
 调研日期：2026-08-28
 
+> 状态更新（2026-08-31）：下述 `geometry_enabled` surfel loss 已被外部 LiDAR
+> Z-depth 图监督取代并从训练代码删除。当前方案与数据审计见
+> [LichtFeld Studio 深度约束方案调研](lichtfeld_studio_depth_supervision.md)。
+
 ## 结论摘要
 
 Structured-Li-GS 的正式题名是 **Structured-Li-GS: Structured 3D Gaussians

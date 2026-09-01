@@ -1,5 +1,4 @@
 import math
-from dataclasses import dataclass
 from typing import Dict, Tuple
 
 import cv2
@@ -13,19 +12,6 @@ from utils import rgb_to_sh
 
 _SH_C0 = 0.28209479177387814
 _SKY_COLOR_MIN = 1.0 / 255.0
-
-
-@dataclass
-class SurfacePriorData:
-    """KNN-PCA surface attributes shared by initialization and regularization."""
-
-    rotations: Tensor
-    scales: Tensor
-    normals: Tensor
-    confidence: Tensor
-    radius: Tensor
-    accepted_count: int
-    points_cpu: np.ndarray
 
 
 def rotation_matrix_to_quaternion(rotation: Tensor) -> Tensor:
@@ -81,7 +67,7 @@ def rotation_matrix_to_quaternion(rotation: Tensor) -> Tensor:
 
 
 @torch.no_grad()
-def build_surface_priors_knn_pca(
+def initialize_surface_priors_knn_pca(
     points: Tensor,
     *,
     k: int,
@@ -89,8 +75,8 @@ def build_surface_priors_knn_pca(
     normal_scale_factor: float,
     planarity_threshold: float,
     curvature_threshold: float,
-) -> SurfacePriorData:
-    """Build reusable surface attributes and aligned Gaussian initialization."""
+) -> Tuple[Tensor, Tensor, int]:
+    """Build surface-aligned quaternions and scales from local KNN-PCA."""
     if points.ndim != 2 or points.shape[1] != 3:
         raise ValueError(f"Expected points with shape [N, 3], got {points.shape}")
     if k < 4:
@@ -109,26 +95,14 @@ def build_surface_priors_knn_pca(
     min_scale = 1e-6
     rotations = torch.zeros((num_points, 4), dtype=dtype, device=device)
     rotations[:, 0] = 1.0
-    normals = torch.zeros((num_points, 3), dtype=dtype, device=device)
-    normals[:, 2] = 1.0
-    confidence = torch.zeros(num_points, dtype=dtype, device=device)
-    radius = torch.full((num_points,), min_scale, dtype=dtype, device=device)
-    points_cpu = np.ascontiguousarray(points.detach().float().cpu().numpy())
     if num_points < 4:
         scales = torch.full(
             (num_points, 3), min_scale, dtype=dtype, device=device
         )
-        return SurfacePriorData(
-            rotations=rotations,
-            scales=scales,
-            normals=normals,
-            confidence=confidence,
-            radius=radius,
-            accepted_count=0,
-            points_cpu=points_cpu,
-        )
+        return rotations, scales, 0
 
     k_eff = min(k, num_points)
+    points_cpu = np.ascontiguousarray(points.detach().float().cpu().numpy())
     neighbors_model = NearestNeighbors(
         n_neighbors=k_eff,
         metric="euclidean",
@@ -168,23 +142,6 @@ def build_surface_priors_knn_pca(
         valid = (planarity >= planarity_threshold) & (
             curvature <= curvature_threshold
         )
-        planarity_denom = max(1.0 - planarity_threshold, float(eps))
-        planarity_score = (
-            (planarity - planarity_threshold) / planarity_denom
-        ).clamp(0.0, 1.0)
-        if curvature_threshold > 0.0:
-            curvature_score = (1.0 - curvature / curvature_threshold).clamp(
-                0.0, 1.0
-            )
-        else:
-            curvature_score = (curvature <= 0.0).to(dtype)
-        confidence[start:end] = torch.where(
-            valid, planarity_score * curvature_score, 0.0
-        )
-        normals[start:end] = rotation_matrix[:, :, 2]
-        radius[start:end] = torch.from_numpy(distances[:, -1]).to(
-            device=device, dtype=dtype
-        ).clamp_min(min_scale)
 
         quaternions = rotation_matrix_to_quaternion(rotation_matrix)
         tangent_minor = torch.sqrt(lambda1.clamp_min(eps))
@@ -217,37 +174,7 @@ def build_surface_priors_knn_pca(
         )
         accepted_count += int(valid.sum().item())
 
-    return SurfacePriorData(
-        rotations=rotations,
-        scales=actual_scales,
-        normals=normals,
-        confidence=confidence,
-        radius=radius,
-        accepted_count=accepted_count,
-        points_cpu=points_cpu,
-    )
-
-
-@torch.no_grad()
-def initialize_surface_priors_knn_pca(
-    points: Tensor,
-    *,
-    k: int,
-    local_scale_factor: float,
-    normal_scale_factor: float,
-    planarity_threshold: float,
-    curvature_threshold: float,
-) -> Tuple[Tensor, Tensor, int]:
-    """Backward-compatible surface-aligned quaternion/scale initialization."""
-    priors = build_surface_priors_knn_pca(
-        points,
-        k=k,
-        local_scale_factor=local_scale_factor,
-        normal_scale_factor=normal_scale_factor,
-        planarity_threshold=planarity_threshold,
-        curvature_threshold=curvature_threshold,
-    )
-    return priors.rotations, priors.scales, priors.accepted_count
+    return rotations, actual_scales, accepted_count
 
 
 def sky_hemisphere(

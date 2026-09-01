@@ -46,6 +46,88 @@ def _resolve_sky_mask_path(mask_dir: str, image_name: str) -> str:
     )
 
 
+def _resolve_depth_path(depth_dir: str, image_name: str) -> str:
+    """Resolve an image name to its same-layout PNG depth sidecar."""
+    relative = os.path.splitext(image_name)[0] + ".png"
+    path = os.path.join(depth_dir, relative)
+    if not os.path.isfile(path):
+        raise FileNotFoundError(
+            f"Depth map for COLMAP image {image_name!r} was not found at {path!r}"
+        )
+    return path
+
+
+def _infer_lfs_depth_max(data_dir: str) -> float:
+    """Read the uint16 depth encoding range emitted by the preprocessing pipeline."""
+    report_path = os.path.join(data_dir, "report.json")
+    if not os.path.isfile(report_path):
+        raise ValueError(
+            "depth_max must be provided when the dataset has no report.json"
+        )
+    with open(report_path) as stream:
+        report = json.load(stream)
+    candidates = (
+        report.get("lidar_initialization", {})
+        .get("supervision_maps", {})
+        .get("depth", {})
+        .get("z_max_m"),
+        report.get("settings", {}).get("lidar_max_camera_distance_m"),
+    )
+    depth_max = next((value for value in candidates if value is not None), None)
+    if depth_max is None:
+        raise ValueError(
+            f"Cannot infer depth_max from {report_path}; set it explicitly"
+        )
+    depth_max = float(depth_max)
+    if not math.isfinite(depth_max) or depth_max <= 0.0:
+        raise ValueError(f"depth_max must be finite and positive, got {depth_max}")
+    return depth_max
+
+
+def _downsample_sparse_depth(
+    encoded: np.ndarray, output_shape: tuple[int, int]
+) -> np.ndarray:
+    """Downsample a sparse z-buffer while retaining the nearest valid sample."""
+    output_height, output_width = output_shape
+    if encoded.shape == output_shape:
+        return encoded
+
+    source_height, source_width = encoded.shape
+    if (
+        source_height < output_height
+        or source_width < output_width
+        or source_height % output_height != 0
+        or source_width % output_width != 0
+        or source_height // output_height != source_width // output_width
+    ):
+        raise ValueError(
+            "Depth and training image sizes must differ by the same integer "
+            f"factor, got {encoded.shape} and {output_shape}"
+        )
+
+    ys, xs = np.nonzero(encoded)
+    output = np.zeros(output_height * output_width, dtype=np.uint16)
+    if len(xs) == 0:
+        return output.reshape(output_shape)
+
+    output_xs = np.floor((xs + 0.5) * output_width / source_width).astype(
+        np.int64
+    )
+    output_ys = np.floor((ys + 0.5) * output_height / source_height).astype(
+        np.int64
+    )
+    np.clip(output_xs, 0, output_width - 1, out=output_xs)
+    np.clip(output_ys, 0, output_height - 1, out=output_ys)
+    output_indices = output_ys * output_width + output_xs
+
+    # uint16 value 65535 is valid, so use a wider sentinel while reducing.
+    nearest = np.full(output.size, 65536, dtype=np.uint32)
+    np.minimum.at(nearest, output_indices, encoded[ys, xs].astype(np.uint32))
+    valid = nearest <= 65535
+    output[valid] = nearest[valid].astype(np.uint16)
+    return output.reshape(output_shape)
+
+
 def _frame_key(image_name: str):
     """Return a rig frame key for names such as ``*_00063-L.png``."""
     match = re.search(r"_(\d+)-[A-Za-z](?:\.[^.]+)?$", image_name)
@@ -543,11 +625,46 @@ class Dataset:
         split: str = "train",
         patch_size: Optional[int] = None,
         load_depths: bool = False,
+        depth_dir: Optional[str] = None,
+        depth_max: Optional[float] = None,
     ):
         self.parser = parser
         self.split = split
         self.patch_size = patch_size
         self.load_depths = load_depths
+        self.depth_paths: Optional[List[str]] = None
+        self.depth_max = None
+        self.depth_world_scale = 1.0
+        if load_depths and depth_dir is not None:
+            if parser.undistort:
+                raise ValueError(
+                    "Depth sidecars are in the original distorted image domain; "
+                    "set undistort=False (simple_trainer: keep_distortion=true)"
+                )
+            if not os.path.isabs(depth_dir):
+                depth_dir = os.path.join(parser.data_dir, depth_dir)
+            if not os.path.isdir(depth_dir):
+                raise FileNotFoundError(f"Depth directory does not exist: {depth_dir}")
+            self.depth_paths = [
+                _resolve_depth_path(depth_dir, name) for name in parser.image_names
+            ]
+            self.depth_max = (
+                _infer_lfs_depth_max(parser.data_dir)
+                if depth_max is None
+                else float(depth_max)
+            )
+            if not math.isfinite(self.depth_max) or self.depth_max <= 0.0:
+                raise ValueError(
+                    f"depth_max must be finite and positive, got {self.depth_max}"
+                )
+            transform_scale = np.linalg.norm(parser.transform[:3, :3], axis=0)
+            if not np.allclose(transform_scale, transform_scale[0], rtol=1e-5):
+                raise ValueError("Depth maps require a similarity world transform")
+            self.depth_world_scale = float(transform_scale.mean())
+            print(
+                f"[Dataset] Loading Z-depth maps from {depth_dir}; "
+                f"uint16 range={self.depth_max:g} m"
+            )
         indices = np.arange(len(self.parser.image_names))
         if not self.parser.use_test_split:
             self.indices = indices if split == "train" else indices[:0]
@@ -562,6 +679,30 @@ class Dataset:
     def __getitem__(self, item: int) -> Dict[str, Any]:
         index = self.indices[item]
         image = imageio.imread(self.parser.image_paths[index])[..., :3]
+        depth = None
+        if self.depth_paths is not None:
+            encoded_depth = cv2.imread(
+                self.depth_paths[index], cv2.IMREAD_UNCHANGED
+            )
+            if encoded_depth is None:
+                raise OSError(f"Failed to read depth map: {self.depth_paths[index]}")
+            if encoded_depth.dtype != np.uint16 or encoded_depth.ndim != 2:
+                raise ValueError(
+                    f"Expected a single-channel uint16 depth PNG, got "
+                    f"dtype={encoded_depth.dtype}, shape={encoded_depth.shape}: "
+                    f"{self.depth_paths[index]}"
+                )
+            encoded_depth = _downsample_sparse_depth(
+                encoded_depth, image.shape[:2]
+            )
+            valid_depth = encoded_depth > 0
+            depth = np.zeros(encoded_depth.shape, dtype=np.float32)
+            depth[valid_depth] = (
+                (encoded_depth[valid_depth].astype(np.float32) - 1.0)
+                / 65534.0
+                * self.depth_max
+                * self.depth_world_scale
+            )
         camera_id = self.parser.camera_ids[index]
         K = self.parser.Ks_dict[camera_id].copy()  # undistorted K
         params = self.parser.params_dict[camera_id]
@@ -636,6 +777,8 @@ class Dataset:
                 sky_mask = sky_mask[
                     y : y + self.patch_size, x : x + self.patch_size
                 ]
+            if depth is not None:
+                depth = depth[y : y + self.patch_size, x : x + self.patch_size]
             K[0, 2] -= x
             K[1, 2] -= y
 
@@ -672,27 +815,33 @@ class Dataset:
                 )
 
         if self.load_depths:
-            # projected points to image plane to get depths
-            worldtocams = np.linalg.inv(camtoworlds)
-            image_name = self.parser.image_names[index]
-            point_indices = self.parser.point_indices[image_name]
-            points_world = self.parser.points[point_indices]
-            points_cam = (worldtocams[:3, :3] @ points_world.T + worldtocams[:3, 3:4]).T
-            points_proj = (K @ points_cam.T).T
-            points = points_proj[:, :2] / points_proj[:, 2:3]  # (M, 2)
-            depths = points_cam[:, 2]  # (M,)
-            # filter out points outside the image
-            selector = (
-                (points[:, 0] >= 0)
-                & (points[:, 0] < image.shape[1])
-                & (points[:, 1] >= 0)
-                & (points[:, 1] < image.shape[0])
-                & (depths > 0)
-            )
-            points = points[selector]
-            depths = depths[selector]
-            data["points"] = torch.from_numpy(points).float()
-            data["depths"] = torch.from_numpy(depths).float()
+            if depth is not None:
+                data["depth"] = torch.from_numpy(depth).float()
+            else:
+                # Projected COLMAP tracks provide the legacy sparse-depth path.
+                worldtocams = np.linalg.inv(camtoworlds)
+                image_name = self.parser.image_names[index]
+                point_indices = self.parser.point_indices[image_name]
+                points_world = self.parser.points[point_indices]
+                points_cam = (
+                    worldtocams[:3, :3] @ points_world.T
+                    + worldtocams[:3, 3:4]
+                ).T
+                points_proj = (K @ points_cam.T).T
+                points = points_proj[:, :2] / points_proj[:, 2:3]  # (M, 2)
+                depths = points_cam[:, 2]  # (M,)
+                # filter out points outside the image
+                selector = (
+                    (points[:, 0] >= 0)
+                    & (points[:, 0] < image.shape[1])
+                    & (points[:, 1] >= 0)
+                    & (points[:, 1] < image.shape[0])
+                    & (depths > 0)
+                )
+                points = points[selector]
+                depths = depths[selector]
+                data["points"] = torch.from_numpy(points).float()
+                data["depths"] = torch.from_numpy(depths).float()
 
         return data
 
