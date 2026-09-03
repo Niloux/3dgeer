@@ -1,44 +1,39 @@
-preset: default
+preset: mrnf
 
-# 数据集
-data_dir: data/park_colmap
+# Generated for examples/simple_trainer.py.
+data_dir: "/home/wuyou/remote/preprocess/output/park/contextcapture"
 data_factor: 4
-frame_id_min: 63
-frame_id_max: 187
-test_every: 16
+test_every: 8
+use_test_split: false
+normalize_world_space: false
+log_every: 100
+log_loss_window: 100
 
-# 输出与运行
-result_dir: results/park_default1549_knn_pca_sky
+result_dir: results/0903/park_geo
 disable_viewer: true
 disable_video: true
 
-# 相机与畸变
 camera_model: fisheye
 keep_distortion: true
-max_fisheye_fov: 178.0
+max_fisheye_fov: 160
 
-# 训练步数
 max_steps: 15000
-
-# 评估与保存
-eval_steps: [3000, 7000, 15000, 30000]
-save_steps: [7000, 15000, 30000]
+eval_steps: [3000, 7000, 10000, 15000, 20000, 30000]
+save_steps: [3000, 7000, 10000, 15000, 20000, 30000]
 save_ply: true
-ply_steps: [7000, 15000, 30000]
+ply_steps: [3000, 7000, 10000, 15000, 20000, 30000]
 
-# 外观与损失
 sh_degree: 0
+# Keep the full SH representation for training, but save only the DC term in PLY.
+ply_sh_degree: 0
 ssim_lambda: 0.2
-
-# 渲染后端（二选一：GEER 或 3DGUT）
 with_geer: true
 with_ut: false
 with_eval3d: true
 
-# Gaussian 初始化
 init_type: lidar
-init_lidar_path: data/park_colmap/lidar.ply
-init_opa: 0.1
+init_lidar_path: "/home/wuyou/remote/preprocess/output/park/contextcapture/lidar.ply"
+init_opa: 0.5
 init_scale: 1.0
 init_use_knn_pca: true
 knn_pca_k: 24
@@ -46,9 +41,8 @@ knn_pca_normal_scale_factor: 0.25
 knn_pca_planarity_threshold: 0.30
 knn_pca_curvature_threshold: 0.10
 
-# 天空单独建模（几何固定，仅优化 SH）
 sky_enabled: true
-sky_mask_dir: semantic_masks/sky
+sky_mask_dir: sky_masks
 sky_num_points: 100000
 sky_radius: 10000.0
 sky_initial_opacity: 0.7
@@ -56,18 +50,46 @@ sky_sh0_lr: 0.0025
 sky_shN_lr: 0.000125
 sky_alpha_lambda: 0.1
 
-# 正则化
-opacity_reg: 0.0
+opacities_lr: 0.012
+opacity_reg: 0.003
 scale_reg: 0.0
+means_lr: 2.0e-5
+means_lr_end: 2.0e-7
 
-# 增密策略
 strategy:
-  absgrad: true
+  grow_error_threshold: 0.003
+  grow_fraction: 0.07
+  refine_start_iter: 0
+  grow_until_iter: 15000
+  refine_every: 200
   max_gaussians: 2000000
-  max_grow_per_refine: 100000
-  refine_stop_iter: 25000
-  refine_scale2d_stop_iter: 25000
+  refine_stop_iter: 28500
+  bounds_percentile: 0.8
+  opacity_decay: 0.004
+  scale_decay: 0.002
+  max_screen_share: 0.3
+  oversize_split_fraction: 0.15
+  # LichtFeld's baseline profile ranks growth by raw attributed error.
+  use_visibility_ratio: false
+  visibility_power: 0.75
 
-  # cap_max: 3000000
-  # noise_lr: 5e3
-  # verbose: true
+densification_start_step: 3001
+
+depth_loss: false
+depth_dir: depth
+depth_lambda: 0.01
+# Direct 3D LiDAR surfel supervision; no depth maps are loaded.
+geometry_enabled: true
+geometry_lambda: 0.03
+
+pose_opt: true
+pose_opt_start_step: 500
+pose_opt_lr: 1.0e-4
+
+calib_opt: false
+calib_opt_reg: 1e-6
+
+app_opt: false
+
+use_bilateral_grid: true
+bilateral_grid_shape: [16, 16, 8]

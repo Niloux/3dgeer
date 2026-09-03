@@ -1,4 +1,5 @@
 import math
+from dataclasses import dataclass
 from typing import Dict, Tuple
 
 import cv2
@@ -12,6 +13,22 @@ from utils import rgb_to_sh
 
 _SH_C0 = 0.28209479177387814
 _SKY_COLOR_MIN = 1.0 / 255.0
+
+
+@dataclass
+class SurfacePriorData:
+    """Reusable LiDAR surface attributes produced by KNN-PCA."""
+
+    rotations: Tensor
+    scales: Tensor
+    centroids: Tensor
+    normals: Tensor
+    confidence: Tensor
+    radius: Tensor
+    local_scale: Tensor
+    normal_scale: Tensor
+    accepted_count: int
+    points_cpu: np.ndarray
 
 
 def rotation_matrix_to_quaternion(rotation: Tensor) -> Tensor:
@@ -67,7 +84,7 @@ def rotation_matrix_to_quaternion(rotation: Tensor) -> Tensor:
 
 
 @torch.no_grad()
-def initialize_surface_priors_knn_pca(
+def build_surface_priors_knn_pca(
     points: Tensor,
     *,
     k: int,
@@ -75,8 +92,8 @@ def initialize_surface_priors_knn_pca(
     normal_scale_factor: float,
     planarity_threshold: float,
     curvature_threshold: float,
-) -> Tuple[Tensor, Tensor, int]:
-    """Build surface-aligned quaternions and scales from local KNN-PCA."""
+) -> SurfacePriorData:
+    """Build reusable local planes and surface-aligned Gaussian priors."""
     if points.ndim != 2 or points.shape[1] != 3:
         raise ValueError(f"Expected points with shape [N, 3], got {points.shape}")
     if k < 4:
@@ -95,14 +112,36 @@ def initialize_surface_priors_knn_pca(
     min_scale = 1e-6
     rotations = torch.zeros((num_points, 4), dtype=dtype, device=device)
     rotations[:, 0] = 1.0
+    centroids = points.detach().clone()
+    normals = torch.zeros((num_points, 3), dtype=dtype, device=device)
+    normals[:, 2] = 1.0
+    confidence = torch.zeros(num_points, dtype=dtype, device=device)
+    radius = torch.full((num_points,), min_scale, dtype=dtype, device=device)
+    local_scale = torch.full(
+        (num_points,), min_scale, dtype=dtype, device=device
+    )
+    normal_scale = torch.full(
+        (num_points,), min_scale, dtype=dtype, device=device
+    )
+    points_cpu = np.ascontiguousarray(points.detach().float().cpu().numpy())
     if num_points < 4:
         scales = torch.full(
             (num_points, 3), min_scale, dtype=dtype, device=device
         )
-        return rotations, scales, 0
+        return SurfacePriorData(
+            rotations=rotations,
+            scales=scales,
+            centroids=centroids,
+            normals=normals,
+            confidence=confidence,
+            radius=radius,
+            local_scale=local_scale,
+            normal_scale=normal_scale,
+            accepted_count=0,
+            points_cpu=points_cpu,
+        )
 
     k_eff = min(k, num_points)
-    points_cpu = np.ascontiguousarray(points.detach().float().cpu().numpy())
     neighbors_model = NearestNeighbors(
         n_neighbors=k_eff,
         metric="euclidean",
@@ -116,7 +155,8 @@ def initialize_surface_priors_knn_pca(
         end = min(start + 65_536, num_points)
         distances, neighbor_indices = neighbors_model.kneighbors(points_cpu[start:end])
         neighbors = points_cpu[neighbor_indices]
-        centered = neighbors - neighbors.mean(axis=1, keepdims=True)
+        centroids_np = neighbors.mean(axis=1)
+        centered = neighbors - centroids_np[:, None, :]
         covariance = centered.transpose(0, 2, 1) @ centered / float(k_eff - 1)
         if not np.isfinite(covariance).all():
             raise ValueError("KNN-PCA covariance contains non-finite values")
@@ -142,6 +182,26 @@ def initialize_surface_priors_knn_pca(
         valid = (planarity >= planarity_threshold) & (
             curvature <= curvature_threshold
         )
+        planarity_denom = max(1.0 - planarity_threshold, float(eps))
+        planarity_score = (
+            (planarity - planarity_threshold) / planarity_denom
+        ).clamp(0.0, 1.0)
+        if curvature_threshold > 0.0:
+            curvature_score = (1.0 - curvature / curvature_threshold).clamp(
+                0.0, 1.0
+            )
+        else:
+            curvature_score = (curvature <= 0.0).to(dtype)
+        confidence[start:end] = torch.where(
+            valid, planarity_score * curvature_score, 0.0
+        )
+        centroids[start:end] = torch.from_numpy(centroids_np).to(
+            device=device, dtype=dtype
+        )
+        normals[start:end] = rotation_matrix[:, :, 2]
+        radius[start:end] = torch.from_numpy(distances[:, -1]).to(
+            device=device, dtype=dtype
+        ).clamp_min(min_scale)
 
         quaternions = rotation_matrix_to_quaternion(rotation_matrix)
         tangent_minor = torch.sqrt(lambda1.clamp_min(eps))
@@ -169,12 +229,49 @@ def initialize_surface_priors_knn_pca(
         actual_scales[start:end] = torch.where(
             valid[:, None], pca_scales, isotropic_scales
         )
+        local_scale[start:end] = torch.sqrt(
+            (pca_scales[:, 0] * pca_scales[:, 1]).clamp_min(min_scale**2)
+        )
+        normal_scale[start:end] = pca_scales[:, 2]
         rotations[start:end] = torch.where(
             valid[:, None], quaternions, rotations[start:end]
         )
         accepted_count += int(valid.sum().item())
 
-    return rotations, actual_scales, accepted_count
+    return SurfacePriorData(
+        rotations=rotations,
+        scales=actual_scales,
+        centroids=centroids,
+        normals=normals,
+        confidence=confidence,
+        radius=radius,
+        local_scale=local_scale,
+        normal_scale=normal_scale,
+        accepted_count=accepted_count,
+        points_cpu=points_cpu,
+    )
+
+
+@torch.no_grad()
+def initialize_surface_priors_knn_pca(
+    points: Tensor,
+    *,
+    k: int,
+    local_scale_factor: float,
+    normal_scale_factor: float,
+    planarity_threshold: float,
+    curvature_threshold: float,
+) -> Tuple[Tensor, Tensor, int]:
+    """Initialize Gaussians while preserving the original public return type."""
+    priors = build_surface_priors_knn_pca(
+        points,
+        k=k,
+        local_scale_factor=local_scale_factor,
+        normal_scale_factor=normal_scale_factor,
+        planarity_threshold=planarity_threshold,
+        curvature_threshold=curvature_threshold,
+    )
+    return priors.rotations, priors.scales, priors.accepted_count
 
 
 def sky_hemisphere(
