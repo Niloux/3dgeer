@@ -3,6 +3,8 @@ preset: mrnf
 # Generated for examples/simple_trainer.py.
 data_dir: "/home/wuyou/remote/preprocess/output/park/contextcapture"
 data_factor: 4
+data_factor_final: 2
+data_factor_switch_step: 12000
 test_every: 8
 use_test_split: false
 normalize_world_space: false

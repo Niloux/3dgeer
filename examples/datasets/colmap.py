@@ -151,30 +151,47 @@ def _combine_supervision_masks(
     return valid, sky
 
 
-def _resize_image_folder(image_dir: str, resized_dir: str, factor: int) -> str:
-    """Resize image folder."""
-    print(f"Downscaling images by {factor}x from {image_dir} to {resized_dir}.")
-    os.makedirs(resized_dir, exist_ok=True)
+_JPEG_EXTENSIONS = {".jpg", ".jpeg", ".jpe"}
+_JPEG_REDUCED_READ_FLAGS = {
+    2: cv2.IMREAD_REDUCED_COLOR_2,
+    4: cv2.IMREAD_REDUCED_COLOR_4,
+    8: cv2.IMREAD_REDUCED_COLOR_8,
+}
 
-    image_files = _get_rel_paths(image_dir)
-    for image_file in tqdm(image_files):
-        image_path = os.path.join(image_dir, image_file)
-        resized_path = os.path.join(
-            resized_dir, os.path.splitext(image_file)[0] + ".png"
+
+def _downsampled_image_size(
+    source_size: tuple[int, int], factor: int
+) -> tuple[int, int]:
+    """Return the target (width, height) using the legacy resize convention."""
+    width, height = source_size
+    return (
+        max(1, int(round(width / factor))),
+        max(1, int(round(height / factor))),
+    )
+
+
+def _load_image(
+    image_path: str, factor: int, target_size: tuple[int, int]
+) -> np.ndarray:
+    """Decode an RGB image at the requested size without creating a disk cache."""
+    decode_factor = 1
+    if os.path.splitext(image_path)[1].lower() in _JPEG_EXTENSIONS:
+        decode_factor = max(
+            (
+                candidate
+                for candidate in _JPEG_REDUCED_READ_FLAGS
+                if candidate <= factor
+            ),
+            default=1,
         )
-        if os.path.isfile(resized_path):
-            continue
-        os.makedirs(os.path.dirname(resized_path), exist_ok=True)
-        image = imageio.imread(image_path)[..., :3]
-        resized_size = (
-            int(round(image.shape[1] / factor)),
-            int(round(image.shape[0] / factor)),
-        )
-        resized_image = np.array(
-            Image.fromarray(image).resize(resized_size, Image.BICUBIC)
-        )
-        imageio.imwrite(resized_path, resized_image)
-    return resized_dir
+    read_flag = _JPEG_REDUCED_READ_FLAGS.get(decode_factor, cv2.IMREAD_COLOR)
+    read_flag |= cv2.IMREAD_IGNORE_ORIENTATION
+    image = cv2.imread(image_path, read_flag)
+    if image is None:
+        raise OSError(f"Failed to read image: {image_path}")
+    if image.shape[1::-1] != target_size:
+        image = cv2.resize(image, target_size, interpolation=cv2.INTER_AREA)
+    return cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
 
 def _fisheye_fov_mask(K, params, width: int, height: int, max_fov: float):
@@ -210,6 +227,8 @@ class Parser:
         sky_mask_dir: Optional[str] = None,
         use_test_split: bool = True,
     ):
+        if factor < 1:
+            raise ValueError("factor must be a positive integer")
         self.data_dir = data_dir
         self.factor = factor
         self.normalize = normalize
@@ -247,7 +266,6 @@ class Parser:
         Ks_dict = dict()
         params_dict = dict()
         imsize_dict = dict()  # width, height
-        mask_dict = dict()
         bottom = np.array([0, 0, 0, 1]).reshape(1, 4)
         for k in imdata:
             im = imdata[k]
@@ -264,7 +282,6 @@ class Parser:
             cam = manager.cameras[camera_id]
             fx, fy, cx, cy = cam.fx, cam.fy, cam.cx, cam.cy
             K = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]])
-            K[:2, :] /= factor
             Ks_dict[camera_id] = K
 
             # Get distortion parameters.
@@ -291,8 +308,7 @@ class Parser:
                 raise ValueError(f"Unsupported camera type: {type_}")
 
             params_dict[camera_id] = params
-            imsize_dict[camera_id] = (cam.width // factor, cam.height // factor)
-            mask_dict[camera_id] = None
+            imsize_dict[camera_id] = (cam.width, cam.height)
         print(
             f"[Parser] {len(imdata)} images, taken by {len(set(camera_ids))} cameras."
         )
@@ -360,34 +376,16 @@ class Parser:
         if os.path.exists(posefile):
             self.bounds = np.load(posefile)[:, -2:]
 
-        # Load images.
-        if factor > 1 and not self.extconf["no_factor_suffix"]:
-            image_dir_suffix = f"_{factor}"
-        else:
-            image_dir_suffix = ""
+        # Load original images. Downsampling happens on demand in Dataset so no
+        # generated images_<factor> directory is needed.
         colmap_image_dir = os.path.join(data_dir, "images")
-        image_dir = os.path.join(data_dir, "images" + image_dir_suffix)
+        image_dir = colmap_image_dir
         mask_dir = os.path.join(data_dir, "masks")
         has_masks = os.path.isdir(mask_dir)
         if not os.path.exists(colmap_image_dir):
             raise ValueError(f"Image folder {colmap_image_dir} does not exist.")
         colmap_files = sorted(_get_rel_paths(colmap_image_dir))
-        if not os.path.exists(image_dir):
-            if factor == 1:
-                raise ValueError(f"Image folder {image_dir} does not exist.")
-            image_dir = _resize_image_folder(colmap_image_dir, image_dir, factor)
-        elif factor > 1 and len(_get_rel_paths(image_dir)) < len(colmap_files):
-            image_dir = _resize_image_folder(colmap_image_dir, image_dir, factor)
-
-        # Downsampled images may have different names vs images used for COLMAP,
-        # so we need to map between the two sorted lists of files.
-        image_files = sorted(_get_rel_paths(image_dir))
-        if factor > 1 and os.path.splitext(image_files[0])[1].lower() == ".jpg":
-            image_dir = _resize_image_folder(
-                colmap_image_dir, image_dir + "_png", factor=factor
-            )
-            image_files = sorted(_get_rel_paths(image_dir))
-        colmap_to_image = dict(zip(colmap_files, image_files))
+        image_file_set = set(colmap_files)
 
         # Skip images referenced by COLMAP but missing on disk.
         kept_image_names = []
@@ -399,12 +397,11 @@ class Parser:
         skipped = []
 
         for name, camera_id, c2w in zip(image_names, camera_ids, camtoworlds):
-            rel_path = name if name in image_files else colmap_to_image.get(name, None)
-            if rel_path is None or rel_path not in image_files:
+            if name not in image_file_set:
                 skipped.append(name)
                 continue
             kept_image_names.append(name)
-            kept_image_paths.append(os.path.join(image_dir, rel_path))
+            kept_image_paths.append(os.path.join(image_dir, name))
             if has_masks:
                 mask_path = os.path.join(mask_dir, name + ".png")
                 if not os.path.isfile(mask_path):
@@ -497,36 +494,77 @@ class Parser:
             [frame_key_to_index[key] for key in frame_keys], dtype=np.int64
         )
         self.camera_models_dict = camera_models_dict  # Dict of camera_id -> camera_model (int)
-        self.Ks_dict = Ks_dict  # Dict of camera_id -> K
         self.params_dict = params_dict  # Dict of camera_id -> params
-        self.imsize_dict = imsize_dict  # Dict of camera_id -> (width, height)
-        self.mask_dict = mask_dict  # Dict of camera_id -> mask
+        self._base_Ks_dict = {
+            camera_id: K.copy() for camera_id, K in Ks_dict.items()
+        }
+        self._base_imsize_dict = dict(imsize_dict)
         self.points = points  # np.ndarray, (num_points, 3)
         self.points_err = points_err  # np.ndarray, (num_points,)
         self.points_rgb = points_rgb  # np.ndarray, (num_points, 3)
         self.point_indices = point_indices  # Dict[str, np.ndarray], image_name -> [M,]
         self.transform = transform  # np.ndarray, (4, 4)
 
-        # load one image to check the size. In the case of tanksandtemples dataset, the
-        # intrinsics stored in COLMAP corresponds to 2x upsampled images.
-        actual_image = imageio.imread(self.image_paths[0])[..., :3]
-        actual_height, actual_width = actual_image.shape[:2]
-        colmap_width, colmap_height = self.imsize_dict[self.camera_ids[0]]
-        s_height, s_width = actual_height / colmap_height, actual_width / colmap_width
-        for camera_id, K in self.Ks_dict.items():
-            K[0, :] *= s_width
-            K[1, :] *= s_height
-            self.Ks_dict[camera_id] = K
-            width, height = self.imsize_dict[camera_id]
-            self.imsize_dict[camera_id] = (int(width * s_width), int(height * s_height))
+        # Read only the image header to determine how source pixels relate to
+        # COLMAP's camera dimensions. This also covers datasets whose COLMAP
+        # intrinsics correspond to a differently sized image pyramid.
+        with Image.open(self.image_paths[0]) as actual_image:
+            actual_width, actual_height = actual_image.size
+        colmap_width, colmap_height = self._base_imsize_dict[self.camera_ids[0]]
+        source_scale_width = actual_width / colmap_width
+        source_scale_height = actual_height / colmap_height
+        self._source_imsize_dict = {
+            camera_id: (
+                max(1, int(round(width * source_scale_width))),
+                max(1, int(round(height * source_scale_height))),
+            )
+            for camera_id, (width, height) in self._base_imsize_dict.items()
+        }
+        self.set_image_factor(factor)
 
-        # undistortion
+        # size of the scene measured by cameras
+        camera_locations = camtoworlds[:, :3, 3]
+        scene_center = np.mean(camera_locations, axis=0)
+        dists = np.linalg.norm(camera_locations - scene_center, axis=1)
+        self.scene_scale = np.max(dists)
+
+    def set_image_factor(self, factor: int) -> None:
+        """Rebuild factor-dependent image geometry without reparsing COLMAP."""
+        if factor < 1:
+            raise ValueError("factor must be a positive integer")
+        self.factor = factor
+        self.image_downsample_factor = (
+            1 if self.extconf["no_factor_suffix"] else factor
+        )
+
+        self.Ks_dict = dict()
+        self.input_imsize_dict = dict()
+        for camera_id, base_K in self._base_Ks_dict.items():
+            base_width, base_height = self._base_imsize_dict[camera_id]
+            target_width, target_height = _downsampled_image_size(
+                self._source_imsize_dict[camera_id],
+                self.image_downsample_factor,
+            )
+            K = base_K.copy()
+            K[0, :] *= target_width / base_width
+            K[1, :] *= target_height / base_height
+            self.Ks_dict[camera_id] = K
+            self.input_imsize_dict[camera_id] = (target_width, target_height)
+
+        self.imsize_dict = dict(self.input_imsize_dict)
+        self.mask_dict = {camera_id: None for camera_id in self.params_dict}
         self.mapx_dict = dict()
         self.mapy_dict = dict()
         self.roi_dict = dict()
         for camera_id in self.params_dict.keys():
+            width, height = self.imsize_dict[camera_id]
+            self.roi_dict[camera_id] = [0, 0, width, height]
             if self.undistort:
-                camtype = "perspective" if self.camera_models_dict[camera_id] != 5 else "fisheye"
+                camtype = (
+                    "perspective"
+                    if self.camera_models_dict[camera_id] != 5
+                    else "fisheye"
+                )
                 params = self.params_dict[camera_id]
                 if len(params) == 0:
                     continue  # no distortion
@@ -607,13 +645,16 @@ class Parser:
                     self.max_fisheye_fov,
                 )
                 mask = self.mask_dict[camera_id]
-                self.mask_dict[camera_id] = fov_mask if mask is None else mask & fov_mask
+                self.mask_dict[camera_id] = (
+                    fov_mask if mask is None else mask & fov_mask
+                )
 
-        # size of the scene measured by cameras
-        camera_locations = camtoworlds[:, :3, 3]
-        scene_center = np.mean(camera_locations, axis=0)
-        dists = np.linalg.norm(camera_locations - scene_center, axis=1)
-        self.scene_scale = np.max(dists)
+        if self.image_downsample_factor > 1:
+            sizes = sorted(set(self.input_imsize_dict.values()))
+            print(
+                f"[Parser] Downsampling images by {self.image_downsample_factor}x "
+                f"on demand to {sizes}."
+            )
 
 
 class Dataset:
@@ -678,7 +719,12 @@ class Dataset:
 
     def __getitem__(self, item: int) -> Dict[str, Any]:
         index = self.indices[item]
-        image = imageio.imread(self.parser.image_paths[index])[..., :3]
+        camera_id = self.parser.camera_ids[index]
+        image = _load_image(
+            self.parser.image_paths[index],
+            self.parser.image_downsample_factor,
+            self.parser.input_imsize_dict[camera_id],
+        )
         depth = None
         if self.depth_paths is not None:
             encoded_depth = cv2.imread(
@@ -703,7 +749,6 @@ class Dataset:
                 * self.depth_max
                 * self.depth_world_scale
             )
-        camera_id = self.parser.camera_ids[index]
         K = self.parser.Ks_dict[camera_id].copy()  # undistorted K
         params = self.parser.params_dict[camera_id]
         camtoworlds = self.parser.camtoworlds[index]
@@ -787,7 +832,7 @@ class Dataset:
             "camera_id": camera_id,
             "K": torch.from_numpy(K).float(),
             "camtoworld": torch.from_numpy(camtoworlds).float(),
-            "image": torch.from_numpy(image).float(),
+            "image": torch.from_numpy(image),
             "image_id": item,  # the index of the image in the dataset
             "source_index": int(index),  # stable index in parser.image_names
             "frame_id": int(self.parser.frame_ids[index]),

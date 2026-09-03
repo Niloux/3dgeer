@@ -295,8 +295,12 @@ class Config:
 
     # Path to the Mip-NeRF 360 dataset
     data_dir: str = "data/360_v2/garden"
-    # Downsample factor for the dataset
+    # Initial downsample factor applied on demand while loading images.
     data_factor: int = 4
+    # Optional finer factor used after data_factor_switch_step.
+    data_factor_final: Optional[int] = None
+    # First training step that uses data_factor_final. -1 disables switching.
+    data_factor_switch_step: int = -1
     # Directory to save results
     result_dir: str = "results/garden"
     # Every N images there is a test image
@@ -573,6 +577,10 @@ class Config:
         self.ply_steps = [int(i * factor) for i in self.ply_steps]
         self.max_steps = int(self.max_steps * factor)
         self.pose_opt_start_step = int(self.pose_opt_start_step * factor)
+        if self.data_factor_switch_step >= 0:
+            self.data_factor_switch_step = int(
+                self.data_factor_switch_step * factor
+            )
         for name in (
             "calib_opt_focal_start_step",
             "calib_opt_principal_start_step",
@@ -870,6 +878,25 @@ class Runner:
         self.local_rank = local_rank
         self.world_size = world_size
         self.device = f"cuda:{local_rank}"
+        if cfg.data_factor < 1:
+            raise ValueError("data_factor must be a positive integer")
+        if cfg.data_factor_final is None:
+            if cfg.data_factor_switch_step != -1:
+                raise ValueError(
+                    "data_factor_switch_step requires data_factor_final"
+                )
+        else:
+            if cfg.data_factor_final < 1:
+                raise ValueError("data_factor_final must be a positive integer")
+            if cfg.data_factor_final >= cfg.data_factor:
+                raise ValueError(
+                    "data_factor_final must be smaller than data_factor for "
+                    "coarse-to-fine training"
+                )
+            if not 0 < cfg.data_factor_switch_step < cfg.max_steps:
+                raise ValueError(
+                    "data_factor_switch_step must be between 0 and max_steps"
+                )
         if cfg.sky_enabled and cfg.sky_mask_dir is None:
             raise ValueError("sky_enabled requires sky_mask_dir")
         if cfg.sky_enabled and cfg.random_bkgd:
@@ -1540,6 +1567,27 @@ class Runner:
     def _camera_stage(self, step: int):
         return self.camera_schedule.at(step, self.cfg.pose_opt, self.cfg.calib_opt)
 
+    def _data_factor_at_step(self, step: int) -> int:
+        final_factor = self.cfg.data_factor_final
+        if final_factor is not None and step >= self.cfg.data_factor_switch_step:
+            return final_factor
+        return self.cfg.data_factor
+
+    def _set_data_factor(self, factor: int, step: int) -> None:
+        previous_factor = self.parser.factor
+        if factor == previous_factor:
+            return
+        self.parser.set_image_factor(factor)
+        self._fisheye_valid_mask_cache.clear()
+        self.train_logger.log(
+            "data_factor_change",
+            step=step,
+            previous_factor=previous_factor,
+            data_factor=factor,
+            input_sizes=sorted(set(self.parser.input_imsize_dict.values())),
+            render_sizes=sorted(set(self.parser.imsize_dict.values())),
+        )
+
     def _apply_pose_adjustment(
         self,
         camtoworlds: Tensor,
@@ -1756,6 +1804,17 @@ class Runner:
             renders = colors
         return renders, alphas, info
 
+    def _make_trainloader(self):
+        cfg = self.cfg
+        return torch.utils.data.DataLoader(
+            self.trainset,
+            batch_size=cfg.batch_size,
+            shuffle=True,
+            num_workers=4,
+            persistent_workers=True,
+            pin_memory=True,
+        )
+
     def train(self):
         cfg = self.cfg
         device = self.device
@@ -1786,6 +1845,9 @@ class Runner:
             ppisp_version=self.ppisp_version,
             ppisp_camera_ids=self.ppisp_camera_ids,
             ppisp_frames_per_camera=self.ppisp_frames_per_camera,
+            data_factor=cfg.data_factor,
+            data_factor_final=cfg.data_factor_final,
+            data_factor_switch_step=cfg.data_factor_switch_step,
         )
 
         means_lr_end = cfg.means_lr_end or cfg.means_lr * 0.01
@@ -1839,14 +1901,7 @@ class Runner:
                 max_steps,
             )
 
-        trainloader = torch.utils.data.DataLoader(
-            self.trainset,
-            batch_size=cfg.batch_size,
-            shuffle=True,
-            num_workers=4,
-            persistent_workers=True,
-            pin_memory=True,
-        )
+        trainloader = self._make_trainloader()
         trainloader_iter = iter(trainloader)
         loss_history = deque(maxlen=cfg.log_loss_window)
         l1loss_history = deque(maxlen=cfg.log_loss_window)
@@ -1856,6 +1911,17 @@ class Runner:
         global_tic = time.time()
         pbar = tqdm.tqdm(range(init_step, max_steps))
         for step in pbar:
+            data_factor = self._data_factor_at_step(step)
+            if data_factor != self.parser.factor:
+                # Persistent workers own a copy of the Dataset and may already
+                # have prefetched old-resolution batches. Destroy them before
+                # reconfiguring the shared parser, then start fresh workers.
+                del trainloader_iter
+                del trainloader
+                self._set_data_factor(data_factor, step)
+                trainloader = self._make_trainloader()
+                trainloader_iter = iter(trainloader)
+
             if not cfg.disable_viewer:
                 while self.viewer.state == "paused":
                     time.sleep(0.01)
@@ -1870,7 +1936,9 @@ class Runner:
 
             camtoworlds = camtoworlds_gt = data["camtoworld"].to(device)  # [1, 4, 4]
             Ks = data["K"].to(device)  # [1, 3, 3]
-            pixels = data["image"].to(device) / 255.0  # [1, H, W, 3]
+            pixels = data["image"].to(
+                device=device, dtype=torch.float32, non_blocking=True
+            ).div_(255.0)  # [1, H, W, 3]
             num_train_rays_per_step = (
                 pixels.shape[0] * pixels.shape[1] * pixels.shape[2]
             )
@@ -2187,7 +2255,8 @@ class Runner:
                 ssimloss_history.append(ssimloss_value)
 
             desc = (
-                f"loss={loss.item():.3f}| stage={stage.name}| "
+                f"loss={loss.item():.3f}| factor={self.parser.factor}x| "
+                f"stage={stage.name}| "
                 f"sh degree={sh_degree_to_use}| "
             )
             if self.sky_splats is not None:
@@ -2251,6 +2320,9 @@ class Runner:
                     "images": image_details,
                     "num_gaussians": len(self.splats["means"]),
                     "gpu_memory_gib": mem,
+                    "data_factor": self.parser.factor,
+                    "image_width": int(width),
+                    "image_height": int(height),
                     "camera_stage": stage.name,
                     "sh_degree": sh_degree_to_use,
                     "means_lr": self.optimizers["means"].param_groups[0]["lr"],
@@ -2311,6 +2383,9 @@ class Runner:
                     "mem": mem,
                     "ellipse_time": time.time() - global_tic,
                     "num_GS": len(self.splats["means"]),
+                    "data_factor": self.parser.factor,
+                    "image_width": int(width),
+                    "image_height": int(height),
                 }
                 if self.sky_splats is not None:
                     stats["num_sky_GS"] = len(self.sky_splats["means"])
@@ -2320,7 +2395,11 @@ class Runner:
                     "w",
                 ) as f:
                     json.dump(stats, f)
-                data = {"step": step, "splats": self.splats.state_dict()}
+                data = {
+                    "step": step,
+                    "data_factor": self.parser.factor,
+                    "splats": self.splats.state_dict(),
+                }
                 if self.sky_splats is not None:
                     data["sky_splats"] = self.sky_splats.state_dict()
                 if cfg.pose_opt:
@@ -2643,7 +2722,9 @@ class Runner:
         for data in dataloader:
             camtoworlds = data["camtoworld"].to(device)
             Ks = data["K"].to(device)
-            pixels = data["image"].to(device) / 255.0
+            pixels = data["image"].to(
+                device=device, dtype=torch.float32, non_blocking=True
+            ).div_(255.0)
             depth_map_gt = (
                 data["depth"].to(device) if "depth" in data else None
             )
@@ -2941,6 +3022,7 @@ class Runner:
                 {
                     "num_train_images": train_image_count,
                     "num_GS": len(self.splats["means"]),
+                    "data_factor": self.parser.factor,
                 }
             )
             if val_image_count:
@@ -3276,6 +3358,15 @@ def main(local_rank: int, world_rank, world_size: int, cfg: Config):
                 )
             runner.ppisp.load_state_dict(ckpts[0]["ppisp"])
         step = ckpts[0]["step"]
+        checkpoint_factor = int(
+            ckpts[0].get("data_factor", runner._data_factor_at_step(step))
+        )
+        if any(
+            int(ckpt.get("data_factor", checkpoint_factor)) != checkpoint_factor
+            for ckpt in ckpts[1:]
+        ):
+            raise ValueError("Checkpoint data factors do not match")
+        runner._set_data_factor(checkpoint_factor, step)
         runner.eval(step=step)
         runner.render_traj(step=step)
         if cfg.compression is not None:

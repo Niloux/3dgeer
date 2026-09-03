@@ -44,7 +44,7 @@ class Config:
 
     # Path to the Mip-NeRF 360 dataset
     data_dir: str = "data/360_v2/garden"
-    # Downsample factor for the dataset
+    # Downsample factor applied on demand while loading images
     data_factor: int = 4
     # Directory to save results
     result_dir: str = "results/garden"
@@ -527,7 +527,9 @@ class Runner:
 
             camtoworlds = camtoworlds_gt = data["camtoworld"].to(device)  # [1, 4, 4]
             Ks = data["K"].to(device)  # [1, 3, 3]
-            pixels = data["image"].to(device) / 255.0  # [1, H, W, 3]
+            pixels = data["image"].to(
+                device=device, dtype=torch.float32, non_blocking=True
+            ).div_(255.0)  # [1, H, W, 3]
             num_train_rays_per_step = (
                 pixels.shape[0] * pixels.shape[1] * pixels.shape[2]
             )
@@ -764,7 +766,9 @@ class Runner:
         for i, data in enumerate(valloader):
             camtoworlds = data["camtoworld"].to(device)
             Ks = data["K"].to(device)
-            pixels = data["image"].to(device) / 255.0
+            pixels = data["image"].to(
+                device=device, dtype=torch.float32, non_blocking=True
+            ).div_(255.0)
             height, width = pixels.shape[1:3]
 
             torch.cuda.synchronize()
