@@ -1,7 +1,9 @@
 ## Development environment
 
-- Use the `3dgeer` Conda environment whenever a project command requires the
-  project's Python environment.
+- Use the uv-managed `.venv` environment (`uv run`) whenever a project command
+  requires the project's Python environment. See `scripts/setup_uv.sh` for setup.
+- Source `scripts/activate.sh` before CUDA builds or training to select GCC 14
+  and the project-local CUDA headers compatible with the system glibc.
 
 ## Testing and validation
 

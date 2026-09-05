@@ -1,0 +1,63 @@
+[build-system]
+requires = ["setuptools>=77,<81", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gsplat"
+dynamic = ["version", "description", "dependencies", "optional-dependencies"]
+requires-python = ">=3.11,<3.12"
+
+[dependency-groups]
+train = [
+    "torch==2.7.1+cu128",
+    "torchvision==0.22.1+cu128",
+    "setuptools>=77,<81",
+    "wheel",
+    "pycolmap",
+    "viser",
+    "nerfview",
+    "imageio[ffmpeg]",
+    "numpy<2",
+    "scikit-learn",
+    "tqdm",
+    "torchmetrics[image]",
+    "opencv-python",
+    "tyro>=0.8.8",
+    "Pillow",
+    "tensorboard",
+    "tensorly",
+    "pyyaml",
+    "matplotlib",
+    "fused-ssim",
+    "fused-bilagrid",
+    "splines",
+]
+
+[tool.uv]
+default-groups = ["train"]
+environments = ["sys_platform == 'linux' and platform_machine == 'x86_64'"]
+no-build-isolation-package = ["fused-ssim", "fused-bilagrid"]
+
+[tool.uv.extra-build-variables]
+# gsplat compiles on first use; dependency installation stays lightweight.
+gsplat = { BUILD_NO_CUDA = "1" }
+fused-ssim = { CC = "gcc-14", CXX = "g++-14", MAX_JOBS = "4" }
+fused-bilagrid = { CC = "gcc-14", CXX = "g++-14", MAX_JOBS = "4" }
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
+torchvision = { index = "pytorch-cu128" }
+pycolmap = { git = "https://github.com/rmbrualla/pycolmap", rev = "cc7ea4b7301720ac29287dbe450952511b32125e" }
+nerfview = { git = "https://github.com/nerfstudio-project/nerfview", rev = "4538024fe0d15fd1a0e4d760f3695fc44ca72787" }
+fused-ssim = { git = "https://github.com/rahul-goel/fused-ssim", rev = "328dc9836f513d00c4b5bc38fe30478b4435cbb5" }
+fused-bilagrid = { git = "https://github.com/harry7557558/fused-bilagrid", rev = "90f9788e57d3545e3a033c1038bb9986549632fe" }
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://mirror.sjtu.edu.cn/pytorch-wheels/cu128"
+explicit = true
+
+[[tool.uv.index]]
+name = "pypi-mirror"
+url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+default = true

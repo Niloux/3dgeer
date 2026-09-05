@@ -20,6 +20,46 @@ These are consistent with `gsplat`'s 3DGUT implementation (`with_ut`).
 - [ ] Demo adding CAD models into distorted camera-rendered scenes
 
 ## 🏃Quick Start
+### Training environment (uv, Linux / CUDA 12.8)
+
+The training environment uses Python 3.11, PyTorch 2.7.1 cu128 and
+torchvision 0.22.1 cu128, pinned in `uv.lock`. PyTorch wheels come from the
+[SJTU mirror](https://mirrors.sjtug.sjtu.edu.cn/docs/pytorch-wheels); other PyPI
+packages use the Tsinghua mirror. Git dependencies retain the commits in
+`examples/requirements.txt`.
+
+Install [uv](https://docs.astral.sh/uv/getting-started/installation/), CUDA Toolkit
+12.8, and GCC/G++ 14 first (CUDA 12.8 cannot compile with GCC 15). On Ubuntu:
+
+```bash
+sudo apt-get install -y g++-14
+bash scripts/setup_uv.sh
+```
+
+The setup script creates `.venv`, downloads the missing GLM 1.0.1 headers, and
+installs the local gsplat package plus training dependencies. It builds
+`fused-ssim` and `fused-bilagrid` for the visible GPU; run setup with the training
+GPU accessible. gsplat itself compiles on first rendering/training use, which can
+take several minutes. No dataset or model weights are downloaded during setup.
+
+On newer glibc systems, setup also creates a local copy of CUDA headers under
+`.cache/cuda-include` and fixes the `noexcept` declarations of `sinpi`, `cospi`,
+`rsqrt` and their float variants. This addresses the
+[CUDA/glibc header incompatibility](https://forums.developer.nvidia.com/t/cuda-headers-in-crt-math-functions-h-still-broken-in-debian-13-repo/362940)
+without changing the system toolkit.
+
+Activate these compiler/header settings in each training shell:
+
+```bash
+source scripts/activate.sh
+uv run python examples/simple_trainer.py --help
+```
+
+For subsequent dependency synchronization, source the activation script and run
+`uv sync --locked`. To run the
+examples below, use `uv run python` in place of `python`; uv finds the project
+environment even from the `examples` directory. Conda activation is not required.
+
 ### Training
 Passing in `--with_geer --with_eval3d` to the `simple_trainer.py` arg list will enable training with 3DGEER.
 #### Download Data
@@ -30,7 +70,8 @@ python datasets/download_dataset.py
 ```
 #### Install Dependencies
 ```bash
-pip install -r requirements.txt
+# From the repository root:
+bash scripts/setup_uv.sh
 ```
 #### Training Script
 ```bash
@@ -66,8 +107,9 @@ Once trained, you can view the 3DGS through the nerfstudio-style viewer to expor
 
 #### Install Dependencies
 ```bash
+# From the repository root (same environment as training):
+bash scripts/setup_uv.sh
 cd examples
-pip install -r requirements.txt
 ```
 #### Rendering Script
 ```bash
