@@ -67,8 +67,27 @@ def _tanfov_from_raymap(raymap, min_rz: float = 1e-3, max_tan: float = 1e4):
         Maximum absolute tangent values in x and y.  Returns ``(None, None)``
         when no valid pixels are found so the caller can keep its default.
     """
+    if isinstance(raymap, torch.Tensor) and raymap.is_cuda:
+        # Reduce on the GPU: a full-resolution raymap is tens of MB, while
+        # the caller only needs two scalar bounds for frustum clipping.
+        arr = raymap.detach()
+        if arr.numel() == 0:
+            return None, None
+        rz = arr[:, :, 2]
+        valid = rz > min_rz
+        safe_rz = torch.where(valid, rz, 1.0)
+        tangents = arr[:, :, :2].abs() / safe_rz.unsqueeze(-1)
+        bounds = tangents.masked_fill(~valid.unsqueeze(-1), -torch.inf).amax((0, 1))
+        tanfovx, tanfovy = bounds.cpu().tolist()
+        if tanfovx == -math.inf:
+            return None, None
+        return (
+            float(np.clip(tanfovx, 0.0, max_tan)),
+            float(np.clip(tanfovy, 0.0, max_tan)),
+        )
+
     if isinstance(raymap, torch.Tensor):
-        arr = raymap.detach().cpu().numpy() if raymap.is_cuda else raymap.numpy()
+        arr = raymap.numpy()
     else:
         arr = np.asarray(raymap, dtype=np.float32)
 

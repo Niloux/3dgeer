@@ -1910,6 +1910,7 @@ class Runner:
         # Training loop.
         global_tic = time.time()
         pbar = tqdm.tqdm(range(init_step, max_steps))
+        next_progress_update = 0.0
         for step in pbar:
             data_factor = self._data_factor_at_step(step)
             if data_factor != self.parser.factor:
@@ -1934,43 +1935,43 @@ class Runner:
                 trainloader_iter = iter(trainloader)
                 data = next(trainloader_iter)
 
-            camtoworlds = camtoworlds_gt = data["camtoworld"].to(device)  # [1, 4, 4]
-            Ks = data["K"].to(device)  # [1, 3, 3]
+            camtoworlds = camtoworlds_gt = data["camtoworld"].to(device, non_blocking=True)  # [1, 4, 4]
+            Ks = data["K"].to(device, non_blocking=True)  # [1, 3, 3]
             pixels = data["image"].to(
                 device=device, dtype=torch.float32, non_blocking=True
             ).div_(255.0)  # [1, H, W, 3]
             num_train_rays_per_step = (
                 pixels.shape[0] * pixels.shape[1] * pixels.shape[2]
             )
-            image_ids = data["image_id"].to(device)
-            camera_ids = data["camera_id"].to(device)
-            frame_ids = data["frame_id"].to(device)
-            masks = data["mask"].to(device) if "mask" in data else None  # [1, H, W]
+            image_ids = data["image_id"].to(device, non_blocking=True)
+            camera_ids = data["camera_id"].to(device, non_blocking=True)
+            frame_ids = data["frame_id"].to(device, non_blocking=True)
+            masks = data["mask"].to(device, non_blocking=True) if "mask" in data else None  # [1, H, W]
             sky_masks = (
-                data["sky_mask"].to(device) if "sky_mask" in data else None
+                data["sky_mask"].to(device, non_blocking=True) if "sky_mask" in data else None
             )  # [1, H, W]
             if cfg.sky_enabled and sky_masks is None:
                 raise RuntimeError("Gaussian sky is enabled but the batch has no sky_mask")
             if masks is not None:
                 pixels = pixels * masks.unsqueeze(-1)
             radial_coeffs = (
-                data["radial_coeffs"].to(device)
+                data["radial_coeffs"].to(device, non_blocking=True)
                 if (cfg.keep_distortion and "radial_coeffs" in data)
                 else None
             )
             tangential_coeffs = (
-                data["tangential_coeffs"].to(device)
+                data["tangential_coeffs"].to(device, non_blocking=True)
                 if (cfg.keep_distortion and "tangential_coeffs" in data)
                 else None
             )
             if cfg.depth_loss:
                 if "depth" in data:
-                    depth_map_gt = data["depth"].to(device)  # [1, H, W]
+                    depth_map_gt = data["depth"].to(device, non_blocking=True)  # [1, H, W]
                     points = depths_gt = None
                 else:
                     depth_map_gt = None
-                    points = data["points"].to(device)  # [1, M, 2]
-                    depths_gt = data["depths"].to(device)  # [1, M]
+                    points = data["points"].to(device, non_blocking=True)  # [1, M, 2]
+                    depths_gt = data["depths"].to(device, non_blocking=True)  # [1, M]
 
             height, width = pixels.shape[1:3]
             stage = self._camera_stage(step)
@@ -2092,8 +2093,11 @@ class Runner:
                 l1loss = F.l1_loss(colors_for_loss, pixels)
             else:
                 valid = masks.unsqueeze(-1)
-                l1loss = (
-                    (colors_for_loss - pixels).abs().masked_select(valid).mean()
+                # Fixed-shape reduction avoids allocating a dynamically sized
+                # selection. Keep the RGB normalization and empty-mask NaN.
+                errors = (colors_for_loss - pixels).abs()
+                l1loss = errors.masked_fill(~valid, 0.0).sum() / (
+                    masks.sum() * errors.shape[-1]
                 )
             if cfg.ssim_lambda:
                 ssimloss = _masked_fused_ssim_loss(
@@ -2244,9 +2248,11 @@ class Runner:
                         parameters, max_norm=cfg.grad_clip_norm
                     )
 
-            loss_value = loss.detach().item()
-            l1loss_value = l1loss.detach().item()
-            ssimloss_value = ssimloss.detach().item()
+            # Transfer the three history scalars together; retain every step
+            # and the existing finite-value filtering for moving averages.
+            loss_value, l1loss_value, ssimloss_value = torch.stack(
+                (loss.detach(), l1loss.detach(), ssimloss.detach())
+            ).cpu().tolist()
             if math.isfinite(loss_value):
                 loss_history.append(loss_value)
             if math.isfinite(l1loss_value):
@@ -2254,27 +2260,33 @@ class Runner:
             if math.isfinite(ssimloss_value):
                 ssimloss_history.append(ssimloss_value)
 
-            desc = (
-                f"loss={loss.item():.3f}| factor={self.parser.factor}x| "
-                f"stage={stage.name}| "
-                f"sh degree={sh_degree_to_use}| "
-            )
-            if self.sky_splats is not None:
-                desc += f"sky alpha={sky_alpha_loss.item():.4f}| "
-            if cfg.depth_loss:
-                desc += f"depth loss={depthloss.item():.6f}| "
-            if self.lidar_surface is not None:
-                if geometry_updated:
-                    desc += f"geometry={geometry_loss.item():.4f}| "
-                else:
-                    desc += "geometry=--| "
-            if self.ppisp is not None:
-                desc += f"ppisp reg={ppisp_reg_loss.item():.4f}| "
-            if cfg.pose_opt and cfg.pose_noise:
-                # monitor the pose error if we inject noise
-                pose_err = F.l1_loss(camtoworlds_gt, camtoworlds)
-                desc += f"pose err={pose_err.item():.6f}| "
-            pbar.set_description(desc)
+            # Match tqdm's display cadence instead of synchronizing optional
+            # GPU metrics and forcing a terminal refresh on every iteration.
+            progress_now = time.monotonic()
+            if progress_now >= next_progress_update or step == max_steps - 1:
+                desc = (
+                    f"loss={loss_value:.3f}| factor={self.parser.factor}x| "
+                    f"stage={stage.name}| "
+                    f"sh degree={sh_degree_to_use}| "
+                )
+                if self.sky_splats is not None:
+                    desc += f"sky alpha={sky_alpha_loss.item():.4f}| "
+                if cfg.depth_loss:
+                    desc += f"depth loss={depthloss.item():.6f}| "
+                if self.lidar_surface is not None:
+                    if geometry_updated:
+                        desc += f"geometry={geometry_loss.item():.4f}| "
+                    else:
+                        desc += "geometry=--| "
+                if self.ppisp is not None:
+                    desc += f"ppisp reg={ppisp_reg_loss.item():.4f}| "
+                if cfg.pose_opt and cfg.pose_noise:
+                    # monitor the pose error if we inject noise
+                    pose_err = F.l1_loss(camtoworlds_gt, camtoworlds)
+                    desc += f"pose err={pose_err.item():.6f}| "
+                pbar.set_description(desc, refresh=False)
+
+                next_progress_update = time.monotonic() + pbar.mininterval
 
             # write images (gt and render)
             # if world_rank == 0 and step % 800 == 0:
@@ -2287,7 +2299,7 @@ class Runner:
 
             if world_rank == 0 and cfg.log_every > 0 and step % cfg.log_every == 0:
                 mem = torch.cuda.max_memory_allocated() / 1024**3
-                image_ids_cpu = image_ids.detach().cpu().reshape(-1).tolist()
+                image_ids_cpu = data["image_id"].reshape(-1).tolist()
                 image_details = []
                 for image_id in image_ids_cpu:
                     dataset_index = int(self.trainset.indices[int(image_id)])
