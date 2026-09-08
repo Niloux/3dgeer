@@ -245,9 +245,8 @@ def rasterization(
         <https://arxiv.org/abs/2412.12507>`_.
 
     .. note::
-        Global-shutter eval3d rasterization supports gradients w.r.t. `viewmats`
-        and, for OPENCV_FISHEYE cameras, `Ks` plus the four `radial_coeffs`.
-        Other camera models and distortion terms do not expose calibration gradients.
+        Global-shutter eval3d rasterization supports gradients w.r.t. `viewmats`.
+        Intrinsics and distortion coefficients are fixed inputs.
 
     Args:
         means: The 3D centers of the Gaussians. [..., N, 3]

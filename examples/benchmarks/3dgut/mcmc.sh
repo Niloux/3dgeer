@@ -41,19 +41,9 @@ for SCENE in $SCENE_LIST;
 do
     echo "=== Eval Stats ==="
 
-    for STATS in $RESULT_DIR/$SCENE/stats/val*.json;
-    do  
-        echo $STATS
-        cat $STATS; 
-        echo
-    done
+    python stats.py "$RESULT_DIR/$SCENE/stats" --stage val --rank 0
 
     echo "=== Train Stats ==="
 
-    for STATS in $RESULT_DIR/$SCENE/stats/train*_rank0.json;
-    do  
-        echo $STATS
-        cat $STATS; 
-        echo
-    done
+    python stats.py "$RESULT_DIR/$SCENE/stats" --stage train --rank 0
 done

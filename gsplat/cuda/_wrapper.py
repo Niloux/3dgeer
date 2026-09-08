@@ -1757,7 +1757,6 @@ class _RasterizeToPixelsEval3D(torch.autograd.Function):
         densification_info: Optional[Tensor] = None,  # [..., 2, N]
     ) -> Tuple[Tensor, Tensor]:
         ctx.rolling_shutter = rolling_shutter
-        ctx.camera_model = camera_model
         ut_params = ut_params.to_cpp()
         rs_type = rolling_shutter.to_cpp()
         camera_model_type = _make_lazy_cuda_obj(
@@ -1863,34 +1862,17 @@ class _RasterizeToPixelsEval3D(torch.autograd.Function):
         tile_size = ctx.tile_size
         ftheta_coeffs = ctx.ftheta_coeffs
         viewmats_requires_grad = ctx.needs_input_grad[7]
-        Ks_requires_grad = ctx.needs_input_grad[8]
-        radial_coeffs_requires_grad = ctx.needs_input_grad[16]
-        tangential_coeffs_requires_grad = ctx.needs_input_grad[17]
-        thin_prism_coeffs_requires_grad = ctx.needs_input_grad[18]
         viewmats_rs_requires_grad = ctx.needs_input_grad[21]
 
         if viewmats_rs_requires_grad:
             raise NotImplementedError(
                 "eval3d camera gradients do not support viewmats_rs"
             )
-        if (
-            viewmats_requires_grad
-            or Ks_requires_grad
-            or radial_coeffs_requires_grad
-        ) and ctx.rolling_shutter is not RollingShutterType.GLOBAL:
-            raise NotImplementedError(
-                "eval3d camera gradients currently support global shutter only"
-            )
-        if tangential_coeffs_requires_grad or thin_prism_coeffs_requires_grad:
-            raise NotImplementedError(
-                "eval3d camera gradients do not support tangential or thin-prism "
-                "distortion"
-            )
-        if (Ks_requires_grad or radial_coeffs_requires_grad) and (
-            ctx.camera_model != "fisheye"
+        if viewmats_requires_grad and (
+            ctx.rolling_shutter is not RollingShutterType.GLOBAL
         ):
             raise NotImplementedError(
-                "eval3d calibration gradients currently support fisheye cameras only"
+                "eval3d camera gradients currently support global shutter only"
             )
 
         (
@@ -1900,8 +1882,6 @@ class _RasterizeToPixelsEval3D(torch.autograd.Function):
             v_colors,
             v_opacities,
             v_viewmats,
-            v_Ks,
-            v_radial_coeffs,
         ) = _make_lazy_cuda_func("rasterize_to_pixels_from_world_3dgs_bwd")(
             means,
             quats,
@@ -1932,8 +1912,6 @@ class _RasterizeToPixelsEval3D(torch.autograd.Function):
             ctx.densification_error_map,
             ctx.densification_info,
             viewmats_requires_grad,
-            Ks_requires_grad,
-            radial_coeffs_requires_grad,
         )
 
         if ctx.needs_input_grad[5]:  # backgrounds
@@ -1945,10 +1923,6 @@ class _RasterizeToPixelsEval3D(torch.autograd.Function):
 
         if not viewmats_requires_grad:
             v_viewmats = None
-        if not Ks_requires_grad:
-            v_Ks = None
-        if not radial_coeffs_requires_grad:
-            v_radial_coeffs = None
 
         return (
             v_means,  # means
@@ -1959,7 +1933,7 @@ class _RasterizeToPixelsEval3D(torch.autograd.Function):
             v_backgrounds,  # backgrounds
             None,  # masks
             v_viewmats,  # viewmats
-            v_Ks,  # Ks
+            None,  # Ks
             None,  # width
             None,  # height
             None,  # tile_size
@@ -1967,7 +1941,7 @@ class _RasterizeToPixelsEval3D(torch.autograd.Function):
             None,  # flatten_ids
             None,  # camera_model
             None,  # ut_params
-            v_radial_coeffs,  # radial_coeffs
+            None,  # radial_coeffs
             None,  # tangential_coeffs
             None,  # thin_prism_coeffs
             None,  # ftheta_coeffs

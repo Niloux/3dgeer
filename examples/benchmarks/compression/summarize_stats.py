@@ -1,11 +1,16 @@
 import json
 import os
 import subprocess
+import sys
 from collections import defaultdict
+from pathlib import Path
 from typing import List
 
 import numpy as np
 import tyro
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from stats import read_stats
 
 
 def main(results_dir: str, scenes: List[str], stage: str = "compress"):
@@ -26,9 +31,14 @@ def main(results_dir: str, scenes: List[str], stage: str = "compress"):
             size = int(out.stdout)
             summary["size"].append(size)
 
-        with open(os.path.join(scene_dir, f"stats/{stage}_step29999.json"), "r") as f:
-            stats = json.load(f)
-            for k, v in stats.items():
+        matches = [
+            row for row in read_stats(Path(scene_dir) / "stats")
+            if row["stage"] == stage and row["step"] == 29999 and row["rank"] == 0
+        ]
+        if not matches:
+            raise FileNotFoundError(f"Missing {stage} step 29999 statistics in {scene_dir}")
+        for k, v in matches[0].items():
+            if k not in ("stage", "step", "iteration", "rank"):
                 summary[k].append(v)
 
     for k, v in summary.items():

@@ -33,6 +33,7 @@ from gaussian_models import (
     create_sky_splats_with_optimizers,
 )
 from lidar_geometry import LidarSurfelField
+from stats import write_stats
 from torch import Tensor
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torchmetrics.image import StructuralSimilarityIndexMeasure
@@ -40,7 +41,6 @@ from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from typing_extensions import Literal, assert_never
 from utils import (
     AppearanceOptModule,
-    CameraCalibrationOptModule,
     CameraOptModule,
     CameraRefinementSchedule,
     CameraRigPoseModule,
@@ -476,46 +476,8 @@ class Config:
     # Add noise to camera extrinsics. This is only to test the camera pose optimization.
     pose_noise: float = 0.0
 
-    # Optimize shared OPENCV_FISHEYE intrinsics and radial distortion.
-    calib_opt: bool = False
-    # Learning rate for focal log-scales.
-    calib_opt_focal_lr: float = 1e-5
-    # Learning rate for principal-point offsets normalized by focal length.
-    calib_opt_principal_lr: float = 1e-5
-    # Learning rate for k1, k2, k3, k4 deltas.
-    calib_opt_radial_lr: float = 1e-6
-    # High-order radial learning rate multiplier relative to calib_opt_radial_lr.
-    calib_opt_radial_high_lr: float = 0.0
-    # Regularization for all calibration deltas as optimizer weight decay.
-    calib_opt_reg: float = 1e-3
-    # Progressive calibration release steps.
-    calib_opt_focal_start_step: int = 3_000
-    calib_opt_principal_start_step: int = 8_000
-    calib_opt_radial_start_step: int = 15_000
-    # -1 keeps k3/k4 frozen for the complete run.
-    calib_opt_high_order_start_step: int = -1
-    # Freeze all camera parameters at this step; -1 disables the freeze.
+    # Freeze camera poses at this step; -1 disables the freeze.
     camera_freeze_step: int = 20_000
-    # Shared focal scale is the default. Aspect-ratio correction is optional.
-    calib_opt_shared_focal: bool = True
-    calib_opt_allow_aspect_ratio: bool = False
-    calib_opt_aspect_lr_scale: float = 0.1
-    # Explicit calibration priors.
-    calib_opt_prior_lambda: float = 1e-4
-    calib_opt_focal_sigma: float = 0.03
-    calib_opt_principal_sigma: float = 0.01
-    calib_opt_radial_low_sigma: float = 0.01
-    calib_opt_radial_high_sigma: float = 0.003
-    calib_opt_aspect_sigma: float = 0.005
-    # OpenCV fisheye monotonicity prior over the usable angular domain.
-    calib_opt_monotonic_lambda: float = 1e-3
-    calib_opt_monotonic_samples: int = 32
-    calib_opt_monotonic_eps: float = 1e-3
-    calib_opt_monotonic_fov_deg: float = 170.0
-    # Hard bounds keep joint pose/calibration optimization identifiable.
-    calib_opt_max_focal_log_scale: float = 0.1
-    calib_opt_max_principal_offset: float = 0.05
-    calib_opt_max_radial_delta: float = 0.1
 
     # Densification can be delayed until camera refinement has stabilized.
     # -1 selects an automatic camera-aware start.
@@ -540,13 +502,16 @@ class Config:
     # modules; the novel-view controller is left disabled.
     use_ppisp: bool = False
 
-    # Enable depth loss. (experimental)
+    # PPISP global exposure/vignetting/color + a local exposure/chroma grid.
+    # Uses the project-local PyTorch implementation with an identity CRF.
+    use_exposure_correction: bool = False
+    exposure_correction_grid_start_iter: int = 1000
+    exposure_correction_lr: float = 2e-3
+    exposure_correction_grid_lr: float = 2e-3
+    exposure_correction_tv_weight: float = 10.0
+
+    # Enable sparse COLMAP-track depth loss. (experimental)
     depth_loss: bool = False
-    # Optional same-layout directory of LFS uint16 camera-Z depth PNGs. When
-    # unset, depth_loss retains the legacy sparse COLMAP-track supervision.
-    depth_dir: Optional[str] = None
-    # Camera-Z value represented by uint16 65535. None reads data_dir/report.json.
-    depth_max: Optional[float] = None
     # Weight for depth loss
     depth_lambda: float = 1e-2
 
@@ -577,18 +542,14 @@ class Config:
         self.ply_steps = [int(i * factor) for i in self.ply_steps]
         self.max_steps = int(self.max_steps * factor)
         self.pose_opt_start_step = int(self.pose_opt_start_step * factor)
+        self.exposure_correction_grid_start_iter = int(
+            self.exposure_correction_grid_start_iter * factor
+        )
         if self.data_factor_switch_step >= 0:
             self.data_factor_switch_step = int(
                 self.data_factor_switch_step * factor
             )
-        for name in (
-            "calib_opt_focal_start_step",
-            "calib_opt_principal_start_step",
-            "calib_opt_radial_start_step",
-            "calib_opt_high_order_start_step",
-            "camera_freeze_step",
-            "densification_start_step",
-        ):
+        for name in ("camera_freeze_step", "densification_start_step"):
             value = getattr(self, name)
             if value >= 0:
                 setattr(self, name, int(value * factor))
@@ -921,25 +882,8 @@ class Runner:
             raise ValueError(
                 "means_lr and means_lr_end must be positive when means_lr_end is set"
             )
-        if cfg.depth_loss and cfg.depth_dir is not None and not cfg.keep_distortion:
-            raise ValueError(
-                "depth_dir sidecars require keep_distortion=True because they are "
-                "aligned to the original image domain"
-            )
         if cfg.sky_alpha_lambda < 0.0:
             raise ValueError("sky_alpha_lambda must be non-negative")
-        if cfg.calib_opt and not cfg.keep_distortion:
-            raise ValueError("calib_opt requires keep_distortion")
-        if cfg.calib_opt and not cfg.with_eval3d:
-            raise ValueError("calib_opt requires with_eval3d")
-        if cfg.calib_opt and not (cfg.with_ut or cfg.with_geer):
-            raise ValueError("calib_opt requires with_ut or with_geer")
-        if cfg.calib_opt and min(
-            cfg.calib_opt_max_focal_log_scale,
-            cfg.calib_opt_max_principal_offset,
-            cfg.calib_opt_max_radial_delta,
-        ) <= 0.0:
-            raise ValueError("calib_opt parameter bounds must be positive")
         if cfg.pose_opt_start_step < 0:
             raise ValueError("pose_opt_start_step must be non-negative")
         if cfg.rig_opt and not cfg.pose_opt:
@@ -950,48 +894,46 @@ class Runner:
             raise ValueError("pose_opt_translation_sigma must be positive")
         if cfg.pose_opt_reference_image_id < -1:
             raise ValueError("pose_opt_reference_image_id must be -1 or non-negative")
-        if cfg.calib_opt_radial_high_lr < 0.0:
-            raise ValueError("calib_opt_radial_high_lr must be non-negative")
-        for name in (
-            "calib_opt_focal_start_step",
-            "calib_opt_principal_start_step",
-            "calib_opt_radial_start_step",
-        ):
-            if getattr(cfg, name) < 0:
-                raise ValueError(f"{name} must be non-negative")
-        if cfg.calib_opt_high_order_start_step < -1:
-            raise ValueError("calib_opt_high_order_start_step must be -1 or non-negative")
         if cfg.camera_freeze_step < -1:
             raise ValueError("camera_freeze_step must be -1 or non-negative")
         if cfg.densification_start_step < -1:
             raise ValueError("densification_start_step must be -1 or non-negative")
         appearance_methods = sum(
-            (bool(cfg.app_opt), bool(cfg.use_bilateral_grid), bool(cfg.use_ppisp))
+            (
+                bool(cfg.app_opt),
+                bool(cfg.use_bilateral_grid or cfg.use_fused_bilagrid),
+                bool(cfg.use_ppisp),
+                bool(cfg.use_exposure_correction),
+            )
         )
         if appearance_methods > 1:
             raise ValueError(
-                "app_opt, use_bilateral_grid, and use_ppisp are mutually exclusive"
+                "app_opt, bilateral grid, use_ppisp, and use_exposure_correction "
+                "are mutually exclusive"
             )
-        if cfg.use_ppisp and cfg.batch_size != 1:
-            raise ValueError("use_ppisp currently requires batch_size=1")
-        if cfg.use_ppisp and cfg.patch_size is not None:
+        ppisp_active = cfg.use_ppisp or cfg.use_exposure_correction
+        if ppisp_active and cfg.batch_size != 1:
+            raise ValueError("PPISP/exposure correction currently requires batch_size=1")
+        if ppisp_active and cfg.patch_size is not None:
             raise ValueError(
-                "use_ppisp currently requires full images (patch_size must be unset)"
+                "PPISP/exposure correction requires full images (patch_size must be unset)"
             )
-        if cfg.use_ppisp and world_size != 1:
-            raise ValueError("use_ppisp currently supports single-GPU training only")
-        if cfg.calib_opt_high_order_start_step >= 0 and (
-            cfg.calib_opt_high_order_start_step < cfg.calib_opt_radial_start_step
-        ):
-            raise ValueError("high-order distortion cannot start before low-order distortion")
-        if cfg.pose_opt_prior_lambda < 0.0 or cfg.calib_opt_prior_lambda < 0.0:
-            raise ValueError("camera prior weights must be non-negative")
-        if cfg.calib_opt_monotonic_lambda < 0.0:
-            raise ValueError("calib_opt_monotonic_lambda must be non-negative")
-        if cfg.calib_opt_monotonic_samples < 2:
-            raise ValueError("calib_opt_monotonic_samples must be at least 2")
-        if not 0.0 < cfg.calib_opt_monotonic_fov_deg < 180.0:
-            raise ValueError("calib_opt_monotonic_fov_deg must be in (0, 180)")
+        if ppisp_active and world_size != 1:
+            raise ValueError("PPISP/exposure correction supports single-GPU training only")
+        if cfg.use_exposure_correction:
+            if cfg.exposure_correction_grid_start_iter < 0:
+                raise ValueError("exposure_correction_grid_start_iter must be non-negative")
+            if min(cfg.bilateral_grid_shape) < 2:
+                raise ValueError("Exposure correction grid dimensions must be at least 2")
+            for name in (
+                "exposure_correction_lr",
+                "exposure_correction_grid_lr",
+                "exposure_correction_tv_weight",
+            ):
+                if not math.isfinite(getattr(cfg, name)) or getattr(cfg, name) < 0:
+                    raise ValueError(f"{name} must be finite and non-negative")
+        if cfg.pose_opt_prior_lambda < 0.0:
+            raise ValueError("pose_opt_prior_lambda must be non-negative")
         if cfg.log_every < 0:
             raise ValueError("log_every must be non-negative")
         if cfg.log_loss_window <= 0:
@@ -1040,15 +982,10 @@ class Runner:
             split="train",
             patch_size=cfg.patch_size,
             load_depths=cfg.depth_loss,
-            depth_dir=cfg.depth_dir,
-            depth_max=cfg.depth_max,
         )
         self.valset = dataset_cls(
             self.parser,
             split="val",
-            load_depths=cfg.depth_loss and cfg.depth_dir is not None,
-            depth_dir=cfg.depth_dir,
-            depth_max=cfg.depth_max,
         )
         if cfg.rig_opt:
             _, frame_counts = np.unique(self.parser.frame_ids, return_counts=True)
@@ -1076,20 +1013,10 @@ class Runner:
 
         self.camera_schedule = CameraRefinementSchedule(
             pose_start=cfg.pose_opt_start_step,
-            focal_start=cfg.calib_opt_focal_start_step,
-            principal_start=cfg.calib_opt_principal_start_step,
-            radial_start=cfg.calib_opt_radial_start_step,
-            high_order_start=cfg.calib_opt_high_order_start_step,
             freeze_step=cfg.camera_freeze_step,
         )
         if cfg.densification_start_step >= 0:
             self.densification_start_step = cfg.densification_start_step
-        elif cfg.calib_opt:
-        # elif cfg.pose_opt or cfg.calib_opt:
-            self.densification_start_step = max(
-                cfg.pose_opt_start_step + 1000,
-                cfg.calib_opt_focal_start_step,
-            )
         else:
             self.densification_start_step = 0
 
@@ -1259,55 +1186,6 @@ class Runner:
             if world_size > 1:
                 self.pose_adjust = DDP(self.pose_adjust)
 
-        self.calibration_optimizers = []
-        if cfg.calib_opt:
-            camera_ids = sorted(set(self.parser.camera_ids))
-            unsupported_camera_ids = [
-                camera_id
-                for camera_id in camera_ids
-                if self.parser.camera_models_dict[camera_id] != 5
-            ]
-            if unsupported_camera_ids:
-                raise ValueError(
-                    "calib_opt only supports OPENCV_FISHEYE cameras; "
-                    f"unsupported camera ids: {unsupported_camera_ids}"
-                )
-            self.calibration_camera_indices = {
-                camera_id: index for index, camera_id in enumerate(camera_ids)
-            }
-            self.calibration_adjust = CameraCalibrationOptModule(
-                len(camera_ids),
-                shared_focal=cfg.calib_opt_shared_focal,
-                allow_aspect_ratio=cfg.calib_opt_allow_aspect_ratio,
-            ).to(self.device)
-            self.calibration_optimizers = [
-                torch.optim.Adam(
-                    [
-                        {
-                            "params": (
-                                self.calibration_adjust.focal_log_scales.parameters()
-                            ),
-                            "lr": cfg.calib_opt_focal_lr * math.sqrt(cfg.batch_size),
-                        },
-                        {
-                            "params": (
-                                self.calibration_adjust.principal_offsets.parameters()
-                            ),
-                            "lr": cfg.calib_opt_principal_lr
-                            * math.sqrt(cfg.batch_size),
-                        },
-                        {
-                            "params": (
-                                self.calibration_adjust.radial_deltas.parameters()
-                            ),
-                            "lr": cfg.calib_opt_radial_lr * math.sqrt(cfg.batch_size),
-                        },
-                    ],
-                    weight_decay=cfg.calib_opt_reg,
-                )
-            ]
-            if world_size > 1:
-                self.calibration_adjust = DDP(self.calibration_adjust)
 
         if cfg.pose_noise > 0.0:
             self.pose_perturb = CameraOptModule(
@@ -1365,16 +1243,19 @@ class Runner:
         self.ppisp_frame_indices: Optional[Tensor] = None
         self.ppisp_frames_per_camera: List[int] = []
         self.ppisp_version: Optional[str] = None
-        if cfg.use_ppisp:
-            try:
-                import ppisp as ppisp_package
-                from ppisp import PPISP, PPISPConfig
-            except ImportError as error:
-                raise RuntimeError(
-                    "use_ppisp requires the PPISP package in the active Python environment"
-                ) from error
-
-            self.ppisp_version = ppisp_package.__version__
+        self.exposure_grid = None
+        self.exposure_grid_optimizer = None
+        self.exposure_grid_active = False
+        if cfg.use_ppisp or cfg.use_exposure_correction:
+            if cfg.use_ppisp:
+                try:
+                    import ppisp as ppisp_package
+                    from ppisp import PPISP, PPISPConfig
+                except ImportError as error:
+                    raise RuntimeError(
+                        "use_ppisp requires the PPISP package in the active Python environment"
+                    ) from error
+                self.ppisp_version = ppisp_package.__version__
             self.ppisp_camera_ids = tuple(
                 sorted({int(camera_id) for camera_id in self.parser.camera_ids})
             )
@@ -1409,15 +1290,33 @@ class Runner:
                 device=self.device
             )
 
-            ppisp_config = PPISPConfig(
-                use_controller=False,
-                scheduler_decay_max_steps=cfg.max_steps,
-            )
-            self.ppisp = PPISP(
-                num_cameras=len(self.ppisp_camera_ids),
-                num_frames=len(self.trainset),
-                config=ppisp_config,
-            ).to(self.device)
+            if cfg.use_exposure_correction:
+                from lib_exposure_correction import ExposureChromaGrid, PPISPExposure
+
+                self.ppisp_version = "exposure-correction-torch-v1"
+                self.ppisp = PPISPExposure(
+                    len(self.ppisp_camera_ids),
+                    len(self.trainset),
+                    lr=cfg.exposure_correction_lr,
+                ).to(self.device)
+                self.exposure_grid = ExposureChromaGrid(
+                    len(self.trainset), cfg.bilateral_grid_shape
+                ).to(self.device)
+                self.exposure_grid_optimizer = torch.optim.Adam(
+                    self.exposure_grid.parameters(),
+                    lr=cfg.exposure_correction_grid_lr,
+                    eps=1e-15,
+                )
+            else:
+                ppisp_config = PPISPConfig(
+                    use_controller=False,
+                    scheduler_decay_max_steps=cfg.max_steps,
+                )
+                self.ppisp = PPISP(
+                    num_cameras=len(self.ppisp_camera_ids),
+                    num_frames=len(self.trainset),
+                    config=ppisp_config,
+                ).to(self.device)
             self.ppisp_optimizers = self.ppisp.create_optimizers()
 
         # Losses & Metrics.
@@ -1491,24 +1390,6 @@ class Runner:
             )
         return True
 
-    def _apply_calibration_adjustment(
-        self, Ks: Tensor, radial_coeffs: Tensor, camera_ids: Tensor
-    ) -> Tuple[Tensor, Tensor]:
-        """Map raw COLMAP camera ids to shared learnable calibration rows."""
-        calibration_ids = torch.tensor(
-            [
-                self.calibration_camera_indices[int(camera_id)]
-                for camera_id in camera_ids.detach().cpu().reshape(-1).tolist()
-            ],
-            dtype=torch.long,
-            device=Ks.device,
-        ).reshape(camera_ids.shape)
-        return self.calibration_adjust(Ks, radial_coeffs, calibration_ids)
-
-    def _calibration_module(self) -> CameraCalibrationOptModule:
-        if self.world_size > 1:
-            return self.calibration_adjust.module
-        return self.calibration_adjust
 
     def _pose_module(self):
         if self.world_size > 1:
@@ -1565,7 +1446,7 @@ class Runner:
         ).unsqueeze(0)
 
     def _camera_stage(self, step: int):
-        return self.camera_schedule.at(step, self.cfg.pose_opt, self.cfg.calib_opt)
+        return self.camera_schedule.at(step, self.cfg.pose_opt)
 
     def _data_factor_at_step(self, step: int) -> int:
         final_factor = self.cfg.data_factor_final
@@ -1601,11 +1482,7 @@ class Runner:
             return self.pose_adjust(camtoworlds, frame_ids, camera_ids)
         return self.pose_adjust(camtoworlds, image_ids)
 
-    def _camera_regularization(
-        self,
-        stage,
-        adjusted_radial_coeffs: Optional[Tensor],
-    ) -> Tensor:
+    def _camera_regularization(self, stage) -> Tensor:
         loss = torch.zeros((), device=self.device)
         cfg = self.cfg
         if cfg.pose_opt and stage.pose:
@@ -1613,72 +1490,14 @@ class Runner:
                 cfg.pose_opt_translation_sigma,
                 math.radians(cfg.pose_opt_rotation_sigma_deg),
             )
-        if cfg.calib_opt and not stage.frozen and (
-            stage.focal or stage.principal or stage.radial_low or stage.radial_high
-        ):
-            calibration = self._calibration_module()
-            loss = loss + cfg.calib_opt_prior_lambda * calibration.prior_loss(
-                cfg.calib_opt_focal_sigma,
-                cfg.calib_opt_principal_sigma,
-                cfg.calib_opt_radial_low_sigma,
-                cfg.calib_opt_radial_high_sigma,
-                cfg.calib_opt_aspect_sigma,
-            )
-            if (
-                adjusted_radial_coeffs is not None
-                and (stage.radial_low or stage.radial_high)
-                and cfg.calib_opt_monotonic_lambda > 0.0
-            ):
-                theta_max = math.radians(cfg.calib_opt_monotonic_fov_deg / 2.0)
-                loss = loss + cfg.calib_opt_monotonic_lambda * calibration.monotonicity_loss(
-                    adjusted_radial_coeffs,
-                    theta_max=theta_max,
-                    samples=cfg.calib_opt_monotonic_samples,
-                    eps=cfg.calib_opt_monotonic_eps,
-                )
         return loss
 
-    def _apply_camera_gradient_controls(self, stage):
-        if not self.cfg.calib_opt:
-            return
-        calibration = self._calibration_module()
-        radial_lr = max(self.cfg.calib_opt_radial_lr, 1e-12)
-        calibration.apply_gradient_controls(
-            focal_active=stage.focal,
-            principal_active=stage.principal,
-            radial_low_active=stage.radial_low,
-            radial_high_active=stage.radial_high,
-            radial_high_lr_scale=self.cfg.calib_opt_radial_high_lr / radial_lr,
-            aspect_lr_scale=self.cfg.calib_opt_aspect_lr_scale,
-        )
-
-    def _project_camera_parameters(self):
-        if self.cfg.calib_opt:
-            self._calibration_module().project_parameters()
 
     @torch.no_grad()
     def _camera_metrics(self) -> Dict[str, Tensor]:
         metrics = {}
         if self.cfg.pose_opt:
             metrics.update({f"pose/{k}": v for k, v in self._pose_module().metrics().items()})
-        if self.cfg.calib_opt:
-            base_focal = torch.tensor(
-                [
-                    [
-                        self.parser.Ks_dict[camera_id][0, 0],
-                        self.parser.Ks_dict[camera_id][1, 1],
-                    ]
-                    for camera_id in sorted(set(self.parser.camera_ids))
-                ],
-                device=self.device,
-                dtype=torch.float32,
-            )
-            metrics.update(
-                {
-                    f"calib/{k}": v
-                    for k, v in self._calibration_module().metrics(base_focal).items()
-                }
-            )
         return metrics
 
     def rasterize_splats(
@@ -1868,16 +1687,6 @@ class Runner:
             pose_scheduler = torch.optim.lr_scheduler.ExponentialLR(
                 self.pose_optimizers[0], gamma=0.01 ** (1.0 / pose_opt_steps)
             )
-        calibration_scheduler = None
-        if cfg.calib_opt:
-            calibration_steps = max(
-                max_steps - cfg.calib_opt_focal_start_step,
-                1,
-            )
-            calibration_scheduler = torch.optim.lr_scheduler.ExponentialLR(
-                self.calibration_optimizers[0],
-                gamma=0.01 ** (1.0 / calibration_steps),
-            )
         if cfg.use_bilateral_grid:
             # bilateral grid has a learning rate schedule. Linear warmup for 1000 steps.
             schedulers.append(
@@ -1899,6 +1708,15 @@ class Runner:
             ppisp_schedulers = self.ppisp.create_schedulers(
                 self.ppisp_optimizers,
                 max_steps,
+            )
+        exposure_grid_scheduler = None
+        if self.exposure_grid_optimizer is not None:
+            from lib_exposure_correction import photometric_scheduler
+
+            exposure_grid_scheduler = photometric_scheduler(
+                self.exposure_grid_optimizer,
+                max_steps - cfg.exposure_correction_grid_start_iter,
+                1000,
             )
 
         trainloader = self._make_trainloader()
@@ -1965,22 +1783,15 @@ class Runner:
                 else None
             )
             if cfg.depth_loss:
-                if "depth" in data:
-                    depth_map_gt = data["depth"].to(device, non_blocking=True)  # [1, H, W]
-                    points = depths_gt = None
-                else:
-                    depth_map_gt = None
-                    points = data["points"].to(device, non_blocking=True)  # [1, M, 2]
-                    depths_gt = data["depths"].to(device, non_blocking=True)  # [1, M]
+                points = data["points"].to(device, non_blocking=True)  # [1, M, 2]
+                depths_gt = data["depths"].to(device, non_blocking=True)  # [1, M]
 
             height, width = pixels.shape[1:3]
             stage = self._camera_stage(step)
 
             valid_f = None
             if data["camera_model"] == 5 and radial_coeffs is not None:
-                # Keep this mask tied to the raw COLMAP model. Camera corrections
-                # are deliberately bounded and the raw mask is a stable, cheap
-                # conservative support for all correction stages.
+                # Cache the valid-pixel mask for the fixed COLMAP intrinsics.
                 K_key = tuple(float(x) for x in data["K"].flatten().tolist())
                 radial_key = tuple(float(x) for x in data["radial_coeffs"].flatten().tolist())
                 key = ("fisheye_valid_mask", int(width), int(height), K_key, radial_key)
@@ -2003,14 +1814,6 @@ class Runner:
                 valid_f = valid_mask.unsqueeze(-1).to(dtype=pixels.dtype)  # [1,H,W,1]
                 pixels = pixels * valid_f
 
-            if cfg.calib_opt:
-                if radial_coeffs is None:
-                    raise RuntimeError(
-                        "calib_opt requires a four-coefficient fisheye calibration"
-                    )
-                Ks, radial_coeffs = self._apply_calibration_adjustment(
-                    Ks, radial_coeffs, camera_ids
-                )
 
             if cfg.pose_noise:
                 camtoworlds = self.pose_perturb(camtoworlds, image_ids)
@@ -2062,8 +1865,15 @@ class Runner:
                 bkgd = torch.rand(1, 3, device=device)
                 colors = colors + bkgd * (1.0 - alphas)
 
-            if cfg.use_ppisp:
+            if self.ppisp is not None:
                 colors = self._apply_ppisp(colors, camera_ids, image_ids)
+            if self.exposure_grid is not None:
+                self.exposure_grid_active = (
+                    step >= cfg.exposure_correction_grid_start_iter
+                )
+                if self.exposure_grid_active:
+                    colors = self.exposure_grid(colors, image_ids)
+                colors = colors.clamp(0.0, 1.0)
 
             # loss
             colors_for_loss = (
@@ -2112,54 +1922,38 @@ class Runner:
                 ppisp_reg_loss = self.ppisp.get_regularization_loss()
                 loss += ppisp_reg_loss
             if cfg.depth_loss:
-                if depth_map_gt is not None:
-                    rendered_depth = depths.squeeze(-1)
-                    depth_valid = depth_map_gt > 0.0
-                    if masks is not None:
-                        depth_valid &= masks
-                    rendered_disp = torch.where(
-                        rendered_depth > 0.0,
-                        rendered_depth.clamp_min(1e-8).reciprocal(),
-                        torch.zeros_like(rendered_depth),
-                    )
-                    target_disp = torch.where(
-                        depth_valid,
-                        depth_map_gt.clamp_min(1e-8).reciprocal(),
-                        torch.zeros_like(depth_map_gt),
-                    )
-                    depth_weight = depth_valid.to(rendered_depth.dtype)
-                    depthloss = (
-                        ((rendered_disp - target_disp).abs() * depth_weight).sum()
-                        / depth_weight.sum().clamp_min(1.0)
-                        * self.scene_scale
-                    )
-                else:
-                    assert points is not None and depths_gt is not None
-                    # Query rendered depths at projected COLMAP tracks.
-                    points = torch.stack(
-                        [
-                            points[:, :, 0] / (width - 1) * 2 - 1,
-                            points[:, :, 1] / (height - 1) * 2 - 1,
-                        ],
-                        dim=-1,
-                    )  # normalize to [-1, 1]
-                    grid = points.unsqueeze(2)  # [1, M, 1, 2]
-                    sampled_depths = F.grid_sample(
-                        depths.permute(0, 3, 1, 2), grid, align_corners=True
-                    )  # [1, 1, M, 1]
-                    sampled_depths = sampled_depths.squeeze(3).squeeze(1)  # [1, M]
-                    # Calculate loss in disparity space.
-                    disp = torch.where(
-                        sampled_depths > 0.0,
-                        sampled_depths.clamp_min(1e-8).reciprocal(),
-                        torch.zeros_like(sampled_depths),
-                    )
-                    disp_gt = depths_gt.clamp_min(1e-8).reciprocal()  # [1, M]
-                    depthloss = F.l1_loss(disp, disp_gt) * self.scene_scale
+                assert points is not None and depths_gt is not None
+                # Query rendered depths at projected COLMAP tracks.
+                points = torch.stack(
+                    [
+                        points[:, :, 0] / (width - 1) * 2 - 1,
+                        points[:, :, 1] / (height - 1) * 2 - 1,
+                    ],
+                    dim=-1,
+                )  # normalize to [-1, 1]
+                grid = points.unsqueeze(2)  # [1, M, 1, 2]
+                sampled_depths = F.grid_sample(
+                    depths.permute(0, 3, 1, 2), grid, align_corners=True
+                )  # [1, 1, M, 1]
+                sampled_depths = sampled_depths.squeeze(3).squeeze(1)  # [1, M]
+                # Calculate loss in disparity space.
+                disp = torch.where(
+                    sampled_depths > 0.0,
+                    sampled_depths.clamp_min(1e-8).reciprocal(),
+                    torch.zeros_like(sampled_depths),
+                )
+                disp_gt = depths_gt.clamp_min(1e-8).reciprocal()  # [1, M]
+                depthloss = F.l1_loss(disp, disp_gt) * self.scene_scale
                 loss += depthloss * cfg.depth_lambda
             if cfg.use_bilateral_grid:
                 tvloss = 10 * total_variation_loss(self.bil_grids.grids)
                 loss += tvloss
+            exposure_tv_loss = torch.zeros_like(l1loss)
+            if self.exposure_grid_active:
+                exposure_tv_loss = (
+                    cfg.exposure_correction_tv_weight * self.exposure_grid.tv_loss()
+                )
+                loss += exposure_tv_loss
 
             geometry_loss = torch.zeros_like(l1loss)
             geometry_stats: Dict[str, Tensor] = {}
@@ -2206,7 +2000,7 @@ class Runner:
                     1.0
                 )
                 loss += cfg.sky_alpha_lambda * sky_alpha_loss
-            loss += self._camera_regularization(stage, radial_coeffs)
+            loss += self._camera_regularization(stage)
 
             do_update = True
             if cfg.skip_non_finite_loss and (not torch.isfinite(loss).all()):
@@ -2225,7 +2019,6 @@ class Runner:
             if do_update:
                 loss.backward()
 
-                self._apply_camera_gradient_controls(stage)
 
                 # Some rendering modes (e.g. UT / eval3d) do not provide a differentiable
                 # `info["means2d"]` tensor for gradient-based refinement strategies.
@@ -2342,17 +2135,6 @@ class Runner:
                 }
                 for name, value in self._camera_metrics().items():
                     metrics[name] = value
-                if cfg.calib_opt:
-                    calibration = self._calibration_module()
-                    metrics["calib_focal_log_scale_max"] = (
-                        calibration.focal_log_scales.weight.detach().abs().max()
-                    )
-                    metrics["calib_principal_offset_max"] = (
-                        calibration.principal_offsets.weight.detach().abs().max()
-                    )
-                    metrics["calib_radial_delta_max"] = (
-                        calibration.radial_deltas.weight.detach().abs().max()
-                    )
                 if self.sky_splats is not None:
                     metrics["sky_alpha_loss"] = (
                         cfg.sky_alpha_lambda * sky_alpha_loss.item()
@@ -2371,6 +2153,10 @@ class Runner:
                         metrics[f"geometry_{name}"] = value
                 if cfg.use_bilateral_grid:
                     metrics["tv_loss"] = tvloss.item()
+                if self.exposure_grid is not None:
+                    metrics["exposure_grid_active"] = self.exposure_grid_active
+                    metrics["exposure_grid_tv_loss"] = exposure_tv_loss.item()
+                    metrics["exposure_grid_lr"] = exposure_grid_scheduler.get_last_lr()[0]
                 if self.ppisp is not None:
                     metrics["ppisp_regularization_loss"] = ppisp_reg_loss.item()
                     metrics["ppisp_lr"] = ppisp_schedulers[0].get_last_lr()[0]
@@ -2402,11 +2188,14 @@ class Runner:
                 if self.sky_splats is not None:
                     stats["num_sky_GS"] = len(self.sky_splats["means"])
                 print("Step: ", step, stats)
-                with open(
-                    f"{self.stats_dir}/train_step{step:04d}_rank{self.world_rank}.json",
-                    "w",
-                ) as f:
-                    json.dump(stats, f)
+                rank_stats = [None] * world_size if world_rank == 0 else None
+                if world_size > 1:
+                    torch.distributed.gather_object(stats, rank_stats, dst=0)
+                else:
+                    rank_stats = [stats]
+                if world_rank == 0:
+                    for rank, values in enumerate(rank_stats):
+                        write_stats(self.stats_dir, "train", step, values, rank=rank)
                 data = {
                     "step": step,
                     "data_factor": self.parser.factor,
@@ -2419,10 +2208,6 @@ class Runner:
                         data["pose_adjust"] = self.pose_adjust.module.state_dict()
                     else:
                         data["pose_adjust"] = self.pose_adjust.state_dict()
-                if cfg.calib_opt:
-                    data["calibration_adjust"] = (
-                        self._calibration_module().state_dict()
-                    )
                 if cfg.app_opt:
                     if world_size > 1:
                         data["app_module"] = self.app_module.module.state_dict()
@@ -2436,6 +2221,12 @@ class Runner:
                     data["ppisp_frame_indices"] = (
                         self.ppisp_frame_indices.detach().cpu()
                     )
+                if self.exposure_grid is not None:
+                    data["exposure_correction"] = {
+                        "version": 1,
+                        "grid": self.exposure_grid.state_dict(),
+                        "grid_active": self.exposure_grid_active,
+                    }
                 checkpoint_path = (
                     f"{self.ckpt_dir}/ckpt_{step}_rank{self.world_rank}.pt"
                 )
@@ -2548,13 +2339,6 @@ class Runner:
                 if do_update and pose_opt_active:
                     optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
-            for optimizer in self.calibration_optimizers:
-                calibration_opt_active = (
-                    stage.focal or stage.principal or stage.radial_low or stage.radial_high
-                )
-                if do_update and calibration_opt_active and not stage.frozen:
-                    optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
             for optimizer in self.app_optimizers:
                 if do_update:
                     optimizer.step()
@@ -2567,6 +2351,14 @@ class Runner:
                 if do_update:
                     optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
+            if self.exposure_grid_optimizer is not None:
+                if do_update:
+                    self.ppisp.project_mean()
+                    if self.exposure_grid_active:
+                        self.exposure_grid_optimizer.step()
+                        self.exposure_grid.project_mean()
+                        exposure_grid_scheduler.step()
+                self.exposure_grid_optimizer.zero_grad(set_to_none=True)
             if do_update:
                 for scheduler in schedulers:
                     scheduler.step()
@@ -2574,12 +2366,6 @@ class Runner:
                     scheduler.step()
                 if pose_opt_active and pose_scheduler is not None:
                     pose_scheduler.step()
-                if (
-                    cfg.calib_opt
-                    and calibration_scheduler is not None
-                    and (stage.focal or stage.principal or stage.radial_low or stage.radial_high)
-                ):
-                    calibration_scheduler.step()
 
                 # Post-step parameter clamps for numerical stability.
                 if cfg.scales_log_max > cfg.scales_log_min:
@@ -2596,21 +2382,6 @@ class Runner:
                     )
                 if self.sky_splats is not None:
                     clamp_sky_sh_colors(self.sky_splats, cfg.sh_degree)
-                if cfg.calib_opt:
-                    calibration = self._calibration_module()
-                    calibration.focal_log_scales.weight.data.clamp_(
-                        -cfg.calib_opt_max_focal_log_scale,
-                        cfg.calib_opt_max_focal_log_scale,
-                    )
-                    calibration.principal_offsets.weight.data.clamp_(
-                        -cfg.calib_opt_max_principal_offset,
-                        cfg.calib_opt_max_principal_offset,
-                    )
-                    calibration.radial_deltas.weight.data.clamp_(
-                        -cfg.calib_opt_max_radial_delta,
-                        cfg.calib_opt_max_radial_delta,
-                    )
-                    calibration.project_parameters()
                 if cfg.pose_opt:
                     self._pose_module()._zero_reference()
 
@@ -2737,9 +2508,6 @@ class Runner:
             pixels = data["image"].to(
                 device=device, dtype=torch.float32, non_blocking=True
             ).div_(255.0)
-            depth_map_gt = (
-                data["depth"].to(device) if "depth" in data else None
-            )
             masks = data["mask"].to(device) if "mask" in data else None
             sky_masks = (
                 data["sky_mask"].to(device) if "sky_mask" in data else None
@@ -2764,14 +2532,6 @@ class Runner:
                 if (cfg.keep_distortion and "tangential_coeffs" in data)
                 else None
             )
-            if cfg.calib_opt:
-                if radial_coeffs is None:
-                    raise RuntimeError(
-                        "calib_opt requires a four-coefficient fisheye calibration"
-                    )
-                Ks, radial_coeffs = self._apply_calibration_adjustment(
-                    Ks, radial_coeffs, camera_ids
-                )
             height, width = pixels.shape[1:3]
 
             torch.cuda.synchronize()
@@ -2797,12 +2557,19 @@ class Runner:
             if cfg.use_bilateral_grid and apply_train_adjustment:
                 bilateral_colors = self._apply_bilateral_grid(colors, image_ids)
             ppisp_colors = None
-            if cfg.use_ppisp:
+            if self.ppisp is not None:
                 ppisp_colors = self._apply_ppisp(
                     colors,
                     camera_ids,
                     image_ids if apply_train_adjustment else None,
                 )
+            exposure_colors = None
+            if self.exposure_grid is not None and apply_train_adjustment:
+                exposure_colors = (
+                    self.exposure_grid(ppisp_colors, image_ids)
+                    if self.exposure_grid_active
+                    else ppisp_colors
+                ).clamp(0.0, 1.0)
             torch.cuda.synchronize()
             ellipse_time += max(time.time() - tic, 1e-10)
 
@@ -2835,6 +2602,12 @@ class Runner:
                             masks,
                         )
                     )
+                if exposure_colors is not None:
+                    image_metrics.update(
+                        self._append_image_metrics(
+                            metrics, "exposure_", exposure_colors, pixels, masks
+                        )
+                    )
                 no_sky_mask = None
                 if sky_masks is not None:
                     no_sky_mask = ~sky_masks
@@ -2865,6 +2638,16 @@ class Runner:
                                 no_sky_mask,
                             )
                         )
+                    if exposure_colors is not None:
+                        image_metrics.update(
+                            self._append_image_metrics(
+                                metrics,
+                                "exposure_no_sky_",
+                                exposure_colors,
+                                pixels,
+                                no_sky_mask,
+                            )
+                        )
                 if cfg.use_bilateral_grid:
                     cc_colors = color_correct(colors, pixels).clamp(0.0, 1.0)
                     image_metrics.update(
@@ -2883,42 +2666,15 @@ class Runner:
                             )
                         )
 
-                if depth_map_gt is not None:
-                    rendered_depth = depths.squeeze(-1)
-                    depth_valid = depth_map_gt > 0.0
-                    if masks is not None:
-                        depth_valid &= masks
-                    rendered_disp = torch.where(
-                        rendered_depth > 0.0,
-                        rendered_depth.clamp_min(1e-8).reciprocal(),
-                        torch.zeros_like(rendered_depth),
-                    )
-                    target_disp = torch.where(
-                        depth_valid,
-                        depth_map_gt.clamp_min(1e-8).reciprocal(),
-                        torch.zeros_like(depth_map_gt),
-                    )
-                    depth_weight = depth_valid.to(rendered_depth.dtype)
-                    depth_inv_l1 = (
-                        ((rendered_disp - target_disp).abs() * depth_weight).sum()
-                        / depth_weight.sum().clamp_min(1.0)
-                        * self.scene_scale
-                    )
-                    depth_valid_pixels = depth_weight.sum()
-                    depth_valid_ratio = depth_weight.mean()
-                    for key, value in (
-                        ("depth_inv_l1", depth_inv_l1),
-                        ("depth_valid_pixels", depth_valid_pixels),
-                        ("depth_valid_ratio", depth_valid_ratio),
-                    ):
-                        metrics[key].append(value)
-                        image_metrics[key] = value
 
                 if artifact_writer is not None:
                     source_index = int(data["source_index"].item())
                     final_colors = None
                     final_label = None
-                    if bilateral_colors is not None:
+                    if exposure_colors is not None:
+                        final_colors = exposure_colors
+                        final_label = "Exposure correction"
+                    elif bilateral_colors is not None:
                         final_colors = bilateral_colors
                         final_label = "Bilateral"
                     elif ppisp_colors is not None:
@@ -2943,11 +2699,6 @@ class Runner:
                             ),
                             final_label=final_label,
                             rendered_depth=depths[0, ..., 0].cpu().numpy(),
-                            target_depth=(
-                                depth_map_gt[0].cpu().numpy()
-                                if depth_map_gt is not None
-                                else None
-                            ),
                             foreground_alpha=alphas[0, ..., 0].cpu().numpy(),
                             valid_mask=(
                                 masks[0].cpu().numpy() if masks is not None else None
@@ -2993,11 +2744,7 @@ class Runner:
         cfg = self.cfg
         world_rank = self.world_rank
         artifact_variant = "model" if stage == "val" else stage
-        depth_max = self.trainset.depth_max
-        if depth_max is not None:
-            depth_max *= self.trainset.depth_world_scale
-        else:
-            depth_max = max(self.scene_scale * 4.0, 1.0)
+        depth_max = max(self.scene_scale * 4.0, 1.0)
         artifact_writer = (
             EvalArtifactWriter(
                 render_dir=Path(self.render_dir),
@@ -3049,7 +2796,7 @@ class Runner:
                     f"Train time: {stats['train_ellipse_time']:.3f}s/image, "
                     f"Number of GS: {stats['num_GS']}"
                 )
-            elif not val_image_count and cfg.use_ppisp:
+            elif not val_image_count and self.ppisp is not None:
                 print(
                     f"Train canonical PSNR: {stats['train_psnr']:.3f}, SSIM: {stats['train_ssim']:.4f}, LPIPS: {stats['train_lpips']:.3f}; "
                     f"PPISP PSNR: {stats['train_ppisp_psnr']:.3f}, SSIM: {stats['train_ppisp_ssim']:.4f}, LPIPS: {stats['train_ppisp_lpips']:.3f}; "
@@ -3072,7 +2819,7 @@ class Runner:
                     f"Train time: {stats['train_ellipse_time']:.3f}s/image, "
                     f"Number of GS: {stats['num_GS']}"
                 )
-            elif cfg.use_ppisp:
+            elif self.ppisp is not None:
                 print(
                     f"Val canonical PSNR: {stats['psnr']:.3f}, SSIM: {stats['ssim']:.4f}, LPIPS: {stats['lpips']:.3f}; "
                     f"Val PPISP PSNR: {stats['ppisp_psnr']:.3f}, SSIM: {stats['ppisp_ssim']:.4f}, LPIPS: {stats['ppisp_lpips']:.3f}; "
@@ -3090,6 +2837,13 @@ class Runner:
                     f"Train time: {stats['train_ellipse_time']:.3f}s/image, "
                     f"Number of GS: {stats['num_GS']}"
                 )
+            if "train_exposure_psnr" in stats:
+                print(
+                    f"Train exposure correction PSNR: {stats['train_exposure_psnr']:.3f}, "
+                    f"SSIM: {stats['train_exposure_ssim']:.4f}, "
+                    f"LPIPS: {stats['train_exposure_lpips']:.3f}; "
+                    f"Local grid active: {self.exposure_grid_active}"
+                )
             if "no_sky_psnr" in stats:
                 print(
                     f"Val no-sky PSNR: {stats['no_sky_psnr']:.3f}, "
@@ -3105,8 +2859,7 @@ class Runner:
                     f"SSIM: {stats['train_no_sky_ssim']:.4f}, "
                     f"LPIPS: {stats['train_no_sky_lpips']:.3f}"
                 )
-            with open(f"{self.stats_dir}/{stage}_step{step:04d}.json", "w") as f:
-                json.dump(stats, f)
+            write_stats(self.stats_dir, stage, step, stats)
             if artifact_writer is not None:
                 manifest_path = artifact_writer.finalize(stats)
                 print(f"Evaluation artifacts saved to {manifest_path}")
@@ -3165,17 +2918,6 @@ class Runner:
             if is_fisheye
             else None
         )
-        if cfg.calib_opt:
-            if radial_coeffs is None:
-                raise RuntimeError(
-                    "calib_opt requires a four-coefficient fisheye calibration"
-                )
-            K_batch, radial_coeffs = self._apply_calibration_adjustment(
-                K[None],
-                radial_coeffs,
-                torch.tensor([camera_id], device=device),
-            )
-            K = K_batch[0]
 
         # save to video
         video_dir = f"{cfg.result_dir}/videos"
@@ -3333,24 +3075,26 @@ def main(local_rank: int, world_rank, world_size: int, cfg: Config):
                     "pose_opt evaluation requires pose_adjust in the checkpoint"
                 )
             runner._pose_module().load_state_dict(ckpts[0]["pose_adjust"])
-        if cfg.calib_opt:
-            if "calibration_adjust" not in ckpts[0]:
-                raise ValueError(
-                    "calib_opt evaluation requires calibration_adjust in the checkpoint"
-                )
-            runner._calibration_module().load_state_dict(
-                ckpts[0]["calibration_adjust"]
-            )
         if cfg.use_bilateral_grid:
             if "bilateral_grid" not in ckpts[0]:
                 raise ValueError(
                     "use_bilateral_grid evaluation requires bilateral_grid in the checkpoint"
                 )
             runner.bil_grids.load_state_dict(ckpts[0]["bilateral_grid"])
-        if cfg.use_ppisp:
+        if cfg.use_ppisp or cfg.use_exposure_correction:
+            saved_exposure = ckpts[0].get("exposure_correction")
+            if (saved_exposure is not None) != cfg.use_exposure_correction:
+                raise ValueError(
+                    "Checkpoint appearance mode does not match use_exposure_correction"
+                )
+            if saved_exposure is not None:
+                if saved_exposure.get("version") != 1:
+                    raise ValueError("Unsupported exposure correction checkpoint version")
+                runner.exposure_grid.load_state_dict(saved_exposure["grid"])
+                runner.exposure_grid_active = saved_exposure["grid_active"]
             if "ppisp" not in ckpts[0]:
                 raise ValueError(
-                    "use_ppisp evaluation requires PPISP state in the checkpoint"
+                    "PPISP/exposure correction evaluation requires PPISP state in the checkpoint"
                 )
             saved_camera_ids = tuple(
                 int(camera_id)

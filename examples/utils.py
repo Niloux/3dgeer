@@ -382,228 +382,25 @@ class CameraRigPoseModule(_PoseDeltaModule):
 class CameraRefinementStage:
     name: str
     pose: bool
-    focal: bool
-    principal: bool
-    radial_low: bool
-    radial_high: bool
     frozen: bool = False
 
 
 class CameraRefinementSchedule:
-    """Central stage policy for camera refinement."""
+    """Pose warmup, optimization and freeze policy."""
 
-    def __init__(
-        self,
-        pose_start: int,
-        focal_start: int,
-        principal_start: int,
-        radial_start: int,
-        high_order_start: int,
-        freeze_step: int,
-    ):
-        starts = [pose_start, focal_start, principal_start, radial_start]
-        if any(step < 0 for step in starts):
-            raise ValueError("Camera refinement start steps must be non-negative")
-        if high_order_start < -1:
-            raise ValueError("high_order_start must be -1 or non-negative")
+    def __init__(self, pose_start: int, freeze_step: int):
+        if pose_start < 0:
+            raise ValueError("Pose refinement start must be non-negative")
         if freeze_step < -1:
             raise ValueError("freeze_step must be -1 or non-negative")
         self.pose_start = pose_start
-        self.focal_start = focal_start
-        self.principal_start = principal_start
-        self.radial_start = radial_start
-        self.high_order_start = high_order_start
         self.freeze_step = freeze_step
 
-    def at(self, step: int, pose_enabled: bool, calibration_enabled: bool):
+    def at(self, step: int, pose_enabled: bool):
         if self.freeze_step >= 0 and step >= self.freeze_step:
-            return CameraRefinementStage("frozen", False, False, False, False, False, True)
+            return CameraRefinementStage("frozen", False, True)
         pose = pose_enabled and step >= self.pose_start
-        focal = calibration_enabled and step >= self.focal_start
-        principal = calibration_enabled and step >= self.principal_start
-        radial_low = calibration_enabled and step >= self.radial_start
-        radial_high = (
-            calibration_enabled
-            and self.high_order_start >= 0
-            and step >= self.high_order_start
-        )
-        if radial_high:
-            name = "radial_high"
-        elif radial_low:
-            name = "radial_low"
-        elif principal:
-            name = "principal"
-        elif focal:
-            name = "focal"
-        elif pose:
-            name = "pose"
-        else:
-            name = "warmup"
-        return CameraRefinementStage(name, pose, focal, principal, radial_low, radial_high)
-
-
-class CameraCalibrationOptModule(torch.nn.Module):
-    """Shared physical-camera calibration refinement.
-
-    The four radial coefficients remain in one legacy-compatible table, but
-    `radial_low`/`radial_high` expose low/high-order views and gradient controls
-    keep k3/k4 frozen until the schedule explicitly enables them.
-    """
-
-    def __init__(self, n: int, shared_focal: bool = True, allow_aspect_ratio: bool = False):
-        super().__init__()
-        self.shared_focal = shared_focal
-        self.allow_aspect_ratio = allow_aspect_ratio
-        self.focal_log_scales = torch.nn.Embedding(n, 2)
-        self.principal_offsets = torch.nn.Embedding(n, 2)
-        self.radial_deltas = torch.nn.Embedding(n, 4)
-        self.zero_init()
-
-    @property
-    def radial_low(self) -> Tensor:
-        return self.radial_deltas.weight[..., :2]
-
-    @property
-    def radial_high(self) -> Tensor:
-        return self.radial_deltas.weight[..., 2:]
-
-    def zero_init(self):
-        torch.nn.init.zeros_(self.focal_log_scales.weight)
-        torch.nn.init.zeros_(self.principal_offsets.weight)
-        torch.nn.init.zeros_(self.radial_deltas.weight)
-
-    def forward(
-        self, Ks: Tensor, radial_coeffs: Tensor, camera_ids: Tensor
-    ) -> tuple[Tensor, Tensor]:
-        """Apply calibration deltas shared by physical camera.
-
-        Focal deltas are log-scales, so optimized focal lengths stay positive.
-        Principal-point offsets are represented relative to the original focal
-        lengths, which keeps their parameter scale independent of resolution.
-        """
-        assert Ks.shape[:-2] == camera_ids.shape
-        assert radial_coeffs.shape[:-1] == camera_ids.shape
-        assert radial_coeffs.shape[-1] == 4
-
-        focal_log_scales = self.focal_log_scales(camera_ids)
-        if self.shared_focal and not self.allow_aspect_ratio:
-            focal_log_scales = focal_log_scales.mean(dim=-1, keepdim=True).expand_as(
-                focal_log_scales
-            )
-        principal_offsets = self.principal_offsets(camera_ids)
-        focal_lengths = torch.stack((Ks[..., 0, 0], Ks[..., 1, 1]), dim=-1)
-        optimized_focals = focal_lengths * torch.exp(focal_log_scales)
-        optimized_principal = torch.stack(
-            (Ks[..., 0, 2], Ks[..., 1, 2]), dim=-1
-        ) + principal_offsets * focal_lengths
-
-        optimized_Ks = Ks.clone()
-        optimized_Ks[..., 0, 0] = optimized_focals[..., 0]
-        optimized_Ks[..., 1, 1] = optimized_focals[..., 1]
-        optimized_Ks[..., 0, 2] = optimized_principal[..., 0]
-        optimized_Ks[..., 1, 2] = optimized_principal[..., 1]
-        optimized_radial = radial_coeffs + self.radial_deltas(camera_ids)
-        return optimized_Ks, optimized_radial
-
-    def apply_gradient_controls(
-        self,
-        focal_active: bool,
-        principal_active: bool,
-        radial_low_active: bool,
-        radial_high_active: bool,
-        radial_high_lr_scale: float = 1.0,
-        aspect_lr_scale: float = 1.0,
-    ):
-        """Project stage-specific gradients before the calibration optimizer step."""
-        focal_grad = self.focal_log_scales.weight.grad
-        if focal_grad is not None and not focal_active:
-            focal_grad.zero_()
-        elif focal_grad is not None and self.shared_focal and not self.allow_aspect_ratio:
-            focal_grad.copy_(focal_grad.mean(dim=-1, keepdim=True).expand_as(focal_grad))
-        elif focal_grad is not None and self.allow_aspect_ratio:
-            common = focal_grad.mean(dim=-1, keepdim=True)
-            focal_grad.copy_(common + (focal_grad - common) * aspect_lr_scale)
-
-        principal_grad = self.principal_offsets.weight.grad
-        if principal_grad is not None and not principal_active:
-            principal_grad.zero_()
-
-        radial_grad = self.radial_deltas.weight.grad
-        if radial_grad is not None:
-            radial_grad[..., :2].mul_(1.0 if radial_low_active else 0.0)
-            radial_grad[..., 2:].mul_(radial_high_lr_scale if radial_high_active else 0.0)
-
-    @torch.no_grad()
-    def project_parameters(self):
-        if self.shared_focal and not self.allow_aspect_ratio:
-            mean = self.focal_log_scales.weight.mean(dim=-1, keepdim=True)
-            self.focal_log_scales.weight.copy_(mean.expand_as(self.focal_log_scales.weight))
-
-    def prior_loss(
-        self,
-        focal_sigma: float,
-        principal_sigma: float,
-        radial_low_sigma: float,
-        radial_high_sigma: float,
-        aspect_sigma: float,
-    ) -> Tensor:
-        focal = self.focal_log_scales.weight
-        common = focal.mean(dim=-1)
-        loss = common.square().mean() / max(focal_sigma, 1e-8) ** 2
-        if self.allow_aspect_ratio:
-            aspect = (focal[..., 0] - focal[..., 1]) * 0.5
-            loss = loss + aspect.square().mean() / max(aspect_sigma, 1e-8) ** 2
-        principal = self.principal_offsets.weight
-        loss = loss + principal.square().mean() / max(principal_sigma, 1e-8) ** 2
-        low = self.radial_low
-        high = self.radial_high
-        loss = loss + low.square().mean() / max(radial_low_sigma, 1e-8) ** 2
-        loss = loss + high.square().mean() / max(radial_high_sigma, 1e-8) ** 2
-        return loss
-
-    def monotonicity_loss(
-        self,
-        radial_coeffs: Tensor,
-        theta_max: float,
-        samples: int = 32,
-        eps: float = 1e-3,
-    ) -> Tensor:
-        """Penalize folding of the OpenCV fisheye theta mapping."""
-        theta = torch.linspace(
-            0.0, theta_max, samples, device=radial_coeffs.device, dtype=radial_coeffs.dtype
-        )
-        theta2 = theta.square()
-        k1, k2, k3, k4 = radial_coeffs.unbind(dim=-1)
-        derivative = (
-            1.0
-            + 3.0 * k1[..., None] * theta2
-            + 5.0 * k2[..., None] * theta2.square()
-            + 7.0 * k3[..., None] * theta2.square() * theta2
-            + 9.0 * k4[..., None] * theta2.square() * theta2.square()
-        )
-        return F.relu(eps - derivative).square().mean()
-
-    @torch.no_grad()
-    def metrics(self, base_focal: Tensor) -> dict[str, Tensor]:
-        focal = self.focal_log_scales.weight
-        if self.shared_focal and not self.allow_aspect_ratio:
-            focal = focal.mean(dim=-1, keepdim=True).expand_as(focal)
-        focal_change = torch.exp(focal) - 1.0
-        principal_px = self.principal_offsets.weight * base_focal
-
-        def stats(value: Tensor, suffix: str):
-            flat = value.detach().reshape(-1).abs()
-            return {
-                f"{suffix}_mean": flat.mean(),
-                f"{suffix}_p95": torch.quantile(flat, 0.95),
-                f"{suffix}_max": flat.max(),
-            }
-
-        result = {}
-        result.update(stats(focal_change * 100.0, "focal_change_pct"))
-        result.update(stats(principal_px, "principal_change_px"))
-        result.update(stats(self.radial_deltas.weight, "radial_delta"))
-        return result
+        return CameraRefinementStage("pose" if pose else "warmup", pose)
 
 
 class AppearanceOptModule(torch.nn.Module):

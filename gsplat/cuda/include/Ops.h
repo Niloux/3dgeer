@@ -614,8 +614,6 @@ std::tuple<
     at::Tensor,
     at::Tensor,
     at::Tensor,
-    at::Tensor,
-    at::Tensor,
     at::Tensor>
 rasterize_to_pixels_from_world_3dgs_bwd(
     // Gaussian parameters
@@ -655,9 +653,7 @@ rasterize_to_pixels_from_world_3dgs_bwd(
     // optional MRNF attribution buffers
     const at::optional<at::Tensor> densification_error_map, // [..., C, H, W]
     const at::optional<at::Tensor> densification_info,      // [..., 2, N]
-    const bool viewmats_requires_grad,
-    const bool Ks_requires_grad,
-    const bool radial_coeffs_requires_grad
+    const bool viewmats_requires_grad
 );
 
 } // namespace gsplat

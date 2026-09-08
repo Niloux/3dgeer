@@ -270,17 +270,13 @@ void launch_rasterize_to_pixels_from_world_3dgs_bwd_kernel(
     const at::optional<at::Tensor> densification_error_map, // [..., C, H, W]
     const at::optional<at::Tensor> densification_info,      // [..., 2, N]
     const bool viewmats_requires_grad,
-    const bool Ks_requires_grad,
-    const bool radial_coeffs_requires_grad,
     // outputs
     at::Tensor v_means,      // [..., N, 3]
     at::Tensor v_quats,      // [..., N, 4]
     at::Tensor v_scales,     // [..., N, 3]
     at::Tensor v_colors,     // [..., C, N, 3] or [nnz, 3]
     at::Tensor v_opacities,  // [..., C, N] or [nnz]
-    at::Tensor v_viewmats,   // [..., C, 4, 4]
-    at::Tensor v_Ks,         // [..., C, 3, 3]
-    at::Tensor v_radial_coeffs // [..., C, 4]
+    at::Tensor v_viewmats   // [..., C, 4, 4]
 ) ;
 
 } // namespace gsplat

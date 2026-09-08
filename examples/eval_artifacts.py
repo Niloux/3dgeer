@@ -14,7 +14,6 @@ from PIL import Image, ImageDraw, ImageFont
 
 
 _RGB_ERROR_MAX = 0.25
-_INV_DEPTH_ERROR_MAX = 0.25
 _TILE_MAX_WIDTH = 800
 _LABEL_HEIGHT = 30
 _HEADER_HEIGHT = 42
@@ -131,7 +130,6 @@ class EvalArtifact:
     camtoworld: np.ndarray
     valid_mask: Optional[np.ndarray] = None
     sky_mask: Optional[np.ndarray] = None
-    target_depth: Optional[np.ndarray] = None
     final_rgb: Optional[np.ndarray] = None
     final_label: Optional[str] = None
     radial_coeffs: Optional[np.ndarray] = None
@@ -217,39 +215,6 @@ class EvalArtifactWriter:
                 f"Rendered expected depth (0-{self.depth_max:g})",
             )
         ]
-        if artifact.target_depth is not None:
-            target_depth = np.asarray(artifact.target_depth, dtype=np.float32)
-            depth_valid = np.isfinite(target_depth) & (target_depth > 0.0)
-            if valid_mask is not None:
-                depth_valid &= valid_mask
-            rendered_disp = np.where(
-                rendered_depth > 0.0,
-                1.0 / np.maximum(rendered_depth, 1e-8),
-                0.0,
-            )
-            target_disp = np.where(
-                depth_valid,
-                1.0 / np.maximum(target_depth, 1e-8),
-                0.0,
-            )
-            inv_depth_error = (
-                np.abs(rendered_disp - target_disp) * self.scene_scale
-            )
-            depth_row = [
-                (
-                    _depth_visual(target_depth, self.depth_max),
-                    f"GT LiDAR Z depth (0-{self.depth_max:g})",
-                ),
-                *depth_row,
-                (
-                    _heatmap(
-                        inv_depth_error,
-                        _INV_DEPTH_ERROR_MAX,
-                        depth_valid,
-                    ),
-                    f"Scaled inv-depth error (0-{_INV_DEPTH_ERROR_MAX:g})",
-                ),
-            ]
         depth_row.append(
             (
                 _alpha_visual(
@@ -282,7 +247,6 @@ class EvalArtifactWriter:
             "lpips",
             "bilateral_psnr",
             "ppisp_psnr",
-            "depth_inv_l1",
         ):
             value = artifact.metrics.get(key)
             if value is not None and math.isfinite(float(value)):

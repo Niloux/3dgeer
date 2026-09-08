@@ -97,6 +97,38 @@ Training metrics are appended as JSON Lines to `<result_dir>/train.log` every
 `--log-every` steps. Each record is a standalone JSON object, so the file is
 readable with standard text tools and can also be parsed line by line.
 
+Checkpoint and evaluation summaries are aggregated in `<result_dir>/stats/stats.csv`.
+Each row represents one completed `iteration` (one-based) and worker `rank`.
+Columns are grouped as checkpoint resources, evaluation context, then image
+metrics. `elapsed_s` is cumulative wall time and `peak_gpu_mem_gib` is peak
+allocated GPU memory; `*_render_s_per_image` is average render time.
+Checkpoint and evaluation Gaussian counts / resolution factors are kept separately
+because they describe different snapshots. Metrics use
+`{train|val}_{raw|ppisp|exposure|cc|no_sky}_{psnr|ssim|lpips}`, with each variant's
+PSNR, SSIM and LPIPS together. `exposure` means the full PPISP + local-grid result.
+Optional columns appear only when available; missing values stay blank.
+Re-evaluation updates that stage's columns while preserving the checkpoint data.
+Other stages (such as compression) use `stage.metric` columns.
+The benchmark readers keep the original stage/step API and also accept the older
+event-per-row CSV and per-step JSON. Rewrite an existing CSV with
+`uv run python examples/stats.py path/to/results/stats --reformat`.
+To convert an existing stats directory and remove
+the JSON files after checking that their values were preserved:
+
+```bash
+uv run python examples/stats.py path/to/results/stats --migrate-json --remove-json
+```
+
+Camera intrinsics and distortion are fixed COLMAP inputs. `pose_opt` and the
+original sparse COLMAP `depth_loss` remain available; the experimental
+`calib_opt`, `depth_dir`, and encoded LiDAR depth-map supervision were removed.
+Remove those retired fields (including `depth_max`) from older YAML snapshots
+before using them as launch configurations. LiDAR initialization and the direct
+3D `geometry_enabled` supervision remain available.
+
+For global PPISP compensation followed by a local exposure/chroma grid, use
+`--use-exposure-correction`. See the [configuration and evaluation guide](docs/exposure_correction.md).
+
 #### Caveats
 Some caveats about training with our script:
 - Default densification is more stable for 3DGEER training. It may be necessary to set the `max_gaussians` and `max_grow_per_refine` (e.g. `--strategy.max_gaussians 1000000 --strategy.max_grow_per_refine 50000`).
