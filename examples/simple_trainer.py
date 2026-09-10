@@ -2680,7 +2680,7 @@ class Runner:
                     elif ppisp_colors is not None:
                         final_colors = ppisp_colors
                         final_label = "PPISP"
-                    artifact_writer.write(
+                    artifact_writer.submit(
                         EvalArtifact(
                             split=split,
                             image_name=self.parser.image_names[source_index],
@@ -2729,6 +2729,8 @@ class Runner:
 
         if world_rank != 0:
             return {}
+        if artifact_writer is not None:
+            artifact_writer.flush()
         if len(dataloader) == 0:
             return {"ellipse_time": 0.0, "num_images": 0}
 
@@ -2758,19 +2760,23 @@ class Runner:
             else None
         )
         val_stats = {}
-        if len(self.valset) > 0:
-            val_stats = self._eval_dataset(
-                self.valset,
-                "val",
-                apply_train_adjustment=False,
+        try:
+            if len(self.valset) > 0:
+                val_stats = self._eval_dataset(
+                    self.valset,
+                    "val",
+                    apply_train_adjustment=False,
+                    artifact_writer=artifact_writer,
+                )
+            train_stats = self._eval_dataset(
+                self.train_evalset,
+                "train",
+                apply_train_adjustment=True,
                 artifact_writer=artifact_writer,
             )
-        train_stats = self._eval_dataset(
-            self.train_evalset,
-            "train",
-            apply_train_adjustment=True,
-            artifact_writer=artifact_writer,
-        )
+        finally:
+            if artifact_writer is not None:
+                artifact_writer.close()
 
         if world_rank == 0:
             val_image_count = val_stats.pop("num_images", 0)

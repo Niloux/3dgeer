@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import math
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path, PurePosixPath
@@ -160,6 +162,36 @@ class EvalArtifactWriter:
         self.event_dir.mkdir(parents=True, exist_ok=True)
         self.records = []
         self._panel_sources: Dict[Path, str] = {}
+        self._executor = None
+        self._pending = deque()
+
+    def submit(self, artifact: EvalArtifact) -> None:
+        """Queue CPU-owned arrays; callers must not mutate them after submission."""
+        if self._executor is None:
+            self._executor = ThreadPoolExecutor(
+                max_workers=2, thread_name_prefix="eval-artifacts"
+            )
+        # At most two outstanding images (running + queued), plus the caller's.
+        if len(self._pending) >= 2:
+            self.records.append(self._pending.popleft().result())
+        # Allocate paths on the caller thread before workers can finish out of order.
+        panel_path = self._panel_path(artifact)
+        self._pending.append(
+            self._executor.submit(self._write_panel, artifact, panel_path)
+        )
+
+    def flush(self) -> None:
+        """Wait for all panels and propagate background write failures."""
+        while self._pending:
+            self.records.append(self._pending.popleft().result())
+
+    def close(self) -> None:
+        try:
+            self.flush()
+        finally:
+            if self._executor is not None:
+                self._executor.shutdown(wait=True, cancel_futures=True)
+                self._executor = None
 
     def _panel_path(self, artifact: EvalArtifact) -> Path:
         relative = Path(artifact.split) / _safe_image_path(artifact.image_name)
@@ -172,6 +204,11 @@ class EvalArtifactWriter:
         return self.event_dir / relative
 
     def write(self, artifact: EvalArtifact) -> None:
+        """Keep synchronous callers ordered with any preceding queued panels."""
+        self.flush()
+        self.records.append(self._write_panel(artifact, self._panel_path(artifact)))
+
+    def _write_panel(self, artifact: EvalArtifact, panel_path: Path):
         target = np.asarray(artifact.target_rgb, dtype=np.float32)
         canonical = np.asarray(artifact.canonical_rgb, dtype=np.float32)
         final = (
@@ -265,30 +302,29 @@ class EvalArtifactWriter:
                 x = column_index * (tile_width + _GAP)
                 panel.paste(_tile(image, label, tile_width, tile_height), (x, y))
 
-        panel_path = self._panel_path(artifact)
         panel_path.parent.mkdir(parents=True, exist_ok=True)
         panel.save(panel_path, format="JPEG", quality=90)
 
-        self.records.append(
-            {
-                "split": artifact.split,
-                "image_name": artifact.image_name,
-                "image_path": artifact.image_path,
-                "source_index": artifact.source_index,
-                "split_image_id": artifact.split_image_id,
-                "camera_id": artifact.camera_id,
-                "camera_model": artifact.camera_model,
-                "rig_frame_index": artifact.rig_frame_index,
-                "panel_path": panel_path.relative_to(self.render_dir).as_posix(),
-                "metrics": dict(artifact.metrics),
-                "intrinsics": artifact.intrinsics,
-                "camtoworld": artifact.camtoworld,
-                "radial_coeffs": artifact.radial_coeffs,
-                "tangential_coeffs": artifact.tangential_coeffs,
-            }
-        )
+        record = {
+            "split": artifact.split,
+            "image_name": artifact.image_name,
+            "image_path": artifact.image_path,
+            "source_index": artifact.source_index,
+            "split_image_id": artifact.split_image_id,
+            "camera_id": artifact.camera_id,
+            "camera_model": artifact.camera_model,
+            "rig_frame_index": artifact.rig_frame_index,
+            "panel_path": panel_path.relative_to(self.render_dir).as_posix(),
+            "metrics": dict(artifact.metrics),
+            "intrinsics": artifact.intrinsics,
+            "camtoworld": artifact.camtoworld,
+            "radial_coeffs": artifact.radial_coeffs,
+            "tangential_coeffs": artifact.tangential_coeffs,
+        }
+        return record
 
     def finalize(self, summary: Mapping[str, float]) -> Path:
+        self.flush()
         manifest_path = self.event_dir / "manifest.json"
         manifest = {
             "iteration": self.iteration,
