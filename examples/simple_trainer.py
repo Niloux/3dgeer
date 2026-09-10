@@ -43,7 +43,6 @@ from utils import (
     AppearanceOptModule,
     CameraOptModule,
     CameraRefinementSchedule,
-    CameraRigPoseModule,
     knn,
     rgb_to_sh,
     set_random_seed,
@@ -469,10 +468,6 @@ class Config:
     pose_opt_prior_lambda: float = 1e-4
     pose_opt_translation_sigma: float = 0.02
     pose_opt_rotation_sigma_deg: float = 2.0
-    # Replace independent image poses with one pose per rig frame.
-    rig_opt: bool = False
-    rig_reference_camera_id: Optional[int] = None
-    rig_reference_frame_id: Optional[int] = None
     # Add noise to camera extrinsics. This is only to test the camera pose optimization.
     pose_noise: float = 0.0
 
@@ -886,8 +881,6 @@ class Runner:
             raise ValueError("sky_alpha_lambda must be non-negative")
         if cfg.pose_opt_start_step < 0:
             raise ValueError("pose_opt_start_step must be non-negative")
-        if cfg.rig_opt and not cfg.pose_opt:
-            raise ValueError("rig_opt requires pose_opt")
         if cfg.pose_opt_rotation_sigma_deg <= 0.0:
             raise ValueError("pose_opt_rotation_sigma_deg must be positive")
         if cfg.pose_opt_translation_sigma <= 0.0:
@@ -987,13 +980,7 @@ class Runner:
             self.parser,
             split="val",
         )
-        if cfg.rig_opt:
-            _, frame_counts = np.unique(self.parser.frame_ids, return_counts=True)
-            if (int(frame_counts.max()) if frame_counts.size else 0) < 2:
-                raise ValueError(
-                    "rig_opt requires image names that group multiple cameras per frame"
-                )
-        if cfg.pose_opt and not cfg.rig_opt:
+        if cfg.pose_opt:
             if cfg.pose_opt_reference_image_id >= len(self.trainset):
                 raise ValueError("pose_opt_reference_image_id is outside the trainset")
         # Render a lightweight, deterministic sample of training images at eval
@@ -1142,21 +1129,11 @@ class Runner:
             reference_image_id = (
                 None if cfg.pose_opt_reference_image_id < 0 else cfg.pose_opt_reference_image_id
             )
-            if cfg.rig_opt:
-                self.pose_adjust = CameraRigPoseModule(
-                    torch.from_numpy(self.parser.camtoworlds),
-                    torch.from_numpy(self.parser.frame_ids),
-                    torch.tensor(self.parser.camera_ids),
-                    reference_camera_id=cfg.rig_reference_camera_id,
-                    reference_frame_id=cfg.rig_reference_frame_id,
-                    rotation_mode=cfg.pose_opt_rotation_mode,
-                ).to(self.device)
-            else:
-                self.pose_adjust = CameraOptModule(
-                    len(self.trainset),
-                    reference_index=reference_image_id,
-                    rotation_mode=cfg.pose_opt_rotation_mode,
-                ).to(self.device)
+            self.pose_adjust = CameraOptModule(
+                len(self.trainset),
+                reference_index=reference_image_id,
+                rotation_mode=cfg.pose_opt_rotation_mode,
+            ).to(self.device)
             self.pose_adjust.zero_init()
             translation_lr = (
                 cfg.pose_opt_translation_lr
@@ -1265,7 +1242,7 @@ class Runner:
             }
 
             # PPISP's per-frame parameters belong to individual camera images,
-            # not to the rig timestamp shared by the left/right cameras. Group
+            # with separate exposures for the left/right cameras. Group
             # the indices by camera so the official per-camera reports can slice
             # the parameter arrays correctly.
             train_camera_ids = [
@@ -1473,13 +1450,7 @@ class Runner:
         self,
         camtoworlds: Tensor,
         image_ids: Tensor,
-        frame_ids: Optional[Tensor] = None,
-        camera_ids: Optional[Tensor] = None,
     ) -> Tensor:
-        if self.cfg.rig_opt:
-            if frame_ids is None or camera_ids is None:
-                raise RuntimeError("rig_opt requires frame_id and camera_id tensors")
-            return self.pose_adjust(camtoworlds, frame_ids, camera_ids)
         return self.pose_adjust(camtoworlds, image_ids)
 
     def _camera_regularization(self, stage) -> Tensor:
@@ -1763,7 +1734,6 @@ class Runner:
             )
             image_ids = data["image_id"].to(device, non_blocking=True)
             camera_ids = data["camera_id"].to(device, non_blocking=True)
-            frame_ids = data["frame_id"].to(device, non_blocking=True)
             masks = data["mask"].to(device, non_blocking=True) if "mask" in data else None  # [1, H, W]
             sky_masks = (
                 data["sky_mask"].to(device, non_blocking=True) if "sky_mask" in data else None
@@ -1821,7 +1791,7 @@ class Runner:
             pose_opt_active = stage.pose
             if cfg.pose_opt:
                 camtoworlds = self._apply_pose_adjustment(
-                    camtoworlds, image_ids, frame_ids, camera_ids
+                    camtoworlds, image_ids
                 )
 
             # sh schedule
@@ -2519,7 +2489,7 @@ class Runner:
             frame_ids = data["frame_id"].to(device)
             if apply_train_adjustment and cfg.pose_opt:
                 camtoworlds = self._apply_pose_adjustment(
-                    camtoworlds, image_ids, frame_ids, camera_ids
+                    camtoworlds, image_ids
                 )
 
             radial_coeffs = (

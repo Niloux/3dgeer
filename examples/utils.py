@@ -73,7 +73,7 @@ def so3_log_map(rotation: Tensor) -> Tensor:
 
 
 class _PoseDeltaModule(torch.nn.Module):
-    """Shared implementation for per-image and per-rig pose corrections."""
+    """Implementation of per-image pose corrections."""
 
     def __init__(self, n: int, reference_index: int | None, rotation_mode: str):
         super().__init__()
@@ -254,128 +254,6 @@ class CameraOptModule(_PoseDeltaModule):
         """Apply a camera-local pose correction to camera-to-world matrices."""
         assert camtoworlds.shape[:-2] == embed_ids.shape
         return torch.matmul(camtoworlds, self._delta_transform(embed_ids))
-
-
-class CameraRigPoseModule(_PoseDeltaModule):
-    """Shared rig-pose correction with fixed camera-to-rig extrinsics.
-
-    The module derives a fixed rig model from the initial camera-to-world poses.
-    Images sharing a frame id receive the same rig correction, while their
-    physical-camera extrinsics remain tied together.
-    """
-
-    def __init__(
-        self,
-        camtoworlds: Tensor,
-        frame_ids: Tensor,
-        camera_ids: Tensor,
-        reference_camera_id: int | None = None,
-        reference_frame_id: int | None = None,
-        rotation_mode: str = "so3",
-    ):
-        frame_values = torch.unique(frame_ids.detach().cpu(), sorted=True)
-        camera_values = torch.unique(camera_ids.detach().cpu(), sorted=True)
-        if frame_values.numel() == 0 or camera_values.numel() == 0:
-            raise ValueError("A rig requires non-empty frame and camera ids")
-        reference_camera_id = (
-            int(camera_values[0]) if reference_camera_id is None else reference_camera_id
-        )
-        if reference_camera_id not in set(camera_values.tolist()):
-            raise ValueError("reference_camera_id is not present in the dataset")
-        if reference_frame_id is None:
-            reference_frame_id = int(frame_values[0])
-        if reference_frame_id not in set(frame_values.tolist()):
-            raise ValueError("reference_frame_id is not present in the dataset")
-        reference_frame_index = int(
-            (frame_values == reference_frame_id).nonzero(as_tuple=False)[0]
-        )
-        super().__init__(len(frame_values), reference_frame_index, rotation_mode)
-
-        base = camtoworlds.detach().cpu().float()
-        frame_cpu = frame_ids.detach().cpu().long()
-        camera_cpu = camera_ids.detach().cpu().long()
-        base_rig = torch.eye(4).repeat(len(frame_values), 1, 1)
-        camera_to_rig = torch.eye(4).repeat(len(camera_values), 1, 1)
-
-        for frame_index, frame_value in enumerate(frame_values.tolist()):
-            members = (frame_cpu == frame_value).nonzero(as_tuple=False).flatten()
-            ref_members = members[camera_cpu[members] == reference_camera_id]
-            selected = ref_members[0] if ref_members.numel() else members[0]
-            base_rig[frame_index] = base[selected]
-
-        ref_frame_members = (
-            frame_cpu == int(frame_values[reference_frame_index])
-        ).nonzero(as_tuple=False).flatten()
-        for camera_index, camera_value in enumerate(camera_values.tolist()):
-            members = ref_frame_members[camera_cpu[ref_frame_members] == camera_value]
-            if members.numel():
-                selected = members[0]
-                camera_to_rig[camera_index] = (
-                    torch.linalg.inv(base_rig[reference_frame_index]) @ base[selected]
-                )
-                continue
-            found = False
-            for frame_index, frame_value in enumerate(frame_values.tolist()):
-                members = (frame_cpu == frame_value).nonzero(as_tuple=False).flatten()
-                ref_members = members[camera_cpu[members] == reference_camera_id]
-                cam_members = members[camera_cpu[members] == camera_value]
-                if ref_members.numel() and cam_members.numel():
-                    camera_to_rig[camera_index] = (
-                        torch.linalg.inv(base[ref_members[0]]) @ base[cam_members[0]]
-                    )
-                    found = True
-                    break
-            if not found:
-                raise ValueError(
-                    f"Cannot derive camera-to-rig extrinsic for camera {camera_value}; "
-                    "each rig camera must share a frame with the reference camera"
-                )
-
-        # Frames without the reference camera were initially represented by one
-        # of their other cameras. Convert those representatives back to the rig
-        # origin after all fixed camera-to-rig extrinsics are known.
-        for frame_index, frame_value in enumerate(frame_values.tolist()):
-            members = (frame_cpu == frame_value).nonzero(as_tuple=False).flatten()
-            ref_members = members[camera_cpu[members] == reference_camera_id]
-            if ref_members.numel():
-                continue
-            selected = members[0]
-            camera_index = int(
-                (camera_values == camera_cpu[selected]).nonzero(as_tuple=False)[0]
-            )
-            base_rig[frame_index] = (
-                base[selected] @ torch.linalg.inv(camera_to_rig[camera_index])
-            )
-
-        self.register_buffer("frame_values", frame_values)
-        self.register_buffer("camera_values", camera_values)
-        self.register_buffer("base_rig_camtoworlds", base_rig)
-        self.register_buffer("camera_to_rig", camera_to_rig)
-
-    def _lookup(self, values: Tensor, query: Tensor) -> Tensor:
-        query = query.to(device=values.device, dtype=values.dtype)
-        indices = torch.searchsorted(values, query)
-        if torch.any(indices >= values.numel()) or not torch.equal(
-            values[indices.clamp_max(values.numel() - 1)], query
-        ):
-            raise ValueError("Rig received an unknown frame or camera id")
-        return indices
-
-    def forward(
-        self,
-        camtoworlds: Tensor,
-        frame_ids: Tensor,
-        camera_ids: Tensor,
-    ) -> Tensor:
-        assert camtoworlds.shape[:-2] == frame_ids.shape == camera_ids.shape
-        frame_indices = self._lookup(self.frame_values, frame_ids)
-        camera_indices = self._lookup(self.camera_values, camera_ids)
-        rig_delta = self._delta_transform(frame_indices)
-        return (
-            self.base_rig_camtoworlds[frame_indices]
-            @ rig_delta
-            @ self.camera_to_rig[camera_indices]
-        )
 
 
 @dataclass(frozen=True)
