@@ -33,6 +33,7 @@ from gaussian_models import (
     create_sky_splats_with_optimizers,
 )
 from lidar_geometry import LidarSurfelField
+from pose_refinement import TrackReprojection
 from stats import write_stats
 from torch import Tensor
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -42,8 +43,6 @@ from typing_extensions import Literal, assert_never
 from utils import (
     AppearanceOptModule,
     CameraOptModule,
-    CameraRefinementSchedule,
-    CameraRigPoseModule,
     knn,
     rgb_to_sh,
     set_random_seed,
@@ -450,37 +449,21 @@ class Config:
     # Scale regularization
     scale_reg: float = 0.0
 
-    # Enable camera optimization.
+    # GloSplat joint photometric + SfM track reprojection optimization.
     pose_opt: bool = False
-    # Start camera optimization at this training step (inclusive).
-    pose_opt_start_step: int = 500
-    # Learning rate for camera optimization
+    # Adam learning rate for independent per-image camera extrinsics.
     pose_opt_lr: float = 1e-5
-    # Optional independent translation / rotation learning rates. 0 falls back to pose_opt_lr.
-    pose_opt_translation_lr: float = 1e-4
-    pose_opt_rotation_lr: float = 1e-4
-    # SO(3) is the default; 6d is retained for old experiments.
-    pose_opt_rotation_mode: Literal["so3", "6d"] = "so3"
-    # Reference image index in the trainset. -1 disables the single-image anchor.
+    # Fixed reference image in the training set (coordinate-frame anchor).
     pose_opt_reference_image_id: int = 0
-    # Regularization for camera optimization as weight decay
-    pose_opt_reg: float = 1e-6
-    # Explicit physical Pose prior.
-    pose_opt_prior_lambda: float = 1e-4
-    pose_opt_translation_sigma: float = 0.02
-    pose_opt_rotation_sigma_deg: float = 2.0
-    # Replace independent image poses with one pose per rig frame.
-    rig_opt: bool = False
-    rig_reference_camera_id: Optional[int] = None
-    rig_reference_frame_id: Optional[int] = None
-    # Add noise to camera extrinsics. This is only to test the camera pose optimization.
+    pose_opt_ba_lambda: float = 1e-4
+    # Huber threshold in current training-image pixels.
+    pose_opt_huber_delta: float = 1.0
+    # Track-point Adam LR, scaled by scene extent (not specified in the paper).
+    pose_opt_track_lr: float = 1.6e-4
+    # Add noise to camera extrinsics for pose refinement experiments.
     pose_noise: float = 0.0
 
-    # Freeze camera poses at this step; -1 disables the freeze.
-    camera_freeze_step: int = 20_000
-
-    # Densification can be delayed until camera refinement has stabilized.
-    # -1 selects an automatic camera-aware start.
+    # Explicit densification start; -1 starts immediately.
     densification_start_step: int = -1
 
     # Enable appearance optimization. (experimental)
@@ -541,7 +524,6 @@ class Config:
         self.save_steps = [int(i * factor) for i in self.save_steps]
         self.ply_steps = [int(i * factor) for i in self.ply_steps]
         self.max_steps = int(self.max_steps * factor)
-        self.pose_opt_start_step = int(self.pose_opt_start_step * factor)
         self.exposure_correction_grid_start_iter = int(
             self.exposure_correction_grid_start_iter * factor
         )
@@ -549,10 +531,8 @@ class Config:
             self.data_factor_switch_step = int(
                 self.data_factor_switch_step * factor
             )
-        for name in ("camera_freeze_step", "densification_start_step"):
-            value = getattr(self, name)
-            if value >= 0:
-                setattr(self, name, int(value * factor))
+        if self.densification_start_step >= 0:
+            self.densification_start_step = int(self.densification_start_step * factor)
         self.sh_degree_interval = int(self.sh_degree_interval * factor)
 
         strategy = self.strategy
@@ -884,18 +864,13 @@ class Runner:
             )
         if cfg.sky_alpha_lambda < 0.0:
             raise ValueError("sky_alpha_lambda must be non-negative")
-        if cfg.pose_opt_start_step < 0:
-            raise ValueError("pose_opt_start_step must be non-negative")
-        if cfg.rig_opt and not cfg.pose_opt:
-            raise ValueError("rig_opt requires pose_opt")
-        if cfg.pose_opt_rotation_sigma_deg <= 0.0:
-            raise ValueError("pose_opt_rotation_sigma_deg must be positive")
-        if cfg.pose_opt_translation_sigma <= 0.0:
-            raise ValueError("pose_opt_translation_sigma must be positive")
-        if cfg.pose_opt_reference_image_id < -1:
-            raise ValueError("pose_opt_reference_image_id must be -1 or non-negative")
-        if cfg.camera_freeze_step < -1:
-            raise ValueError("camera_freeze_step must be -1 or non-negative")
+        if cfg.pose_opt_reference_image_id < 0:
+            raise ValueError("pose_opt_reference_image_id must be non-negative")
+        for name in (
+            "pose_opt_lr", "pose_opt_track_lr", "pose_opt_ba_lambda", "pose_opt_huber_delta",
+        ):
+            if not math.isfinite(getattr(cfg, name)) or getattr(cfg, name) <= 0:
+                raise ValueError(f"{name} must be finite and positive")
         if cfg.densification_start_step < -1:
             raise ValueError("densification_start_step must be -1 or non-negative")
         appearance_methods = sum(
@@ -932,8 +907,6 @@ class Runner:
             ):
                 if not math.isfinite(getattr(cfg, name)) or getattr(cfg, name) < 0:
                     raise ValueError(f"{name} must be finite and non-negative")
-        if cfg.pose_opt_prior_lambda < 0.0:
-            raise ValueError("pose_opt_prior_lambda must be non-negative")
         if cfg.log_every < 0:
             raise ValueError("log_every must be non-negative")
         if cfg.log_loss_window <= 0:
@@ -982,20 +955,14 @@ class Runner:
             split="train",
             patch_size=cfg.patch_size,
             load_depths=cfg.depth_loss,
+            load_tracks=cfg.pose_opt,
         )
         self.valset = dataset_cls(
             self.parser,
             split="val",
         )
-        if cfg.rig_opt:
-            _, frame_counts = np.unique(self.parser.frame_ids, return_counts=True)
-            if (int(frame_counts.max()) if frame_counts.size else 0) < 2:
-                raise ValueError(
-                    "rig_opt requires image names that group multiple cameras per frame"
-                )
-        if cfg.pose_opt and not cfg.rig_opt:
-            if cfg.pose_opt_reference_image_id >= len(self.trainset):
-                raise ValueError("pose_opt_reference_image_id is outside the trainset")
+        if cfg.pose_opt and cfg.pose_opt_reference_image_id >= len(self.trainset):
+            raise ValueError("pose_opt_reference_image_id is outside the trainset")
         # Render a lightweight, deterministic sample of training images at eval
         # time. When the held-out split is disabled, trainset contains all images.
         self.train_evalset = torch.utils.data.Subset(
@@ -1011,10 +978,6 @@ class Runner:
         self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
         print("Scene scale:", self.scene_scale)
 
-        self.camera_schedule = CameraRefinementSchedule(
-            pose_start=cfg.pose_opt_start_step,
-            freeze_step=cfg.camera_freeze_step,
-        )
         if cfg.densification_start_step >= 0:
             self.densification_start_step = cfg.densification_start_step
         else:
@@ -1139,59 +1102,28 @@ class Runner:
 
         self.pose_optimizers = []
         if cfg.pose_opt:
-            reference_image_id = (
-                None if cfg.pose_opt_reference_image_id < 0 else cfg.pose_opt_reference_image_id
-            )
-            if cfg.rig_opt:
-                self.pose_adjust = CameraRigPoseModule(
-                    torch.from_numpy(self.parser.camtoworlds),
-                    torch.from_numpy(self.parser.frame_ids),
-                    torch.tensor(self.parser.camera_ids),
-                    reference_camera_id=cfg.rig_reference_camera_id,
-                    reference_frame_id=cfg.rig_reference_frame_id,
-                    rotation_mode=cfg.pose_opt_rotation_mode,
-                ).to(self.device)
-            else:
-                self.pose_adjust = CameraOptModule(
-                    len(self.trainset),
-                    reference_index=reference_image_id,
-                    rotation_mode=cfg.pose_opt_rotation_mode,
-                ).to(self.device)
+            self.pose_adjust = CameraOptModule(
+                len(self.trainset), reference_index=cfg.pose_opt_reference_image_id,
+            ).to(self.device)
             self.pose_adjust.zero_init()
-            translation_lr = (
-                cfg.pose_opt_translation_lr
-                if cfg.pose_opt_translation_lr > 0.0
-                else cfg.pose_opt_lr
-            )
-            rotation_lr = (
-                cfg.pose_opt_rotation_lr
-                if cfg.pose_opt_rotation_lr > 0.0
-                else cfg.pose_opt_lr
-            )
+            self.track_adjust = TrackReprojection(
+                torch.from_numpy(self.trainset.track_points).float(),
+                torch.from_numpy(self.trainset.track_point_indices),
+            ).to(self.device)
             self.pose_optimizers = [
+                torch.optim.Adam(self.pose_adjust.parameters(), lr=cfg.pose_opt_lr),
                 torch.optim.Adam(
-                    [
-                        {
-                            "params": self.pose_adjust.trans.parameters(),
-                            "lr": translation_lr * math.sqrt(cfg.batch_size),
-                        },
-                        {
-                            "params": self.pose_adjust.rot.parameters(),
-                            "lr": rotation_lr * math.sqrt(cfg.batch_size),
-                        },
-                    ],
-                    weight_decay=cfg.pose_opt_reg,
-                )
+                    self.track_adjust.parameters(), lr=cfg.pose_opt_track_lr * self.scene_scale,
+                ),
             ]
             if world_size > 1:
                 self.pose_adjust = DDP(self.pose_adjust)
-
+                self.track_adjust = DDP(self.track_adjust)
 
         if cfg.pose_noise > 0.0:
             self.pose_perturb = CameraOptModule(
                 len(self.trainset),
                 reference_index=None,
-                rotation_mode=cfg.pose_opt_rotation_mode,
             ).to(self.device)
             self.pose_perturb.random_init(cfg.pose_noise)
             if world_size > 1:
@@ -1445,9 +1377,6 @@ class Runner:
             frame_idx=frame_index,
         ).unsqueeze(0)
 
-    def _camera_stage(self, step: int):
-        return self.camera_schedule.at(step, self.cfg.pose_opt)
-
     def _data_factor_at_step(self, step: int) -> int:
         final_factor = self.cfg.data_factor_final
         if final_factor is not None and step >= self.cfg.data_factor_switch_step:
@@ -1468,30 +1397,6 @@ class Runner:
             input_sizes=sorted(set(self.parser.input_imsize_dict.values())),
             render_sizes=sorted(set(self.parser.imsize_dict.values())),
         )
-
-    def _apply_pose_adjustment(
-        self,
-        camtoworlds: Tensor,
-        image_ids: Tensor,
-        frame_ids: Optional[Tensor] = None,
-        camera_ids: Optional[Tensor] = None,
-    ) -> Tensor:
-        if self.cfg.rig_opt:
-            if frame_ids is None or camera_ids is None:
-                raise RuntimeError("rig_opt requires frame_id and camera_id tensors")
-            return self.pose_adjust(camtoworlds, frame_ids, camera_ids)
-        return self.pose_adjust(camtoworlds, image_ids)
-
-    def _camera_regularization(self, stage) -> Tensor:
-        loss = torch.zeros((), device=self.device)
-        cfg = self.cfg
-        if cfg.pose_opt and stage.pose:
-            loss = loss + cfg.pose_opt_prior_lambda * self._pose_module().prior_loss(
-                cfg.pose_opt_translation_sigma,
-                math.radians(cfg.pose_opt_rotation_sigma_deg),
-            )
-        return loss
-
 
     @torch.no_grad()
     def _camera_metrics(self) -> Dict[str, Tensor]:
@@ -1624,9 +1529,12 @@ class Runner:
         return renders, alphas, info
 
     def _make_trainloader(self):
+        from datasets.colmap import collate_with_tracks
+
         cfg = self.cfg
         return torch.utils.data.DataLoader(
             self.trainset,
+            collate_fn=collate_with_tracks if cfg.pose_opt else None,
             batch_size=cfg.batch_size,
             shuffle=True,
             num_workers=4,
@@ -1680,13 +1588,6 @@ class Runner:
                 self.optimizers["means"], gamma=means_lr_gamma
             ),
         ]
-        pose_scheduler = None
-        if cfg.pose_opt and cfg.pose_opt_start_step < max_steps:
-            # pose optimization has a learning rate schedule
-            pose_opt_steps = max_steps - cfg.pose_opt_start_step
-            pose_scheduler = torch.optim.lr_scheduler.ExponentialLR(
-                self.pose_optimizers[0], gamma=0.01 ** (1.0 / pose_opt_steps)
-            )
         if cfg.use_bilateral_grid:
             # bilateral grid has a learning rate schedule. Linear warmup for 1000 steps.
             schedulers.append(
@@ -1787,10 +1688,9 @@ class Runner:
                 depths_gt = data["depths"].to(device, non_blocking=True)  # [1, M]
 
             height, width = pixels.shape[1:3]
-            stage = self._camera_stage(step)
 
             valid_f = None
-            if data["camera_model"] == 5 and radial_coeffs is not None:
+            if bool((data["camera_model"] == 5).all()) and radial_coeffs is not None:
                 # Cache the valid-pixel mask for the fixed COLMAP intrinsics.
                 K_key = tuple(float(x) for x in data["K"].flatten().tolist())
                 radial_key = tuple(float(x) for x in data["radial_coeffs"].flatten().tolist())
@@ -1818,11 +1718,8 @@ class Runner:
             if cfg.pose_noise:
                 camtoworlds = self.pose_perturb(camtoworlds, image_ids)
 
-            pose_opt_active = stage.pose
             if cfg.pose_opt:
-                camtoworlds = self._apply_pose_adjustment(
-                    camtoworlds, image_ids, frame_ids, camera_ids
-                )
+                camtoworlds = self.pose_adjust(camtoworlds, image_ids)
 
             # sh schedule
             sh_degree_to_use = min(step // cfg.sh_degree_interval, cfg.sh_degree)
@@ -1845,7 +1742,7 @@ class Runner:
                 image_ids=image_ids,
                 render_mode="RGB+ED" if cfg.depth_loss else "RGB",
                 masks=masks,
-                camera_model="fisheye" if cfg.keep_distortion and data["camera_model"] == 5 else "pinhole",
+                camera_model="fisheye" if cfg.keep_distortion and bool((data["camera_model"] == 5).all()) else "pinhole",
                 radial_coeffs=radial_coeffs,
                 tangential_coeffs=tangential_coeffs,
                 calc_densification_info=collect_mrnf_info,
@@ -2000,7 +1897,21 @@ class Runner:
                     1.0
                 )
                 loss += cfg.sky_alpha_lambda * sky_alpha_loss
-            loss += self._camera_regularization(stage)
+            ba_loss = torch.zeros_like(l1loss)
+            reprojection_error = torch.zeros_like(l1loss)
+            track_count = torch.zeros((), device=device, dtype=torch.long)
+            if cfg.pose_opt:
+                ba_loss, reprojection_error, track_count = self.track_adjust(
+                    camtoworlds, Ks,
+                    data["track_ids"].to(device, non_blocking=True),
+                    data["track_xy"].to(device, non_blocking=True),
+                    data["track_batch_ids"].to(device, non_blocking=True),
+                    camera_model="fisheye" if cfg.keep_distortion and bool((data["camera_model"] == 5).all()) else "pinhole",
+                    radial_coeffs=radial_coeffs,
+                    tangential_coeffs=tangential_coeffs,
+                    huber_delta=cfg.pose_opt_huber_delta,
+                )
+                loss += cfg.pose_opt_ba_lambda * ba_loss
 
             do_update = True
             if cfg.skip_non_finite_loss and (not torch.isfinite(loss).all()):
@@ -2059,7 +1970,7 @@ class Runner:
             if progress_now >= next_progress_update or step == max_steps - 1:
                 desc = (
                     f"loss={loss_value:.3f}| factor={self.parser.factor}x| "
-                    f"stage={stage.name}| "
+                    f"pose={cfg.pose_opt}| "
                     f"sh degree={sh_degree_to_use}| "
                 )
                 if self.sky_splats is not None:
@@ -2128,11 +2039,16 @@ class Runner:
                     "data_factor": self.parser.factor,
                     "image_width": int(width),
                     "image_height": int(height),
-                    "camera_stage": stage.name,
+                    "camera_stage": "joint" if cfg.pose_opt else "fixed",
                     "sh_degree": sh_degree_to_use,
                     "means_lr": self.optimizers["means"].param_groups[0]["lr"],
                     "update_applied": do_update,
                 }
+                if cfg.pose_opt:
+                    metrics["pose/ba_loss"] = ba_loss.detach()
+                    metrics["pose/weighted_ba_loss"] = cfg.pose_opt_ba_lambda * ba_loss.detach()
+                    metrics["pose/reprojection_error_px"] = reprojection_error
+                    metrics["pose/track_observations"] = track_count
                 for name, value in self._camera_metrics().items():
                     metrics[name] = value
                 if self.sky_splats is not None:
@@ -2204,6 +2120,8 @@ class Runner:
                 if self.sky_splats is not None:
                     data["sky_splats"] = self.sky_splats.state_dict()
                 if cfg.pose_opt:
+                    track_module = self.track_adjust.module if world_size > 1 else self.track_adjust
+                    data["track_adjust"] = track_module.state_dict()
                     if world_size > 1:
                         data["pose_adjust"] = self.pose_adjust.module.state_dict()
                     else:
@@ -2336,7 +2254,7 @@ class Runner:
                     optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
             for optimizer in self.pose_optimizers:
-                if do_update and pose_opt_active:
+                if do_update:
                     optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
             for optimizer in self.app_optimizers:
@@ -2364,8 +2282,6 @@ class Runner:
                     scheduler.step()
                 for scheduler in ppisp_schedulers:
                     scheduler.step()
-                if pose_opt_active and pose_scheduler is not None:
-                    pose_scheduler.step()
 
                 # Post-step parameter clamps for numerical stability.
                 if cfg.scales_log_max > cfg.scales_log_min:
@@ -2518,9 +2434,7 @@ class Runner:
             camera_ids = data["camera_id"].to(device)
             frame_ids = data["frame_id"].to(device)
             if apply_train_adjustment and cfg.pose_opt:
-                camtoworlds = self._apply_pose_adjustment(
-                    camtoworlds, image_ids, frame_ids, camera_ids
-                )
+                camtoworlds = self.pose_adjust(camtoworlds, image_ids)
 
             radial_coeffs = (
                 data["radial_coeffs"].to(device)
@@ -2547,7 +2461,7 @@ class Runner:
                 image_ids=image_ids if apply_train_adjustment else None,
                 masks=masks,
                 render_mode="RGB+ED",
-                camera_model="fisheye" if cfg.keep_distortion and data["camera_model"] == 5 else "pinhole",
+                camera_model="fisheye" if cfg.keep_distortion and bool((data["camera_model"] == 5).all()) else "pinhole",
                 radial_coeffs=radial_coeffs,
                 tangential_coeffs=tangential_coeffs,
             )  # [1, H, W, 4]
@@ -3075,6 +2989,13 @@ def main(local_rank: int, world_rank, world_size: int, cfg: Config):
                     "pose_opt evaluation requires pose_adjust in the checkpoint"
                 )
             runner._pose_module().load_state_dict(ckpts[0]["pose_adjust"])
+            if "track_adjust" not in ckpts[0]:
+                raise ValueError("Joint pose optimization requires track_adjust in the checkpoint")
+            track_module = runner.track_adjust.module if world_size > 1 else runner.track_adjust
+            saved_tracks = ckpts[0]["track_adjust"]
+            if not torch.equal(track_module.point_indices, saved_tracks["point_indices"]):
+                raise ValueError("Checkpoint SfM tracks do not match the training split")
+            track_module.load_state_dict(saved_tracks)
         if cfg.use_bilateral_grid:
             if "bilateral_grid" not in ckpts[0]:
                 raise ValueError(

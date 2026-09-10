@@ -126,6 +126,11 @@ Remove those retired fields (including `depth_max`) from older YAML snapshots
 before using them as launch configurations. LiDAR initialization and the direct
 3D `geometry_enabled` supervision remain available.
 
+`pose_opt` now jointly optimizes independent image poses and persistent SfM
+track points using photometric and robust reprojection losses throughout training.
+See the [pose refinement guide](docs/pose_refinement.md) for parameters and migration
+from the removed rig, pose-prior and warmup/freeze options.
+
 For global PPISP compensation followed by a local exposure/chroma grid, use
 `--use-exposure-correction`. See the [configuration and evaluation guide](docs/exposure_correction.md).
 

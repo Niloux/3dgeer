@@ -1,17 +1,17 @@
 preset: mrnf
 
 # Generated for examples/simple_trainer.py.
-data_dir: "data/展厅0908"
-data_factor: 4
+data_dir: "/home/wuyou/remote/preprocess/output/展厅0908"
+data_factor: 2
 # data_factor_final: 2
-# data_factor_switch_step: 12000
+# data_factor_switch_step: 10000
 test_every: 8
 use_test_split: false
 normalize_world_space: false
 log_every: 100
 log_loss_window: 100
 
-result_dir: results/0908/展厅_exposure
+result_dir: results/0910/展厅-2+几何约束-新位姿矫正(恢复学习率)
 disable_viewer: true
 disable_video: true
 
@@ -34,7 +34,7 @@ with_ut: true
 with_eval3d: true
 
 init_type: lidar
-init_lidar_path: "data/展厅0908/lidar.ply"
+init_lidar_path: "/home/wuyou/remote/preprocess/output/展厅0908/lidar.ply"
 init_opa: 0.5
 init_scale: 1.0
 init_use_knn_pca: true
@@ -78,12 +78,14 @@ strategy:
 densification_start_step: 500
 
 # Direct 3D LiDAR surfel supervision; no depth maps are loaded.
-geometry_enabled: false
+geometry_enabled: true
 geometry_lambda: 0.03
 
 pose_opt: true
-pose_opt_start_step: 500
 pose_opt_lr: 1.0e-4
+pose_opt_ba_lambda: 1.0e-4
+pose_opt_huber_delta: 1.0
+pose_opt_track_lr: 1.6e-4
 
 
 app_opt: false

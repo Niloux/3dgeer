@@ -356,13 +356,17 @@ class Parser:
         points_err = manager.point3D_errors.astype(np.float32)
         points_rgb = manager.point3D_colors.astype(np.uint8)
         point_indices = dict()
+        point_observations = dict()
 
         image_id_to_name = {v: k for k, v in manager.name_to_image_id.items()}
         for point_id, data in manager.point3D_id_to_images.items():
-            for image_id, _ in data:
+            for image_id, point2d_idx in data:
                 image_name = image_id_to_name[image_id]
                 point_idx = manager.point3D_id_to_point3D_idx[point_id]
                 point_indices.setdefault(image_name, []).append(point_idx)
+                point_observations.setdefault(image_name, []).append(
+                    imdata[image_id].points2D[point2d_idx]
+                )
         point_indices = {
             k: np.array(v).astype(np.int32) for k, v in point_indices.items() if k in image_names
         }
@@ -421,6 +425,10 @@ class Parser:
         self.points_err = points_err  # np.ndarray, (num_points,)
         self.points_rgb = points_rgb  # np.ndarray, (num_points, 3)
         self.point_indices = point_indices  # Dict[str, np.ndarray], image_name -> [M,]
+        self.point_observations = {
+            name: np.asarray(point_observations[name], dtype=np.float64)
+            for name in point_indices
+        }
         self.transform = transform  # np.ndarray, (4, 4)
 
         # Read only the image header to determine how source pixels relate to
@@ -500,6 +508,10 @@ class Parser:
                     mapx, mapy = cv2.initUndistortRectifyMap(
                         K, params, None, K_undist, (width, height), cv2.CV_32FC1
                     )
+                    x, y, w, h = roi_undist
+                    mapx, mapy = mapx[y : y + h, x : x + w], mapy[y : y + h, x : x + w]
+                    K_undist[0, 2] -= x
+                    K_undist[1, 2] -= y
                     mask = None
                 elif camtype == "fisheye":
                     D = params.astype(np.float64).reshape(4, 1)
@@ -584,11 +596,13 @@ class Dataset:
         split: str = "train",
         patch_size: Optional[int] = None,
         load_depths: bool = False,
+        load_tracks: bool = False,
     ):
         self.parser = parser
         self.split = split
         self.patch_size = patch_size
         self.load_depths = load_depths
+        self.load_tracks = load_tracks
         indices = np.arange(len(self.parser.image_names))
         if not self.parser.use_test_split:
             self.indices = indices if split == "train" else indices[:0]
@@ -596,6 +610,20 @@ class Dataset:
             self.indices = indices[indices % self.parser.test_every != 0]
         else:
             self.indices = indices[indices % self.parser.test_every == 0]
+
+        if load_tracks:
+            # Only training views establish geometric constraints. Keep a compact
+            # table of points seen by at least two distinct training images.
+            counts = np.zeros(len(parser.points), dtype=np.int32)
+            for index in self.indices:
+                ids = parser.point_indices.get(parser.image_names[index], [])
+                counts[np.unique(ids).astype(np.int64)] += 1
+            self.track_point_indices = np.flatnonzero(counts >= 2)
+            if not len(self.track_point_indices):
+                raise ValueError("pose_opt requires SfM tracks observed in at least two training images")
+            self.track_points = parser.points[self.track_point_indices].copy()
+            self.track_id_map = np.full(len(parser.points), -1, dtype=np.int64)
+            self.track_id_map[self.track_point_indices] = np.arange(len(self.track_points))
 
     def __len__(self):
         return len(self.indices)
@@ -660,12 +688,7 @@ class Dataset:
                     mapy,
                     cv2.INTER_NEAREST,
                 ).astype(bool)
-            x, y, w, h = self.parser.roi_dict[camera_id]
-            image = image[y : y + h, x : x + w]
-            if dataset_mask is not None:
-                dataset_mask = dataset_mask[y : y + h, x : x + w]
-            if sky_mask is not None:
-                sky_mask = sky_mask[y : y + h, x : x + w]
+            # Remap tables already cover the cropped ROI, with matching K.
 
         mask, sky_mask = _combine_supervision_masks(mask, dataset_mask, sky_mask)
 
@@ -698,6 +721,36 @@ class Dataset:
             data["mask"] = torch.from_numpy(mask).bool()
         if sky_mask is not None:
             data["sky_mask"] = torch.from_numpy(sky_mask).bool()
+
+        if self.load_tracks:
+            name = self.parser.image_names[index]
+            point_ids = self.parser.point_indices.get(name, np.empty(0, dtype=np.int64))
+            track_ids = self.track_id_map[point_ids]
+            xy = self.parser.point_observations.get(name, np.empty((0, 2))).copy()
+            base_K = self.parser._base_Ks_dict[camera_id]
+            if len(xy) and self.parser.undistort and len(params):
+                undistort = (
+                    cv2.fisheye.undistortPoints
+                    if self.parser.camera_models_dict[camera_id] == 5
+                    else cv2.undistortPoints
+                )
+                xy = undistort(xy.reshape(-1, 1, 2), base_K, params, P=K).reshape(-1, 2)
+            else:
+                # This also accounts for source-image resizing and random crops.
+                xy = (xy - base_K[:2, 2]) / np.diag(base_K)[:2]
+                xy = xy * np.diag(K)[:2] + K[:2, 2]
+            h, w = image.shape[:2]
+            valid = (
+                (track_ids >= 0) & np.isfinite(xy).all(axis=-1)
+                & (xy[:, 0] >= 0) & (xy[:, 0] < w)
+                & (xy[:, 1] >= 0) & (xy[:, 1] < h)
+            )
+            track_ids, xy = track_ids[valid], xy[valid]
+            if mask is not None:
+                valid = mask[xy[:, 1].astype(np.int64), xy[:, 0].astype(np.int64)]
+                track_ids, xy = track_ids[valid], xy[valid]
+            data["track_ids"] = torch.from_numpy(track_ids)
+            data["track_xy"] = torch.from_numpy(xy).float()
 
         if not self.parser.undistort:
             # Provide distortion coefficients for renderers that support it.
@@ -743,6 +796,21 @@ class Dataset:
             data["depths"] = torch.from_numpy(depths).float()
 
         return data
+
+
+def collate_with_tracks(samples):
+    """Pack variable-length feature observations alongside the image batch."""
+    if len({sample["camera_model"] for sample in samples}) != 1:
+        raise ValueError("A render batch must use one camera model; use batch_size=1 for mixed models")
+    ids = [sample.pop("track_ids") for sample in samples]
+    xy = [sample.pop("track_xy") for sample in samples]
+    batch = torch.utils.data.default_collate(samples)
+    batch["track_ids"] = torch.cat(ids)
+    batch["track_xy"] = torch.cat(xy)
+    batch["track_batch_ids"] = torch.cat([
+        torch.full_like(point_ids, i) for i, point_ids in enumerate(ids)
+    ])
+    return batch
 
 
 if __name__ == "__main__":

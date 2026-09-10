@@ -1,6 +1,5 @@
 import math
 import random
-from dataclasses import dataclass
 
 import numpy as np
 import torch
@@ -49,93 +48,22 @@ def so3_exp_map(omega: Tensor) -> Tensor:
     return eye + A[..., None] * skew + B[..., None] * torch.matmul(skew, skew)
 
 
-def so3_log_map(rotation: Tensor) -> Tensor:
-    """Convert rotation matrices to axis-angle vectors."""
-    cosine = ((rotation.diagonal(dim1=-2, dim2=-1).sum(-1) - 1.0) * 0.5).clamp(
-        -1.0, 1.0
-    )
-    theta = torch.acos(cosine)
-    vee = torch.stack(
-        (
-            rotation[..., 2, 1] - rotation[..., 1, 2],
-            rotation[..., 0, 2] - rotation[..., 2, 0],
-            rotation[..., 1, 0] - rotation[..., 0, 1],
-        ),
-        dim=-1,
-    )
-    sin_theta = torch.sin(theta)
-    scale = torch.where(
-        theta < 1e-5,
-        0.5 + theta.square() / 12.0,
-        theta / (2.0 * sin_theta).clamp_min(1e-8),
-    )
-    return vee * scale[..., None]
+class CameraOptModule(torch.nn.Module):
+    """Independent per-image rigid pose corrections with SO(3) rotations."""
 
-
-class _PoseDeltaModule(torch.nn.Module):
-    """Shared implementation for per-image and per-rig pose corrections."""
-
-    def __init__(self, n: int, reference_index: int | None, rotation_mode: str):
+    def __init__(self, n: int, reference_index: int | None = 0):
         super().__init__()
         if n <= 0:
             raise ValueError("Pose optimization requires at least one pose")
-        if rotation_mode not in {"so3", "6d"}:
-            raise ValueError("rotation_mode must be 'so3' or '6d'")
         if reference_index is not None and not 0 <= reference_index < n:
             raise ValueError("reference_index is outside the pose table")
-        self.rotation_mode = rotation_mode
         self.reference_index = reference_index
         self.trans = torch.nn.Embedding(n, 3, padding_idx=reference_index)
-        self.rot = torch.nn.Embedding(
-            n, 3 if rotation_mode == "so3" else 6, padding_idx=reference_index
-        )
-        self.register_buffer(
-            "identity",
-            torch.tensor([1.0, 0.0, 0.0, 0.0, 1.0, 0.0]),
-            persistent=False,
-        )
+        self.rot = torch.nn.Embedding(n, 3, padding_idx=reference_index)
 
-    def _load_from_state_dict(
-        self,
-        state_dict,
-        prefix,
-        local_metadata,
-        strict,
-        missing_keys,
-        unexpected_keys,
-        error_msgs,
-    ):
-        """Migrate checkpoints written by the old 9D pose embedding."""
-        legacy_key = prefix + "embeds.weight"
-        trans_key = prefix + "trans.weight"
-        rot_key = prefix + "rot.weight"
-        if legacy_key in state_dict and trans_key not in state_dict:
-            legacy = state_dict.pop(legacy_key)
-            state_dict[trans_key] = legacy[..., :3]
-            legacy_rot = legacy[..., 3:]
-            if self.rotation_mode == "so3":
-                identity = self.identity.to(legacy_rot).expand_as(legacy_rot)
-                state_dict[rot_key] = so3_log_map(
-                    rotation_6d_to_matrix(legacy_rot + identity)
-                )
-            else:
-                state_dict[rot_key] = legacy_rot
-        state_dict.pop(prefix + "identity", None)
-        super()._load_from_state_dict(
-            state_dict,
-            prefix,
-            local_metadata,
-            strict,
-            missing_keys,
-            unexpected_keys,
-            error_msgs,
-        )
-        self._zero_reference()
-
-    @property
-    def embeds(self):
-        """Compatibility view for old callers that only inspect `.embeds.weight.grad`."""
-        return _LegacyPoseEmbeddingView(self)
+    def forward(self, camtoworlds: Tensor, embed_ids: Tensor) -> Tensor:
+        """Apply a camera-local SE(3) correction to camera-to-world matrices."""
+        return camtoworlds @ self._delta_transform(embed_ids)
 
     def zero_init(self):
         torch.nn.init.zeros_(self.trans.weight)
@@ -154,49 +82,19 @@ class _PoseDeltaModule(torch.nn.Module):
                 self.rot.weight[self.reference_index].zero_()
 
     def _delta_transform(self, pose_ids: Tensor) -> Tensor:
-        batch_dims = pose_ids.shape
         dx = self.trans(pose_ids)
         drot = self.rot(pose_ids)
-        if self.rotation_mode == "so3":
-            rot = so3_exp_map(drot)
-        else:
-            rot = rotation_6d_to_matrix(
-                drot + self.identity.to(drot).expand(*batch_dims, -1)
-            )
+        rot = so3_exp_map(drot)
         transform = torch.eye(4, device=dx.device, dtype=dx.dtype)
-        transform = transform.expand(*batch_dims, 4, 4).clone()
+        transform = transform.expand(*pose_ids.shape, 4, 4).clone()
         transform[..., :3, :3] = rot
         transform[..., :3, 3] = dx
         return transform
 
-    def prior_loss(self, translation_sigma: float, rotation_sigma: float) -> Tensor:
-        """Normalized physical prior for all non-reference pose corrections."""
-        trans = self.trans.weight
-        rot = self.rot.weight
-        if self.reference_index is not None:
-            mask = torch.ones(trans.shape[0], dtype=torch.bool, device=trans.device)
-            mask[self.reference_index] = False
-            trans, rot = trans[mask], rot[mask]
-        if trans.numel() == 0:
-            return self.trans.weight.sum() * 0.0
-        return (
-            trans.square().sum(-1) / max(translation_sigma, 1e-8) ** 2
-            + rot.square().sum(-1) / max(rotation_sigma, 1e-8) ** 2
-        ).mean()
-
     @torch.no_grad()
     def metrics(self) -> dict[str, Tensor]:
         trans_norm = torch.linalg.vector_norm(self.trans.weight, dim=-1)
-        if self.rotation_mode == "so3":
-            rot_norm = torch.linalg.vector_norm(self.rot.weight, dim=-1)
-        else:
-            rot_matrix = rotation_6d_to_matrix(
-                self.rot.weight + self.identity.to(self.rot.weight)
-            )
-            cosine = (
-                (rot_matrix.diagonal(dim1=-2, dim2=-1).sum(-1) - 1.0) * 0.5
-            ).clamp(-1.0, 1.0)
-            rot_norm = torch.acos(cosine)
+        rot_norm = torch.linalg.vector_norm(self.rot.weight, dim=-1)
         if self.reference_index is not None:
             mask = torch.ones_like(trans_norm, dtype=torch.bool)
             mask[self.reference_index] = False
@@ -215,192 +113,6 @@ class _PoseDeltaModule(torch.nn.Module):
             "rotation_p95_deg": torch.quantile(rotation_deg, 0.95),
             "rotation_max_deg": rotation_deg.max(),
         }
-
-
-class _LegacyPoseEmbeddingView:
-    def __init__(self, module: _PoseDeltaModule):
-        self._module = module
-
-    @property
-    def weight(self):
-        return _LegacyPoseWeightView(self._module)
-
-
-class _LegacyPoseWeightView:
-    def __init__(self, module: _PoseDeltaModule):
-        self._module = module
-
-    @property
-    def grad(self):
-        trans_grad = self._module.trans.weight.grad
-        rot_grad = self._module.rot.weight.grad
-        if trans_grad is None or rot_grad is None:
-            return None
-        return torch.cat((trans_grad, rot_grad), dim=-1)
-
-
-class CameraOptModule(_PoseDeltaModule):
-    """Per-image camera pose optimization with SO(3) tangent corrections."""
-
-    def __init__(
-        self,
-        n: int,
-        reference_index: int | None = 0,
-        rotation_mode: str = "so3",
-    ):
-        super().__init__(n, reference_index, rotation_mode)
-
-    def forward(self, camtoworlds: Tensor, embed_ids: Tensor) -> Tensor:
-        """Apply a camera-local pose correction to camera-to-world matrices."""
-        assert camtoworlds.shape[:-2] == embed_ids.shape
-        return torch.matmul(camtoworlds, self._delta_transform(embed_ids))
-
-
-class CameraRigPoseModule(_PoseDeltaModule):
-    """Shared rig-pose correction with fixed camera-to-rig extrinsics.
-
-    The module derives a fixed rig model from the initial camera-to-world poses.
-    Images sharing a frame id receive the same rig correction, while their
-    physical-camera extrinsics remain tied together.
-    """
-
-    def __init__(
-        self,
-        camtoworlds: Tensor,
-        frame_ids: Tensor,
-        camera_ids: Tensor,
-        reference_camera_id: int | None = None,
-        reference_frame_id: int | None = None,
-        rotation_mode: str = "so3",
-    ):
-        frame_values = torch.unique(frame_ids.detach().cpu(), sorted=True)
-        camera_values = torch.unique(camera_ids.detach().cpu(), sorted=True)
-        if frame_values.numel() == 0 or camera_values.numel() == 0:
-            raise ValueError("A rig requires non-empty frame and camera ids")
-        reference_camera_id = (
-            int(camera_values[0]) if reference_camera_id is None else reference_camera_id
-        )
-        if reference_camera_id not in set(camera_values.tolist()):
-            raise ValueError("reference_camera_id is not present in the dataset")
-        if reference_frame_id is None:
-            reference_frame_id = int(frame_values[0])
-        if reference_frame_id not in set(frame_values.tolist()):
-            raise ValueError("reference_frame_id is not present in the dataset")
-        reference_frame_index = int(
-            (frame_values == reference_frame_id).nonzero(as_tuple=False)[0]
-        )
-        super().__init__(len(frame_values), reference_frame_index, rotation_mode)
-
-        base = camtoworlds.detach().cpu().float()
-        frame_cpu = frame_ids.detach().cpu().long()
-        camera_cpu = camera_ids.detach().cpu().long()
-        base_rig = torch.eye(4).repeat(len(frame_values), 1, 1)
-        camera_to_rig = torch.eye(4).repeat(len(camera_values), 1, 1)
-
-        for frame_index, frame_value in enumerate(frame_values.tolist()):
-            members = (frame_cpu == frame_value).nonzero(as_tuple=False).flatten()
-            ref_members = members[camera_cpu[members] == reference_camera_id]
-            selected = ref_members[0] if ref_members.numel() else members[0]
-            base_rig[frame_index] = base[selected]
-
-        ref_frame_members = (
-            frame_cpu == int(frame_values[reference_frame_index])
-        ).nonzero(as_tuple=False).flatten()
-        for camera_index, camera_value in enumerate(camera_values.tolist()):
-            members = ref_frame_members[camera_cpu[ref_frame_members] == camera_value]
-            if members.numel():
-                selected = members[0]
-                camera_to_rig[camera_index] = (
-                    torch.linalg.inv(base_rig[reference_frame_index]) @ base[selected]
-                )
-                continue
-            found = False
-            for frame_index, frame_value in enumerate(frame_values.tolist()):
-                members = (frame_cpu == frame_value).nonzero(as_tuple=False).flatten()
-                ref_members = members[camera_cpu[members] == reference_camera_id]
-                cam_members = members[camera_cpu[members] == camera_value]
-                if ref_members.numel() and cam_members.numel():
-                    camera_to_rig[camera_index] = (
-                        torch.linalg.inv(base[ref_members[0]]) @ base[cam_members[0]]
-                    )
-                    found = True
-                    break
-            if not found:
-                raise ValueError(
-                    f"Cannot derive camera-to-rig extrinsic for camera {camera_value}; "
-                    "each rig camera must share a frame with the reference camera"
-                )
-
-        # Frames without the reference camera were initially represented by one
-        # of their other cameras. Convert those representatives back to the rig
-        # origin after all fixed camera-to-rig extrinsics are known.
-        for frame_index, frame_value in enumerate(frame_values.tolist()):
-            members = (frame_cpu == frame_value).nonzero(as_tuple=False).flatten()
-            ref_members = members[camera_cpu[members] == reference_camera_id]
-            if ref_members.numel():
-                continue
-            selected = members[0]
-            camera_index = int(
-                (camera_values == camera_cpu[selected]).nonzero(as_tuple=False)[0]
-            )
-            base_rig[frame_index] = (
-                base[selected] @ torch.linalg.inv(camera_to_rig[camera_index])
-            )
-
-        self.register_buffer("frame_values", frame_values)
-        self.register_buffer("camera_values", camera_values)
-        self.register_buffer("base_rig_camtoworlds", base_rig)
-        self.register_buffer("camera_to_rig", camera_to_rig)
-
-    def _lookup(self, values: Tensor, query: Tensor) -> Tensor:
-        query = query.to(device=values.device, dtype=values.dtype)
-        indices = torch.searchsorted(values, query)
-        if torch.any(indices >= values.numel()) or not torch.equal(
-            values[indices.clamp_max(values.numel() - 1)], query
-        ):
-            raise ValueError("Rig received an unknown frame or camera id")
-        return indices
-
-    def forward(
-        self,
-        camtoworlds: Tensor,
-        frame_ids: Tensor,
-        camera_ids: Tensor,
-    ) -> Tensor:
-        assert camtoworlds.shape[:-2] == frame_ids.shape == camera_ids.shape
-        frame_indices = self._lookup(self.frame_values, frame_ids)
-        camera_indices = self._lookup(self.camera_values, camera_ids)
-        rig_delta = self._delta_transform(frame_indices)
-        return (
-            self.base_rig_camtoworlds[frame_indices]
-            @ rig_delta
-            @ self.camera_to_rig[camera_indices]
-        )
-
-
-@dataclass(frozen=True)
-class CameraRefinementStage:
-    name: str
-    pose: bool
-    frozen: bool = False
-
-
-class CameraRefinementSchedule:
-    """Pose warmup, optimization and freeze policy."""
-
-    def __init__(self, pose_start: int, freeze_step: int):
-        if pose_start < 0:
-            raise ValueError("Pose refinement start must be non-negative")
-        if freeze_step < -1:
-            raise ValueError("freeze_step must be -1 or non-negative")
-        self.pose_start = pose_start
-        self.freeze_step = freeze_step
-
-    def at(self, step: int, pose_enabled: bool):
-        if self.freeze_step >= 0 and step >= self.freeze_step:
-            return CameraRefinementStage("frozen", False, True)
-        pose = pose_enabled and step >= self.pose_start
-        return CameraRefinementStage("pose" if pose else "warmup", pose)
 
 
 class AppearanceOptModule(torch.nn.Module):
