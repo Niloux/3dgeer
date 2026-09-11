@@ -144,9 +144,17 @@ def _long_axis_split_gaussians(
     _update_param_with_optimizer(param_fn, optimizer_fn, params, optimizers)
     for key, value in state.items():
         if isinstance(value, Tensor):
-            value[selected_ids] = 0
+            # Fresh children must collect their own evidence. Neutral survival
+            # and confidence are one; unseen view IDs use -1, not camera zero.
+            reset_value = 0
+            if key in ("uncertainty_survival", "uncertainty_confidence",
+                       "uncertainty_observation_confidence"):
+                reset_value = 1
+            elif key == "uncertainty_view_ids":
+                reset_value = -1
+            value[selected_ids] = reset_value
             state[key] = torch.cat(
-                (value, torch.zeros_like(value[selected_ids])), dim=0
+                (value, torch.full_like(value[selected_ids], reset_value)), dim=0
             )
 
 
@@ -318,6 +326,7 @@ class MRNFStrategy(Strategy):
         rendered: Tensor,
         target: Tensor,
         mask: Union[Tensor, None] = None,
+        reliability: Union[Tensor, None] = None,
     ) -> None:
         """Write a valid-window-normalized SSIM-CS error map for backward."""
         del optimizers
@@ -349,6 +358,12 @@ class MRNFStrategy(Strategy):
             error / valid_mean.clamp_min(self.error_epsilon),
             torch.zeros_like(error),
         )
+        if reliability is not None:
+            assert reliability.shape == error.shape, (reliability.shape, error.shape)
+            # Apply AFTER normalization: whole-frame unreliability would otherwise
+            # cancel out. Match the same footprint as the SSIM-CS error.
+            window_weight = F.avg_pool2d(reliability.detach().unsqueeze(1), 11, 1, 5).squeeze(1)
+            normalized = normalized * window_weight
         error_map.copy_(normalized.to(dtype=error_map.dtype))
 
     @torch.no_grad()
@@ -478,6 +493,10 @@ class MRNFStrategy(Strategy):
         state: Dict[str, Any],
     ) -> int:
         prune_mask = torch.sigmoid(params["opacities"].flatten()) < self.prune_opa
+        if "uncertainty_survival" in state:
+            prune_mask = (
+                torch.sigmoid(params["opacities"].flatten()) * state["uncertainty_survival"]
+            ) < self.prune_opa
         n_prune = int(prune_mask.sum().item())
         if n_prune > 0:
             remove(params=params, optimizers=optimizers, state=state, mask=prune_mask)
@@ -496,6 +515,14 @@ class MRNFStrategy(Strategy):
         candidates = (error_max > self.grow_error_threshold) & (
             state["visibility_sum"] > 0.0
         )
+        confident = torch.ones_like(candidates)
+        if "uncertainty_confidence" in state:
+            confidence = state["uncertainty_confidence"]
+            observed = state["visibility_sum"] > 0
+            if bool(observed.any()):
+                # Ties stay eligible, including the all-one warmup state.
+                confident = confidence >= confidence[observed].median()
+            candidates &= confident
         candidate_count = int(candidates.sum().item())
         budget = candidate_count + pruned_count
         if self.max_gaussians > 0:
@@ -507,7 +534,7 @@ class MRNFStrategy(Strategy):
             return 0, 0
 
         replacement_weights = torch.where(
-            state["visibility_sum"] > 0.0,
+            (state["visibility_sum"] > 0.0) & confident,
             torch.sigmoid(params["opacities"].flatten()),
             torch.zeros_like(error_max),
         )
@@ -543,7 +570,7 @@ class MRNFStrategy(Strategy):
             max_share = state["max_screen_share"]
             oversize_candidates = (max_share > self.max_screen_share) & (
                 rank > 0.0
-            )
+            ) & confident
             oversize_weights = torch.where(
                 oversize_candidates,
                 rank.clamp_min(0.0).sqrt()

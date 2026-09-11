@@ -2,7 +2,7 @@ preset: mrnf
 
 # Generated for examples/simple_trainer.py.
 data_dir: "/home/wuyou/remote/preprocess/output/展厅0908"
-data_factor: 4
+data_factor: 2
 # data_factor_final: 2
 # data_factor_switch_step: 12000
 test_every: 8
@@ -11,7 +11,7 @@ normalize_world_space: false
 log_every: 100
 log_loss_window: 100
 
-result_dir: results/0911/展厅base
+result_dir: results/0911/展厅_uncertainty
 disable_viewer: true
 disable_video: true
 
@@ -100,3 +100,23 @@ exposure_correction_grid_start_iter: 1000
 exposure_correction_lr: 0.002
 exposure_correction_grid_lr: 0.002
 exposure_correction_tv_weight: 10.0
+
+# SH0 双不确定性：局部软监督、MRNF 增密门控、有效透明度导出。
+uncertainty:
+  enabled: true
+  warmup_steps: 1500
+  ramp_steps: 1500
+  refresh_every: 500
+  probe_every: 50
+  phase_steps: 2000
+  neighbors: 8
+  min_views: 3
+  min_observations: 8
+  ema_decay: 0.9
+  min_weight: 0.15
+  min_survival: 0.1
+  fusion_weight: 0.5
+  opacity_strength: 2.0
+  temperature_start: 2.0
+  temperature_end: 0.5
+  outlier_threshold: 1.5

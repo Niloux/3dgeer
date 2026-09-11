@@ -25,6 +25,7 @@ from datasets.traj import (
 from eval_artifacts import EvalArtifact, EvalArtifactWriter
 from evaluation import masked_lpips, masked_psnr, masked_ssim
 from fused_ssim import FusedSSIMMap, fused_ssim
+from lib_uncertainty import ReconstructionUncertainty, UncertaintyConfig
 from gaussian_models import (
     SurfacePriorData,
     build_surface_priors_knn_pca,
@@ -95,12 +96,13 @@ def _json_log_value(value):
 
 
 def _masked_fused_ssim_loss(
-    prediction: Tensor, target: Tensor, mask: Optional[Tensor]
+    prediction: Tensor, target: Tensor, mask: Optional[Tensor],
+    weights: Optional[Tensor] = None,
 ) -> Tensor:
     """Compute SSIM loss from windows containing only valid pixels."""
     prediction = prediction.permute(0, 3, 1, 2).contiguous()
     target = target.permute(0, 3, 1, 2).contiguous()
-    if mask is None:
+    if mask is None and weights is None:
         return 1.0 - fused_ssim(prediction, target, padding="valid")
 
     ssim_map = FusedSSIMMap.apply(
@@ -111,6 +113,8 @@ def _masked_fused_ssim_loss(
         "valid",
         True,
     )
+    if mask is None:
+        mask = torch.ones_like(prediction[:, 0], dtype=torch.bool)
     valid_windows = F.avg_pool2d(
         mask.unsqueeze(1).to(dtype=ssim_map.dtype),
         kernel_size=11,
@@ -118,7 +122,11 @@ def _masked_fused_ssim_loss(
     )
     valid_windows = (valid_windows >= 1.0 - 1e-6).to(dtype=ssim_map.dtype)
     valid_windows = valid_windows.expand_as(ssim_map)
-    return ((1.0 - ssim_map) * valid_windows).sum() / valid_windows.sum().clamp_min(
+    weighted_windows = valid_windows
+    if weights is not None:
+        window_weights = F.avg_pool2d(weights.detach().unsqueeze(1), 11, 1)
+        weighted_windows = valid_windows * window_weights
+    return ((1.0 - ssim_map) * weighted_windows).sum() / valid_windows.sum().clamp_min(
         1.0
     )
 
@@ -505,6 +513,9 @@ class Config:
     exposure_correction_grid_lr: float = 2e-3
     exposure_correction_tv_weight: float = 10.0
 
+    # Dual uncertainty for SH0 reconstruction; uses MRNF/Eval3D attribution.
+    uncertainty: UncertaintyConfig = field(default_factory=UncertaintyConfig)
+
     # Enable sparse COLMAP-track depth loss. (experimental)
     depth_loss: bool = False
     # Weight for depth loss
@@ -540,6 +551,9 @@ class Config:
         self.exposure_correction_grid_start_iter = int(
             self.exposure_correction_grid_start_iter * factor
         )
+        self.uncertainty.warmup_steps = int(self.uncertainty.warmup_steps * factor)
+        for name in ("ramp_steps", "refresh_every", "probe_every", "phase_steps"):
+            setattr(self.uncertainty, name, max(1, int(getattr(self.uncertainty, name) * factor)))
         if self.data_factor_switch_step >= 0:
             self.data_factor_switch_step = int(
                 self.data_factor_switch_step * factor
@@ -931,6 +945,18 @@ class Runner:
             raise ValueError("log_every must be non-negative")
         if cfg.log_loss_window <= 0:
             raise ValueError("log_loss_window must be positive")
+        if cfg.uncertainty.enabled:
+            cfg.uncertainty.validate()
+            if cfg.sh_degree != 0 or cfg.ply_sh_degree != 0 or cfg.app_opt:
+                raise ValueError("Uncertainty reconstruction requires SH0 training/export and app_opt=False")
+            if not isinstance(cfg.strategy, MRNFStrategy) or not cfg.with_eval3d:
+                raise ValueError("Uncertainty reconstruction requires MRNF and Eval3D")
+            if cfg.batch_size != 1 or world_size != 1 or cfg.packed or cfg.sparse_grad:
+                raise ValueError("Uncertainty reconstruction requires one image, one GPU, and dense rasterization")
+            if cfg.patch_size is not None:
+                raise ValueError("Uncertainty image history requires full images")
+            if cfg.compression is not None:
+                raise ValueError("Use PLY export for uncertainty reconstruction; PNG compression is not supported")
 
         # Where to dump results.
         os.makedirs(cfg.result_dir, exist_ok=True)
@@ -1115,6 +1141,12 @@ class Runner:
                 raise ValueError("MRNFStrategy does not support packed rasterization")
             if world_size > 1:
                 raise ValueError("MRNFStrategy does not support distributed rasterization")
+
+        self.uncertainty = (
+            ReconstructionUncertainty(cfg.uncertainty, self.strategy_state,
+                                      self.splats, len(self.trainset), cfg.max_steps)
+            if cfg.uncertainty.enabled else None
+        )
 
         # Compression Strategy
         self.compression_method = None
@@ -1487,6 +1519,7 @@ class Runner:
         calc_densification_info = bool(
             kwargs.pop("calc_densification_info", False)
         ) and is_foreground
+        render_uncertainty = bool(kwargs.pop("render_uncertainty", False)) and is_foreground
         splats = self.splats if splats is None else splats
         means = splats["means"]  # [N, 3]
         # quats = F.normalize(self.splats["quats"], dim=-1)  # [N, 4]
@@ -1494,6 +1527,8 @@ class Runner:
         quats = splats["quats"]  # [N, 4]
         scales = torch.exp(splats["scales"])  # [N, 3]
         opacities = torch.sigmoid(splats["opacities"])  # [N,]
+        if is_foreground and self.uncertainty is not None:
+            opacities = self.uncertainty.effective_opacity(splats["opacities"])
 
         image_ids = kwargs.pop("image_ids", None)
         if is_foreground and self.cfg.app_opt:
@@ -1507,6 +1542,18 @@ class Runner:
             colors = torch.sigmoid(colors)
         else:
             colors = torch.cat([splats["sh0"], splats["shN"]], 1)  # [N, K, 3]
+
+        if render_uncertainty:
+            # SH0 is exactly affine in its DC coefficients. Render uncertainty
+            # through the same visibility/occlusion path as RGB, without another
+            # rasterization or a new CUDA kernel. Auxiliary channels are detached
+            # before they are used to weight supervision.
+            kwargs["sh_degree"] = None
+            rgb = (splats["sh0"][:, 0] * 0.28209479177387814 + 0.5).clamp_min(0)
+            colors = torch.cat((rgb, self.uncertainty.features()), dim=-1)
+            if kwargs.get("backgrounds") is not None:
+                backgrounds = kwargs["backgrounds"]
+                kwargs["backgrounds"] = F.pad(backgrounds, (0, 2))
 
         if rasterize_mode is None:
             rasterize_mode = "antialiased" if self.cfg.antialiased else "classic"
@@ -1538,6 +1585,11 @@ class Runner:
             calc_densification_info=calc_densification_info,
             **kwargs,
         )
+        if render_uncertainty:
+            info["uncertainty_map"] = (
+                render_colors[..., 3:5].detach() / render_alphas.detach().clamp_min(1e-6)
+            )
+            render_colors = torch.cat((render_colors[..., :3], render_colors[..., 5:]), -1)
         if masks is not None:
             render_colors[~masks] = 0
         return render_colors, render_alphas, info
@@ -1701,6 +1753,8 @@ class Runner:
         pbar = tqdm.tqdm(range(init_step, max_steps))
         next_progress_update = 0.0
         for step in pbar:
+            if self.uncertainty is not None:
+                self.uncertainty.prepare(step, self.splats)
             data_factor = self._data_factor_at_step(step)
             if data_factor != self.parser.factor:
                 # Persistent workers own a copy of the Dataset and may already
@@ -1818,7 +1872,8 @@ class Runner:
                 camera_model="fisheye" if cfg.keep_distortion and data["camera_model"] == 5 else "pinhole",
                 radial_coeffs=radial_coeffs,
                 tangential_coeffs=tangential_coeffs,
-                calc_densification_info=collect_mrnf_info,
+                calc_densification_info=collect_mrnf_info or self.uncertainty is not None,
+                render_uncertainty=self.uncertainty is not None,
             )
             if renders.shape[-1] == 4:
                 colors, depths = renders[..., 0:3], renders[..., 3:4]
@@ -1849,6 +1904,12 @@ class Runner:
             colors_for_loss = (
                 colors.clamp(0.0, 1.0) if cfg.clamp_colors_for_loss else colors
             )
+            reliability = None
+            if self.uncertainty is not None:
+                reliability = self.uncertainty.pixel_weights(
+                    colors_for_loss.detach(), pixels, masks, info["uncertainty_map"],
+                    int(image_ids.item()),
+                )
             if densification_active:
                 if isinstance(cfg.strategy, MRNFStrategy):
                     cfg.strategy.step_pre_backward(
@@ -1860,6 +1921,7 @@ class Runner:
                         rendered=colors_for_loss,
                         target=pixels,
                         mask=masks,
+                        reliability=reliability,
                     )
                 else:
                     cfg.strategy.step_pre_backward(
@@ -1869,7 +1931,11 @@ class Runner:
                         step=step,
                         info=info,
                     )
-            if masks is None:
+            if reliability is not None:
+                errors = (colors_for_loss - pixels).abs().mean(dim=-1)
+                valid_count = max(1, errors.numel()) if masks is None else masks.sum().clamp_min(1)
+                l1loss = (errors * reliability).sum() / valid_count
+            elif masks is None:
                 l1loss = F.l1_loss(colors_for_loss, pixels)
             else:
                 valid = masks.unsqueeze(-1)
@@ -1881,7 +1947,7 @@ class Runner:
                 )
             if cfg.ssim_lambda:
                 ssimloss = _masked_fused_ssim_loss(
-                    colors_for_loss, pixels, masks
+                    colors_for_loss, pixels, masks, reliability
                 )
                 loss = l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda
             else:
@@ -1987,7 +2053,37 @@ class Runner:
                         update_applied=False,
                     )
             if do_update:
+                if self.uncertainty is not None and step % cfg.uncertainty.probe_every == 0:
+                    # Probe the unweighted photometric objective, excluding pose,
+                    # geometry and appearance priors. Otherwise low supervision
+                    # weights would themselves look like reliable low gradients.
+                    probe_errors = (colors_for_loss - pixels).abs().mean(-1)
+                    if masks is None:
+                        probe_l1 = probe_errors.mean()
+                    else:
+                        probe_l1 = probe_errors.masked_fill(~masks, 0).sum() / masks.sum().clamp_min(1)
+                    probe_loss = (1 - cfg.ssim_lambda) * probe_l1
+                    if cfg.ssim_lambda:
+                        probe_loss = probe_loss + cfg.ssim_lambda * _masked_fused_ssim_loss(
+                            colors_for_loss, pixels, masks
+                        )
+                    attribution_map = info["densification_error_map"]
+                    training_error_map = attribution_map.clone()
+                    attribution_map.copy_(reliability)
+                    probe_grads = torch.autograd.grad(
+                        probe_loss, tuple(self.splats.values()), retain_graph=True, allow_unused=True,
+                    )
+                    probe_stats = info["densification_info"].reshape(-1, 2, len(self.splats["means"]))
+                    self.uncertainty.observe_gradients(probe_grads, probe_stats[:, 0].sum(0) > 1e-4)
+                    self.uncertainty.observe_confidence(info)
+                    # Eval3D attribution accumulates on every backward, including
+                    # autograd.grad. The optimizer backward must start at zero.
+                    info["densification_info"].zero_()
+                    attribution_map.copy_(training_error_map)
+                    del probe_grads, probe_loss
                 loss.backward()
+                if self.uncertainty is not None:
+                    self.uncertainty.observe_visibility(info, int(image_ids.item()))
 
 
                 # Some rendering modes (e.g. UT / eval3d) do not provide a differentiable
@@ -2105,6 +2201,17 @@ class Runner:
                 }
                 for name, value in self._camera_metrics().items():
                     metrics[name] = value
+                if self.uncertainty is not None:
+                    metrics.update(self.uncertainty.last_metrics)
+                    if step % cfg.uncertainty.refresh_every == 0:
+                        map_dir = Path(self.render_dir) / "uncertainty"
+                        map_dir.mkdir(exist_ok=True)
+                        ua, ue = info["uncertainty_map"][0].unbind(-1)
+                        diagnostic = torch.cat((reliability[0], ua / 6, ue), dim=1)
+                        imageio.imwrite(
+                            map_dir / f"{step:06d}_{int(image_ids.item()):06d}_weight_ua_ue.png",
+                            (diagnostic.clamp(0, 1) * 255).to(torch.uint8).cpu().numpy(),
+                        )
                 if self.sky_splats is not None:
                     metrics["sky_alpha_loss"] = (
                         cfg.sky_alpha_lambda * sky_alpha_loss.item()
@@ -2197,6 +2304,8 @@ class Runner:
                         "grid": self.exposure_grid.state_dict(),
                         "grid_active": self.exposure_grid_active,
                     }
+                if self.uncertainty is not None:
+                    data["uncertainty"] = self.uncertainty.state_dict()
                 checkpoint_path = (
                     f"{self.ckpt_dir}/ckpt_{step}_rank{self.world_rank}.pt"
                 )
@@ -2241,6 +2350,8 @@ class Runner:
                 scales = self.splats["scales"]
                 quats = self.splats["quats"]
                 opacities = self.splats["opacities"]
+                if self.uncertainty is not None:
+                    opacities = self.uncertainty.export_opacity(opacities)
                 export_splats(
                     means=means,
                     scales=scales,
@@ -3035,6 +3146,11 @@ def main(local_rank: int, world_rank, world_size: int, cfg: Config):
         ]
         for k in runner.splats.keys():
             runner.splats[k].data = torch.cat([ckpt["splats"][k] for ckpt in ckpts])
+        has_uncertainty = any("uncertainty" in ckpt for ckpt in ckpts)
+        if has_uncertainty != (runner.uncertainty is not None):
+            raise ValueError("Checkpoint uncertainty mode does not match uncertainty.enabled")
+        if runner.uncertainty is not None:
+            runner.uncertainty.load_state_dict(ckpts[0]["uncertainty"], runner.splats)
         if runner.sky_splats is not None:
             if any("sky_splats" not in ckpt for ckpt in ckpts):
                 raise ValueError(
