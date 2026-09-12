@@ -144,6 +144,7 @@ class Parser:
         frame_id_max: Optional[int] = None,
         sky_mask_dir: Optional[str] = None,
         use_test_split: bool = True,
+        load_tracks: bool = False,
     ):
         if factor < 1:
             raise ValueError("factor must be a positive integer")
@@ -356,13 +357,25 @@ class Parser:
         points_err = manager.point3D_errors.astype(np.float32)
         points_rgb = manager.point3D_colors.astype(np.uint8)
         point_indices = dict()
+        # Actual feature measurements, in COLMAP's original pixel coordinates.
+        # Keep their ordering identical to point_indices; never synthesize them
+        # by projecting the initial 3D points.
+        track_observations = dict() if load_tracks else None
+        track_point_ids = np.empty(len(points), dtype=np.int64) if load_tracks else None
+        kept_names = set(image_names)
 
         image_id_to_name = {v: k for k, v in manager.name_to_image_id.items()}
         for point_id, data in manager.point3D_id_to_images.items():
-            for image_id, _ in data:
+            point_idx = manager.point3D_id_to_point3D_idx[point_id]
+            if load_tracks:
+                track_point_ids[point_idx] = point_id
+            for image_id, point2d_idx in data:
                 image_name = image_id_to_name[image_id]
-                point_idx = manager.point3D_id_to_point3D_idx[point_id]
                 point_indices.setdefault(image_name, []).append(point_idx)
+                if load_tracks and image_name in kept_names:
+                    track_observations.setdefault(image_name, []).append(
+                        imdata[image_id].points2D[int(point2d_idx)]
+                    )
         point_indices = {
             k: np.array(v).astype(np.int32) for k, v in point_indices.items() if k in image_names
         }
@@ -421,6 +434,15 @@ class Parser:
         self.points_err = points_err  # np.ndarray, (num_points,)
         self.points_rgb = points_rgb  # np.ndarray, (num_points, 3)
         self.point_indices = point_indices  # Dict[str, np.ndarray], image_name -> [M,]
+        self.track_observations = (
+            {
+                name: np.asarray(xy, dtype=np.float64).reshape(-1, 2)
+                for name, xy in track_observations.items()
+            }
+            if load_tracks
+            else None
+        )
+        self.track_point_ids = track_point_ids
         self.transform = transform  # np.ndarray, (4, 4)
 
         # Read only the image header to determine how source pixels relate to

@@ -119,8 +119,16 @@ the JSON files after checking that their values were preserved:
 uv run python examples/stats.py path/to/results/stats --migrate-json --remove-json
 ```
 
-Camera intrinsics and distortion are fixed COLMAP inputs. `pose_opt` and the
-original sparse COLMAP `depth_loss` remain available; the experimental
+Camera intrinsics and distortion are fixed COLMAP inputs. In `simple_trainer.py`,
+`pose_opt` jointly optimizes camera poses and independent SfM track points using
+photometric and reprojection losses. Track constraints are required whenever pose
+training is enabled; the default `pose_track_lambda` is `0.01`. See the
+[pose optimization guide and complete exhibition preset](docs/pose_tracks.md).
+The experimental `pose_track_enabled` switch has been removed; delete that field
+from older YAML snapshots. Checkpoint evaluation still uses the saved poses
+without rebuilding tracks.
+
+The original sparse COLMAP `depth_loss` remains available; the experimental
 `calib_opt`, `depth_dir`, and encoded LiDAR depth-map supervision were removed.
 Remove those retired fields (including `depth_max`) from older YAML snapshots
 before using them as launch configurations. LiDAR initialization and the direct
