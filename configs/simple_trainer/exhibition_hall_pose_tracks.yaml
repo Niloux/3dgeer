@@ -7,11 +7,11 @@ disable_viewer: true
 ckpt: null
 compression: null
 render_traj_path: interp
-data_dir: data/展厅0908
+data_dir: /home/wuyou/preprocess/output/展厅_glosplat_blur
 data_factor: 2
 data_factor_final: null
 data_factor_switch_step: -1
-result_dir: results/0912/展厅_pose_tracks
+result_dir: results/0913/展厅_glosplat_blur
 test_every: 1
 use_test_split: false
 frame_id_min: null
@@ -51,7 +51,7 @@ ply_steps:
 ply_sh_degree: 0
 disable_video: true
 init_type: lidar
-init_lidar_path: data/展厅0908/lidar.ply
+init_lidar_path: /home/wuyou/preprocess/output/展厅_glosplat_blur/lidar.ply
 init_num_pts: 100000
 init_extent: 3.0
 sh_degree: 0
