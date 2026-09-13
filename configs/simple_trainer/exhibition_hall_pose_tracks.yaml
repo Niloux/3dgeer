@@ -131,9 +131,6 @@ pose_track_lr: 0.0001
 pose_track_min_views: 3
 pose_track_max_reprojection_error: 2.0
 pose_track_huber_delta: 1.0
-rig_opt: false
-rig_reference_camera_id: null
-rig_reference_frame_id: null
 pose_noise: 0.0
 camera_freeze_step: 20000
 densification_start_step: 500
