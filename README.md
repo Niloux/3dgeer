@@ -122,11 +122,14 @@ uv run python examples/stats.py path/to/results/stats --migrate-json --remove-js
 Camera intrinsics and distortion are fixed COLMAP inputs. In `simple_trainer.py`,
 `pose_opt` jointly optimizes camera poses and independent SfM track points using
 photometric and reprojection losses. Track constraints are required whenever pose
-training is enabled; the default `pose_track_lambda` is `0.01`. See the
+training is enabled; the summed reprojection loss uses `pose_opt_ba_lambda=1e-4`.
+Poses and track points are optimized throughout training with constant Adam
+learning rates, without a pose prior, warmup, or early freeze. See the
 [pose optimization guide and complete exhibition preset](docs/pose_tracks.md).
 The experimental `pose_track_enabled` switch has been removed; delete that field
-from older YAML snapshots. Checkpoint evaluation still uses the saved poses
-without rebuilding tracks.
+from older YAML snapshots. Checkpoint evaluation requires `pose_adjust` and
+`track_adjust` from the same SfM model and training split. Previous geosun
+checkpoints containing only `pose_tracks` are incompatible with this format.
 
 The original sparse COLMAP `depth_loss` remains available; the experimental
 `calib_opt`, `depth_dir`, and encoded LiDAR depth-map supervision were removed.

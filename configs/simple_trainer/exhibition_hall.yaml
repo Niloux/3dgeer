@@ -82,8 +82,10 @@ geometry_enabled: false
 geometry_lambda: 0.03
 
 pose_opt: true
-pose_opt_start_step: 500
 pose_opt_lr: 1.0e-4
+pose_opt_ba_lambda: 1.0e-4
+pose_opt_huber_delta: 1.0
+pose_opt_track_lr: 1.6e-4
 
 
 app_opt: false

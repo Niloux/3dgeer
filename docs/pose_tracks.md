@@ -1,13 +1,62 @@
-# 独立 SfM 特征轨迹约束
+# 联合位姿优化
 
-`examples/simple_trainer.py` 的 `pose_opt` 统一使用独立 SfM 特征轨迹约束。
-开启后，在 pose 优化阶段同时优化相机和共享三维特征点。
-相机同时接收图像损失和重投影损失的梯度；独立的三维特征点只接收
-重投影梯度，不与高斯位置绑定，也不参与 MRNF 的增密、删除和迁移。
-该设计借鉴 [GloSplat §3.3、附录 E](https://arxiv.org/html/2603.04847v1#S3.SS3)，
-沿用现有 SfM 前端和 Gaussian 初始化流程。
+`examples/simple_trainer.py --pose-opt` 使用
+[GloSplat 第 3.3 节](https://arxiv.org/html/2603.04847v1#S3.SS3)中的联合训练目标：
 
-## 运行展厅预设
+`loss = photometric_loss + pose_opt_ba_lambda * track_reprojection_loss`
+
+其中，`photometric_loss` 为光度损失，`track_reprojection_loss` 为特征轨迹的重投影损失。
+
+每张训练图像都有独立的相机局部刚体位姿修正，包括帧编号相同的 L/R 图像。
+旋转采用 SO(3) 切空间向量参数化。参考训练图像的位姿保持固定，用于锚定坐标系。
+相机内参和畸变参数保持固定，渲染器与重投影损失使用同一组修正后的相机位姿。
+
+数据加载器读取 COLMAP 中真实的 `points2D` 观测及其对应的三维特征轨迹 ID。
+只有被至少两张训练图像观测到的三维点才会进入可优化轨迹点表，验证视图不提供观测约束。
+轨迹点表独立于高斯中心，不受高斯增密、重定位和剪枝影响，也独立于 LiDAR 高斯初始化。
+
+二维观测会转换到当前图像分辨率，按需去畸变，并根据 ROI 和随机裁剪调整坐标。
+图像范围外及被掩码排除的观测会被丢弃。重投影支持针孔模型、径向/OpenCV 畸变及
+`OPENCV_FISHEYE`。相机坐标系中深度非正的点不参与当前步骤的重投影损失。
+图像或裁剪区域没有有效观测时，BA 损失为零；整个数据集缺少多视图 SfM 特征轨迹时，
+程序会报错，不会退回仅使用光度损失的位姿优化。
+
+```yaml
+pose_opt: true
+pose_opt_lr: 1.0e-5
+pose_opt_ba_lambda: 1.0e-4
+pose_opt_huber_delta: 1.0
+pose_opt_track_lr: 1.6e-4
+pose_opt_reference_image_id: 0
+```
+
+相机 Adam 学习率、BA 权重和 Huber 阈值采用论文中的取值。
+Huber 损失作用于二维残差的欧氏范数，阈值单位为当前训练图像的像素。
+每张图像内的残差损失求和后，再对小批量中的图像取平均；采样图像中的所有有效观测均参与计算。
+改变图像分辨率会改变像素误差的尺度。
+
+论文未明确给出轨迹点学习率及全部优化器细节。本实现为轨迹点使用独立的 Adam 优化器，
+学习率为 `pose_opt_track_lr * scene_scale`，默认基础学习率为 `1.6e-4`。
+位姿和轨迹点学习率均保持恒定，不使用权重衰减、位姿先验、预热或提前冻结，
+从第一个训练步骤持续优化到最后一步。固定参考位姿和小批量损失归约方式是本实现的明确选择。
+现有 SfM 预处理及高斯训练设置保持可用；这里实现的是论文中的联合优化部分，
+未引入 GloSplat 的特征匹配与全局 SfM 流程。
+
+训练日志包含 `pose/ba_loss`、`pose/weighted_ba_loss`、
+`pose/reprojection_error_px` 和 `pose/track_observations`，分别记录原始 BA 损失、
+加权 BA 损失、平均像素重投影误差及有效轨迹观测数。
+检查点同时保存 `pose_adjust` 和 `track_adjust`，后者包含轨迹点坐标及原始点索引。
+训练视图评估使用修正后的位姿；留出的验证视图保持输入位姿，不进行测试时优化。
+
+使用旧版启动配置时，请删除以下已移除字段：`rig_opt`、
+`rig_reference_camera_id`、`rig_reference_frame_id`、`pose_opt_start_step`、
+`camera_freeze_step`、`pose_opt_translation_lr`、`pose_opt_rotation_lr`、
+`pose_opt_rotation_mode`、`pose_opt_reg`、`pose_opt_prior_lambda`、
+`pose_opt_translation_sigma` 和 `pose_opt_rotation_sigma_deg`。
+旧版 rig/6D 位姿检查点不做迁移。联合位姿优化检查点必须包含轨迹状态，
+并使用相同的 SfM 模型和训练集划分进行评估。
+
+## 展厅预设
 
 ```bash
 source scripts/activate.sh
@@ -15,87 +64,8 @@ uv run python examples/simple_trainer.py \
   --config configs/simple_trainer/exhibition_hall_pose_tracks.yaml
 ```
 
-这是基于已完成的 `results/0911/展厅base/cfg.yml` 整理的完整参数快照。
-采用展厅对照后选择的轨迹权重 `0.01`，输出目录为
-`results/0912/展厅_pose_tracks`。SH0、LiDAR、MRNF、曝光校正、
-pose 学习率、500 步启动、20000 步冻结和 15000 总步数均沿用原值。
-配置头部记录原始快照的 SHA-256。
-
-```yaml
-pose_opt: true
-pose_track_lambda: 0.01
-pose_track_lr: 0.0001
-pose_track_min_views: 3
-pose_track_max_reprojection_error: 2.0
-pose_track_huber_delta: 1.0
-```
-
-当前支持单 GPU、`batch_size: 1`、`patch_size: null`、
-`keep_distortion: true`，相机为 pinhole 或 OpenCV fisheye。
-通用配置的 `pose_opt` 默认关闭，展厅轨迹预设开启。
-启用 pose 优化后，轨迹权重和轨迹点学习率必须为正；若无合格轨迹，
-初始化会报错。`pose_opt: false` 同时关闭相机和轨迹点优化，不加载轨迹观测。
-
-独立的实验开关 `pose_track_enabled` 已删除。旧 YAML 快照需要移除该字段；
-`pose_opt: true` 的训练始终使用新方案，不再提供无轨迹约束的 pose 训练分支。
-`pose_opt_lr`、平移/旋转学习率、参考相机和弱位姿先验等参数继续沿用，
-保持已验证的优化设置；替换监督方案不需要更换相机的位姿参数化。
-
-## 观测与损失
-
-二维目标直接取 `images.bin` 中的实际特征观测，并通过 `points3D.bin`
-的 track 关联同一个三维点。训练图像排序、缺失图像、frame 范围筛选和
-训练/验证划分均按 parser 和 trainset 的实际索引处理；验证图像的二维观测
-不进入此训练损失。三维点初始化沿用现有 SfM 及其场景坐标变换。
-
-初始化时，在初始训练分辨率下过滤非有限值、相机后方点、超过 2 px 的
-重投影残差，以及 FOV、数据有效掩码和已加载天空掩码之外的观测。
-过滤后至少在 3 张训练图像中可见的点才参与优化。筛选只做一次；
-后续误差变大不会触发删除。没有合格观测的单张图像贡献零损失，
-启动日志会列出这些图像。
-
-每步使用当前训练图像的全部保留观测，共享三维特征点将各视图联系起来。
-设像素残差长度为 `r`，Huber 阈值为 `d`：
-
-```text
-h(r) = 0.5 * r²                   (r <= d)
-     = d * (r - 0.5 * d)          (r > d)
-L_track = mean(h(r))
-L_total = 图像及高斯损失 + 弱位姿先验 + pose_track_lambda * L_track
-```
-
-投影使用原图相机模型、畸变和当前训练内参；二维观测按实际图像尺寸同步缩放。
-COLMAP 观测沿用像素角点原点约定，不额外加减半像素。
-分辨率切换会改变像素残差的单位尺度，初始筛选集合则保持固定。
-
-这里使用逐图 **mean**，所以本实现的权重不能与论文求和形式的 `1e-4`
-直接比较。展厅的 `0.01` 与 `0.02` 对照后采用 `0.01`，不代表其他场景的最优值。
-三维点使用独立 SparseAdam；`pose_track_lr` 是训练世界坐标中的步长，
-不乘高斯的场景尺度。其学习率按原 pose 的指数衰减规则变化，
-相机和轨迹点共用优化器更新及学习率调度入口，只有 pose 活跃且本步训练
-更新有效时才推进；warmup、冻结和跳过非有限 loss 时两者都不更新。
-原有参考相机和 pose 先验继续生效；轨迹约束本身不固定绝对尺度。
-
-## 日志与保存
-
-`train.log` 增加 `pose_tracks_init` 事件，记录保留点数、观测数、
-没有轨迹的图像及初始像素残差。周期性训练日志包含：
-
-- `pose_track_active`、`pose_track_point_lr`；
-- `pose_track_loss` 和实际加入总损失的 `pose_track_weighted_loss`；
-- `pose_track_observations`，当前图像参与的观测数；
-- `pose_track_reprojection_mean_px` / `median_px` / `p90_px`；
-- `pose_track_behind_camera_fraction`，用于发现轨迹几何退化。
-
-残差是当前图像上、相机和特征点共同拟合后的训练量，不能充当独立验证。
-warmup 和冻结阶段只在日志步计算该量，不反向传播。
-
-checkpoint 的 `pose_tracks` 项保存三维点、原始 COLMAP 点 ID、
-固定二维观测、图像索引分段、相机畸变和图像名称。
-它们不写入 PLY。`--ckpt` 仍然是已有的仅评估入口，渲染使用保存的 pose 和
-高斯，不重新筛选或拟合轨迹；当前 trainer 不提供完整训练断点续跑。
-
-历史结果可继续用于 pose 关闭、旧 pose、新 pose 方案的对照。
-当前代码不再重新训练旧分支。调整轨迹权重时，应检查独立匹配的重投影、
-同位置文字裁剪和多个共视角，并同时比较全图指标。
-只有训练 track 残差降低，不能证明文字改善或新视角泛化提高。
+展厅预设保留 `pose_opt_lr: 1e-4`，与 feat 分支的展厅配置一致；
+它覆盖代码默认的 `1e-5`。数据路径、输出目录及其他训练参数见 YAML。
+旧 geosun 配置还需要删除所有 `pose_track_*` 字段，改用上文的
+`pose_opt_ba_lambda`、`pose_opt_huber_delta` 和 `pose_opt_track_lr`。
+旧 geosun 的 `pose_tracks` 检查点与本实现的 `track_adjust` 格式不兼容。

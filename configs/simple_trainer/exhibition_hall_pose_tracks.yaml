@@ -1,18 +1,18 @@
 # Full preset for pose optimization with independent SfM track constraints.
 # Based on results/0911/展厅base/cfg.yml.
 # Baseline SHA-256: 58cc2dee5f910829538ffda33eebcea46e0fa4827313d66b0765e4ddf9932180
-# Uses the selected 0.01 track weight and a new output directory.
+# Pose settings follow feat/glosplat-pose-refinement (summed BA loss).
 preset: mrnf
 disable_viewer: true
 ckpt: null
 compression: null
 render_traj_path: interp
-data_dir: /home/wuyou/preprocess/output/展厅_glosplat_blur
+data_dir: /home/wuyou/remote/preprocess/output/G203展厅
 data_factor: 2
 data_factor_final: null
 data_factor_switch_step: -1
-result_dir: results/0913/展厅_glosplat_blur
-test_every: 1
+result_dir: results/0915/G203展厅
+test_every: 8
 use_test_split: false
 frame_id_min: null
 frame_id_max: null
@@ -51,7 +51,7 @@ ply_steps:
 ply_sh_degree: 0
 disable_video: true
 init_type: lidar
-init_lidar_path: /home/wuyou/preprocess/output/展厅_glosplat_blur/lidar.ply
+init_lidar_path: /home/wuyou/remote/preprocess/output/G203展厅/lidar.ply
 init_num_pts: 100000
 init_extent: 3.0
 sh_degree: 0
@@ -116,23 +116,12 @@ shN_lr: 0.000125
 opacity_reg: 0.003
 scale_reg: 0.0
 pose_opt: true
-pose_opt_start_step: 500
 pose_opt_lr: 0.0001
-pose_opt_translation_lr: 0.0001
-pose_opt_rotation_lr: 0.0001
-pose_opt_rotation_mode: so3
+pose_opt_ba_lambda: 1.0e-4
+pose_opt_huber_delta: 1.0
+pose_opt_track_lr: 1.6e-4
 pose_opt_reference_image_id: 0
-pose_opt_reg: 1.0e-06
-pose_opt_prior_lambda: 0.0001
-pose_opt_translation_sigma: 0.02
-pose_opt_rotation_sigma_deg: 2.0
-pose_track_lambda: 0.01
-pose_track_lr: 0.0001
-pose_track_min_views: 3
-pose_track_max_reprojection_error: 2.0
-pose_track_huber_delta: 1.0
 pose_noise: 0.0
-camera_freeze_step: 20000
 densification_start_step: 500
 app_opt: false
 app_embed_dim: 16
